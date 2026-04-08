@@ -4,7 +4,7 @@ This repository contains only the files needed to convert an AMASS `.npz` sequen
 
 - `.mot` (OpenSim inverse kinematics motion)
 - `.osim` (scaled torque-only model, no muscles)
-- `.csv` (frame-by-frame DOF table for the torque-only model)
+- `.csv` (frame-by-frame DOF table for the torque-only model, including velocity and acceleration columns)
 
 The default model is `model/LaiUhlrich2022_torque_only.osim`.
 
@@ -92,6 +92,15 @@ python scripts/run_amass_to_opensim.py \
 
 The script prints a final JSON payload with the absolute paths of all generated files.
 
+The CSV contains:
+
+- Position columns: `<dof>`
+- Velocity columns: `<dof>_vel`
+- Acceleration columns: `<dof>_acc`
+
+Velocity and acceleration are computed from filtered DOF trajectories.
+Filtering uses a 4th-order zero-phase Butterworth low-pass filter.
+
 ## Useful CLI Options
 
 - `--skip-scale`: skip scaling and use `--model-path` directly
@@ -100,8 +109,13 @@ The script prints a final JSON payload with the absolute paths of all generated 
 - `--csv-path /path/file.csv`: custom CSV output path
 - `--csv-model-path /path/model.osim`: model used to order CSV DOF columns
 - `--missing-fill 0`: fill value for DOFs missing in `.mot` (default: `nan`)
+- `--filter-mode auto|walking|dynamic|none`: filtering strategy
+- `--filter-cutoff-hz 20`: explicit cutoff override in Hz
+- `--no-velocity-columns`: disable `<dof>_vel` columns
+- `--no-acceleration-columns`: disable `<dof>_acc` columns
 
 ## Practical Notes
 
 - This repo includes only `SMPLX_NEUTRAL.npz`. For male/female AMASS files, you can still run with `--sex neutral`.
 - If OpenSim reports missing mesh files, make sure `model/Geometry` is present next to the `.osim` model.
+- `auto` filter mode uses 12 Hz for gait-like trial names and 30 Hz otherwise.

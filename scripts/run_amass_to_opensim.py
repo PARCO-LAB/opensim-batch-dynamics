@@ -105,6 +105,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Fill value for DOFs missing in .mot (default: nan).",
     )
     parser.add_argument(
+        "--filter-mode",
+        choices=["auto", "walking", "dynamic", "none"],
+        default="auto",
+        help=(
+            "Low-pass filter mode for DOF signals before derivatives: "
+            "walking=12Hz, dynamic=30Hz, auto=heuristic, none=disabled."
+        ),
+    )
+    parser.add_argument(
+        "--filter-cutoff-hz",
+        type=float,
+        default=None,
+        help="Override low-pass cutoff frequency in Hz (4th-order Butterworth).",
+    )
+    parser.add_argument(
+        "--no-velocity-columns",
+        action="store_true",
+        help="Do not add '<dof>_vel' columns to CSV.",
+    )
+    parser.add_argument(
+        "--no-acceleration-columns",
+        action="store_true",
+        help="Do not add '<dof>_acc' columns to CSV.",
+    )
+    parser.add_argument(
         "--no-time-column",
         action="store_true",
         help="Do not include 'time' column in CSV.",
@@ -195,6 +220,10 @@ def main() -> int:
             model_path=csv_model_path,
             out_csv_path=csv_path,
             missing_fill=parse_missing_fill(args.missing_fill),
+            add_velocity=not bool(args.no_velocity_columns),
+            add_acceleration=not bool(args.no_acceleration_columns),
+            filter_mode=str(args.filter_mode),
+            cutoff_hz=args.filter_cutoff_hz,
             include_time=not bool(args.no_time_column),
             include_frame=not bool(args.no_frame_column),
         )
@@ -203,6 +232,8 @@ def main() -> int:
             "model_dofs": summary.model_dofs,
             "mapped_dofs": summary.mapped_dofs,
             "missing_dofs": list(summary.missing_dofs),
+            "filter_cutoff_hz": summary.filter_cutoff_hz,
+            "sample_rate_hz": summary.sample_rate_hz,
             "csv_model_path": str(csv_model_path),
         }
 

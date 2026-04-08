@@ -6,7 +6,8 @@ channels:
 dependencies:
   - python=3.11
   - opensim=4.5.2
-  - numpy
+  - numpy<2
+  - scipy>=1.10,<1.14
   - pytorch
   - pip
   - pip:
