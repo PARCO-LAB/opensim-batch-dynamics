@@ -5,6 +5,7 @@ import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 import numpy as np
 
@@ -23,7 +24,32 @@ class MotionCsvSummary:
 
 
 def extract_coordinate_names_from_osim(osim_path: Path) -> list[str]:
-    """Read coordinate names from an OpenSim model XML."""
+    """
+    Read coordinate names from an OpenSim model XML.
+
+    Locked coordinates are excluded by default because they are not true DOFs.
+    """
+    try:
+        root = ET.parse(osim_path).getroot()
+        coords: list[str] = []
+        for coordinate in root.findall(".//Coordinate"):
+            name = coordinate.attrib.get("name")
+            if not name:
+                continue
+            locked_tag = coordinate.find("locked")
+            is_locked = (
+                locked_tag is not None
+                and locked_tag.text is not None
+                and locked_tag.text.strip().lower() == "true"
+            )
+            if not is_locked:
+                coords.append(name)
+        if coords:
+            return coords
+    except ET.ParseError:
+        pass
+
+    # Fallback for malformed XML files: keep previous regex behavior.
     text = osim_path.read_text(encoding="utf-8", errors="ignore")
     coords = re.findall(r'<Coordinate name="([^"]+)"', text)
     if not coords:

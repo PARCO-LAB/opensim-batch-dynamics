@@ -118,4 +118,27 @@ Filtering uses a 4th-order zero-phase Butterworth low-pass filter.
 
 - This repo includes only `SMPLX_NEUTRAL.npz`. For male/female AMASS files, you can still run with `--sex neutral`.
 - If OpenSim reports missing mesh files, make sure `model/Geometry` is present next to the `.osim` model.
+
+## Replay in Nimble (optional)
+
+You can replay the generated DOF CSV on the OpenSim model with:
+
+```bash
+python scripts/run_nimble.py \
+  --osim model/LaiUhlrich2022_torque_only.osim \
+  --csv outputs/OpenSim/IK/demo_torque/demo_torque_dofs.csv \
+  --max-frames 200
+```
+
+By default geometry loading is disabled (faster and quieter).  
+If you want mesh loading too, add `--load-geometry --geometry-dir model/Geometry`.
+
+Optional realtime playback:
+
+```bash
+python scripts/run_nimble.py \
+  --osim model/LaiUhlrich2022_torque_only.osim \
+  --csv outputs/OpenSim/IK/demo_torque/demo_torque_dofs.csv \
+  --realtime --speed 1.0
+```
 - `auto` filter mode uses 12 Hz for gait-like trial names and 30 Hz otherwise.
