@@ -1,0 +1,12 @@
+name: opensim-torque
+channels:
+  - opensim-org
+  - conda-forge
+dependencies:
+  - python=3.11
+  - opensim=4.5.2
+  - pip
+  - pip:
+      - numpy
+      - torch
+      - smplx
