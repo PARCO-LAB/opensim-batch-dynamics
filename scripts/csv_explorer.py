@@ -26,6 +26,7 @@ class MotionCsvData:
     time_source: str
     sample_rate_hz: float | None
     dof_names: list[str]
+    root_dofs: list[str]
     grf_bodies: list[str]
     has_total_grf: bool
 
@@ -53,6 +54,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional cap on number of DOFs plotted (default: all)",
+    )
+    parser.add_argument(
+        "--root-force-warning-n",
+        type=float,
+        default=75.0,
+        help="Warning threshold for root translational residual magnitude in N (default: 75.0)",
+    )
+    parser.add_argument(
+        "--root-moment-warning-nm",
+        type=float,
+        default=25.0,
+        help="Warning threshold for root rotational residual magnitude in Nm (default: 25.0)",
     )
     return parser.parse_args()
 
@@ -190,6 +203,7 @@ def load_motion_csv(path: str | Path) -> MotionCsvData:
     values = {col: np.asarray(storage[col], dtype=np.float64) for col in columns}
     time, time_source, sample_rate_hz = _infer_time(values, row_count)
     dof_names = _detect_dofs(columns, values)
+    root_dofs = dof_names[:6]
     grf_bodies = _detect_grf_bodies(columns)
     has_total_grf = all(name in values for name in ("grf_total_x", "grf_total_y", "grf_total_z"))
 
@@ -202,6 +216,7 @@ def load_motion_csv(path: str | Path) -> MotionCsvData:
         time_source=time_source,
         sample_rate_hz=sample_rate_hz,
         dof_names=dof_names,
+        root_dofs=root_dofs,
         grf_bodies=grf_bodies,
         has_total_grf=has_total_grf,
     )
@@ -215,6 +230,76 @@ def _format_float(value: float, digits: int = 3) -> str:
 
 def _is_translational_dof(name: str) -> bool:
     return name.endswith("_tx") or name.endswith("_ty") or name.endswith("_tz")
+
+
+def _root_residual_summary(
+    data: MotionCsvData,
+    force_warning_n: float,
+    moment_warning_nm: float,
+) -> dict[str, object]:
+    root_dofs = data.root_dofs[:6]
+    root_moment_names = [name for name in root_dofs if not _is_translational_dof(name)]
+    root_force_names = [name for name in root_dofs if _is_translational_dof(name)]
+    root_moment_values = [data.values[name] for name in root_moment_names if name in data.values]
+    root_force_values = [data.values[name] for name in root_force_names if name in data.values]
+
+    root_moment_mag = (
+        np.sqrt(np.sum(np.square(np.vstack(root_moment_values)), axis=0))
+        if root_moment_values
+        else np.array([], dtype=np.float64)
+    )
+    root_force_mag = (
+        np.sqrt(np.sum(np.square(np.vstack(root_force_values)), axis=0))
+        if root_force_values
+        else np.array([], dtype=np.float64)
+    )
+
+    moment_peak = _safe_peak_abs(root_moment_mag)
+    force_peak = _safe_peak_abs(root_force_mag)
+    warning_lines: list[str] = []
+    if np.isfinite(force_peak) and force_peak > force_warning_n:
+        warning_lines.append(
+            f"Root translational residuals are large: peak |F| = {_format_float(force_peak, 2)} N "
+            f"> threshold {_format_float(force_warning_n, 2)} N"
+        )
+    if np.isfinite(moment_peak) and moment_peak > moment_warning_nm:
+        warning_lines.append(
+            f"Root rotational residuals are large: peak |M| = {_format_float(moment_peak, 2)} Nm "
+            f"> threshold {_format_float(moment_warning_nm, 2)} Nm"
+        )
+
+    per_dof_peaks = []
+    for name in root_dofs:
+        values = data.values.get(name)
+        if values is None:
+            continue
+        threshold = force_warning_n if _is_translational_dof(name) else moment_warning_nm
+        peak = _safe_peak_abs(values)
+        per_dof_peaks.append(
+            {
+                "name": name,
+                "peak": peak,
+                "threshold": threshold,
+                "is_warning": bool(np.isfinite(peak) and peak > threshold),
+            }
+        )
+        if np.isfinite(peak) and peak > threshold:
+            kind = "force" if _is_translational_dof(name) else "moment"
+            unit = "N" if kind == "force" else "Nm"
+            warning_lines.append(
+                f"{name} {kind} peak {_format_float(peak, 2)} {unit} exceeds "
+                f"{_format_float(threshold, 2)} {unit}"
+            )
+
+    return {
+        "root_dofs": root_dofs,
+        "root_force_mag": root_force_mag,
+        "root_moment_mag": root_moment_mag,
+        "force_peak": force_peak,
+        "moment_peak": moment_peak,
+        "warning_lines": warning_lines,
+        "per_dof_peaks": per_dof_peaks,
+    }
 
 
 def _contact_intervals(time_values: np.ndarray, contact: np.ndarray) -> list[tuple[float, float]]:
@@ -357,6 +442,105 @@ def add_title_page(pdf: PdfPages, data: MotionCsvData, title: str | None) -> Non
     )
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
+
+
+def add_root_residual_page(
+    pdf: PdfPages,
+    data: MotionCsvData,
+    force_warning_n: float,
+    moment_warning_nm: float,
+) -> list[str]:
+    summary = _root_residual_summary(data, force_warning_n, moment_warning_nm)
+    root_dofs = summary["root_dofs"]
+    warning_lines = list(summary["warning_lines"])
+
+    fig, axes = plt.subplots(3, 2, figsize=(11.69, 8.27), sharex=True)
+    fig.suptitle("Root Residuals", fontsize=16, fontweight="bold")
+
+    if warning_lines:
+        fig.text(
+            0.5,
+            0.955,
+            "Warnings: " + " | ".join(warning_lines),
+            ha="center",
+            va="top",
+            fontsize=9,
+            color="#B91C1C",
+            bbox=dict(facecolor="#FEE2E2", edgecolor="#FCA5A5", boxstyle="round,pad=0.4"),
+        )
+    else:
+        fig.text(
+            0.5,
+            0.955,
+            "No root residual warnings at the current thresholds.",
+            ha="center",
+            va="top",
+            fontsize=9,
+            color="#166534",
+            bbox=dict(facecolor="#DCFCE7", edgecolor="#86EFAC", boxstyle="round,pad=0.4"),
+        )
+
+    contact_intervals: list[tuple[float, float]] = []
+    for body in data.grf_bodies:
+        ccol = f"{body}_contact"
+        if ccol in data.values:
+            contact_intervals.extend(_contact_intervals(data.time, data.values[ccol]))
+    contact_intervals.sort(key=lambda x: x[0])
+
+    root_force_names = [name for name in root_dofs if _is_translational_dof(name)]
+    root_moment_names = [name for name in root_dofs if not _is_translational_dof(name)]
+    plot_order = root_moment_names + root_force_names
+    axes_flat = [ax for row in axes for ax in row]
+
+    for idx, (ax, dof_name) in enumerate(zip(axes_flat, plot_order)):
+        color = "#B45309" if _is_translational_dof(dof_name) else "#1D4ED8"
+        threshold = force_warning_n if _is_translational_dof(dof_name) else moment_warning_nm
+        unit = "N" if _is_translational_dof(dof_name) else "Nm"
+        _plot_signal(
+            ax,
+            data.time,
+            data.values[dof_name],
+            f"{dof_name} [{unit}]",
+            color,
+            contact_intervals=contact_intervals,
+        )
+        ax.axhline(threshold, color="#B91C1C", linestyle="--", linewidth=0.9, alpha=0.8)
+        ax.axhline(-threshold, color="#B91C1C", linestyle="--", linewidth=0.9, alpha=0.8)
+        peak = _safe_peak_abs(data.values[dof_name])
+        ax.set_title(f"peak |{dof_name}| = {_format_float(peak, 2)} {unit}", fontsize=9)
+
+    for ax in axes_flat[len(plot_order) :]:
+        ax.axis("off")
+
+    if warning_lines:
+        fig.text(
+            0.02,
+            0.02,
+            "Root residual warnings:\n" + "\n".join(f"- {line}" for line in warning_lines),
+            ha="left",
+            va="bottom",
+            fontsize=9,
+            family="monospace",
+            color="#7F1D1D",
+        )
+    else:
+        fig.text(
+            0.02,
+            0.02,
+            "Root residuals are below the configured warning thresholds.",
+            ha="left",
+            va="bottom",
+            fontsize=9,
+            family="monospace",
+            color="#14532D",
+        )
+
+    axes[-1, 0].set_xlabel("Time")
+    axes[-1, 1].set_xlabel("Time")
+    fig.tight_layout(rect=[0, 0.05, 1, 0.92])
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+    return warning_lines
 
 
 def add_overview_page(pdf: PdfPages, data: MotionCsvData) -> None:
@@ -593,11 +777,24 @@ def default_output_pdf(input_csv: Path) -> Path:
     return input_csv.with_name(f"{input_csv.stem}_report.pdf")
 
 
-def build_pdf_report(data: MotionCsvData, output_pdf: Path, title: str | None, max_dofs: int | None) -> dict[str, object]:
+def build_pdf_report(
+    data: MotionCsvData,
+    output_pdf: Path,
+    title: str | None,
+    max_dofs: int | None,
+    root_force_warning_n: float,
+    root_moment_warning_nm: float,
+) -> dict[str, object]:
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
     with PdfPages(output_pdf) as pdf:
         add_title_page(pdf, data, title=title)
         add_overview_page(pdf, data)
+        root_warning_lines = add_root_residual_page(
+            pdf,
+            data,
+            force_warning_n=root_force_warning_n,
+            moment_warning_nm=root_moment_warning_nm,
+        )
         dof_pages = add_dof_pages(pdf, data, max_dofs=max_dofs)
         grf_pages = add_grf_pages(pdf, data)
 
@@ -607,9 +804,11 @@ def build_pdf_report(data: MotionCsvData, output_pdf: Path, title: str | None, m
         "frames": data.n_frames,
         "duration_s": float(data.time[-1] - data.time[0]) if data.n_frames > 1 else 0.0,
         "dof_count": len(data.dof_names),
+        "root_dof_count": len(data.root_dofs),
         "dof_pages": dof_pages,
         "grf_pages": grf_pages,
         "sample_rate_hz": data.sample_rate_hz,
+        "root_warning_lines": root_warning_lines,
     }
 
 
@@ -627,6 +826,8 @@ def main() -> int:
         output_pdf=output_pdf,
         title=args.title,
         max_dofs=args.max_dofs,
+        root_force_warning_n=args.root_force_warning_n,
+        root_moment_warning_nm=args.root_moment_warning_nm,
     )
 
     print("CSV Explorer report generated successfully.")
