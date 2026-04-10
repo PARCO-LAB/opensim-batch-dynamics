@@ -25,6 +25,11 @@ Main entrypoint:
 - Marker map: `assets/smpl2ab/bsm_markers_smplx.yaml`
 - Local AddBiomechanics checkout (see setup below)
 
+AMASS compatibility note:
+
+- The loader supports both Stage-II style `.npz` files and legacy AMASS files with `poses/trans`.
+- If present, sibling `shape.npz` is used automatically as fallback for `gender` and `betas`.
+
 ## Ubuntu Setup
 
 1. Install system dependencies:
@@ -113,6 +118,41 @@ Final output:
 - `outputs/bsm/A3_swing_full.csv`
 
 With `--cleanup-intermediate`, all temporary files under `outputs/bsm/<trial>/` are removed after a successful run, leaving only the final CSV.
+
+## Batch Parallel Runner
+
+To process an entire AMASS folder in parallel, use:
+
+```bash
+python scripts/run_amass_batch_parallel.py \
+  --input-root /path/to/AMASS \
+  --output-dir outputs/bsm_batch \
+  --workers 8 \
+  --smplx-model-dir model/smpl \
+  --bsm-model model/bsm/bsm.osim \
+  --addbio-root "$HOME/AddBiomechanics" \
+  --id-grf-mode estimated \
+  --cleanup-intermediate
+```
+
+What it does:
+
+- recursively scans `--input-root` for `.npz` files
+- runs the full pipeline in parallel (`--workers N`)
+- writes one final CSV per input `.npz` (preserving folder structure in `--output-dir`)
+- writes per-file logs under `outputs/bsm_batch/logs/`
+- writes a global summary JSON at `outputs/bsm_batch/batch_summary.json`
+
+Useful options:
+
+- `--dry-run` to preview discovered files and planned outputs
+- `--limit N` to run only the first `N` discovered files
+- `--no-skip-existing` to force re-run even when output CSV already exists
+- `--no-cleanup-intermediate` to keep intermediate artifacts
+
+Note on SMB paths:
+
+- If your dataset path is like `smb://parconas.di.univr.it/MAEVE/dataset/AMASS`, mount it first (for example to `/Volumes/AMASS`) and pass the mounted local path to `--input-root`.
 
 ## Output Format
 

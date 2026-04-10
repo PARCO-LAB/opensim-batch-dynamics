@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-_REQUIRED_FIELDS = (
+_REQUIRED_SMPLX_FIELDS = (
     "surface_model_type",
     "gender",
     "mocap_frame_rate",
@@ -19,7 +19,29 @@ _REQUIRED_FIELDS = (
     "betas",
 )
 
-_SHARED_FIELDS = ("surface_model_type", "gender", "mocap_frame_rate", "betas")
+_KNOWN_FIELDS = (
+    "surface_model_type",
+    "gender",
+    "mocap_frame_rate",
+    "mocap_framerate",
+    "trans",
+    "root_orient",
+    "pose_body",
+    "pose_hand",
+    "pose_jaw",
+    "pose_eye",
+    "betas",
+    "poses",
+    "dmpls",
+)
+
+_SHARED_FIELDS = (
+    "surface_model_type",
+    "gender",
+    "mocap_frame_rate",
+    "mocap_framerate",
+    "betas",
+)
 
 
 def _to_scalar(value: Any) -> Any:
@@ -126,31 +148,76 @@ def _build_sequence_from_fields(
     fields: Mapping[str, Any],
 ) -> AMASSSequence:
     """Build and validate one AMASSSequence from a field mapping."""
-    missing_fields = [key for key in _REQUIRED_FIELDS if key not in fields]
-    if missing_fields:
+    surface_model_type = _to_str(fields.get("surface_model_type", "unknown")).lower()
+    gender = _to_str(fields.get("gender", "neutral")).lower()
+
+    frame_rate_raw = fields.get("mocap_frame_rate")
+    if frame_rate_raw is None:
+        frame_rate_raw = fields.get("mocap_framerate")
+    if frame_rate_raw is None:
         raise KeyError(
-            f"Missing required AMASS fields {missing_fields} while parsing '{source.name}'"
+            f"Missing frame-rate field while parsing '{source.name}'. "
+            "Expected 'mocap_frame_rate' or 'mocap_framerate'."
         )
+    frame_rate_hz = _to_float(frame_rate_raw)
 
-    surface_model_type = _to_str(fields["surface_model_type"])
-    if surface_model_type.lower() != "smplx":
-        raise ValueError(
-            "Only AMASS files with surface_model_type='smplx' are supported. "
-            f"Found '{surface_model_type}'."
-        )
-
-    gender = _to_str(fields["gender"]).lower()
-    frame_rate_hz = _to_float(fields["mocap_frame_rate"])
-
+    if "trans" not in fields:
+        raise KeyError(f"Missing required field 'trans' while parsing '{source.name}'")
     trans = np.asarray(fields["trans"], dtype=np.float32)
-    root_orient = np.asarray(fields["root_orient"], dtype=np.float32)
-    body_pose = np.asarray(fields["pose_body"], dtype=np.float32)
-    pose_hand = np.asarray(fields["pose_hand"], dtype=np.float32)
-    jaw_pose = np.asarray(fields["pose_jaw"], dtype=np.float32)
-    pose_eye = np.asarray(fields["pose_eye"], dtype=np.float32)
-    betas = np.asarray(fields["betas"], dtype=np.float32).reshape(-1)
-
     _check_shape(trans, 3, "trans")
+    n_frames = trans.shape[0]
+
+    # Stage-II style AMASS (already split in SMPL-X fields).
+    has_split_smplx_fields = all(
+        key in fields for key in ("root_orient", "pose_body", "pose_hand", "pose_jaw", "pose_eye")
+    )
+    # Original AMASS style (single 'poses' matrix + optional shape.npz for betas/gender).
+    has_legacy_poses = "poses" in fields
+
+    if has_split_smplx_fields:
+        if surface_model_type not in {"smplx", "unknown"}:
+            raise ValueError(
+                "Unsupported split-pose format with surface_model_type != 'smplx'. "
+                f"Found '{surface_model_type}'."
+            )
+        root_orient = np.asarray(fields["root_orient"], dtype=np.float32)
+        body_pose = np.asarray(fields["pose_body"], dtype=np.float32)
+        pose_hand = np.asarray(fields["pose_hand"], dtype=np.float32)
+        jaw_pose = np.asarray(fields["pose_jaw"], dtype=np.float32)
+        pose_eye = np.asarray(fields["pose_eye"], dtype=np.float32)
+        betas = np.asarray(fields["betas"], dtype=np.float32).reshape(-1)
+        normalized_surface_model_type = "smplx"
+    elif has_legacy_poses:
+        poses = np.asarray(fields["poses"], dtype=np.float32)
+        if poses.ndim != 2 or poses.shape[0] != n_frames:
+            raise ValueError(
+                f"Expected poses shape (T, D) with T={n_frames}, got {poses.shape}"
+            )
+        if poses.shape[1] < 66:
+            raise ValueError(
+                "Legacy AMASS poses must have at least 66 columns "
+                f"(global_orient + body), got {poses.shape[1]}"
+            )
+        root_orient = poses[:, :3]
+        body_pose = poses[:, 3:66]
+
+        hand_dim = max(0, min(90, poses.shape[1] - 66))
+        pose_hand = np.zeros((n_frames, 90), dtype=np.float32)
+        if hand_dim > 0:
+            pose_hand[:, :hand_dim] = poses[:, 66 : 66 + hand_dim]
+
+        # Legacy AMASS files usually do not include face parameters.
+        jaw_pose = np.zeros((n_frames, 3), dtype=np.float32)
+        pose_eye = np.zeros((n_frames, 6), dtype=np.float32)
+        betas = np.asarray(fields["betas"], dtype=np.float32).reshape(-1)
+        normalized_surface_model_type = "smplx"
+    else:
+        missing_fields = [key for key in _REQUIRED_SMPLX_FIELDS if key not in fields]
+        raise KeyError(
+            f"Unsupported AMASS layout in '{source.name}'. Missing split fields {missing_fields} "
+            "and no legacy 'poses' field found."
+        )
+
     _check_shape(root_orient, 3, "root_orient")
     _check_shape(body_pose, 63, "pose_body")
     _check_shape(jaw_pose, 3, "pose_jaw")
@@ -165,7 +232,6 @@ def _build_sequence_from_fields(
     leye_pose = pose_eye[:, :3].astype(np.float32, copy=False)
     reye_pose = pose_eye[:, 3:6].astype(np.float32, copy=False)
 
-    n_frames = trans.shape[0]
     expected_arrays = {
         "root_orient": root_orient,
         "body_pose": body_pose,
@@ -186,7 +252,7 @@ def _build_sequence_from_fields(
 
     return AMASSSequence(
         source_path=source,
-        surface_model_type=surface_model_type.lower(),
+        surface_model_type=normalized_surface_model_type,
         gender=gender,
         frame_rate_hz=frame_rate_hz,
         trans=trans,
@@ -199,6 +265,41 @@ def _build_sequence_from_fields(
         reye_pose=reye_pose,
         betas=betas,
     )
+
+
+def _load_shape_fallback(source: Path) -> dict[str, Any]:
+    """
+    Load optional shape metadata from sibling ``shape.npz``.
+
+    AMASS often stores subject-level ``gender`` and ``betas`` in this file.
+    """
+    shape_path = source.parent / "shape.npz"
+    if not shape_path.exists():
+        return {}
+    with np.load(shape_path, allow_pickle=True) as shape_npz:
+        out: dict[str, Any] = {}
+        if "gender" in shape_npz.files:
+            out["gender"] = shape_npz["gender"]
+        if "betas" in shape_npz.files:
+            out["betas"] = shape_npz["betas"]
+        return out
+
+
+def _apply_shape_fallback(fields: Mapping[str, Any], shape_defaults: Mapping[str, Any]) -> dict[str, Any]:
+    """Fill missing (or invalid) fields from shape defaults."""
+    merged = dict(fields)
+    if "gender" not in merged and "gender" in shape_defaults:
+        merged["gender"] = shape_defaults["gender"]
+    if "betas" not in merged and "betas" in shape_defaults:
+        merged["betas"] = shape_defaults["betas"]
+    elif "betas" in merged and "betas" in shape_defaults:
+        try:
+            betas = np.asarray(merged["betas"]).reshape(-1)
+            if betas.size < 10:
+                merged["betas"] = shape_defaults["betas"]
+        except Exception:
+            merged["betas"] = shape_defaults["betas"]
+    return merged
 
 
 def _extract_records_from_trials_obj(trials_obj: Any) -> dict[str, dict[str, Any]]:
@@ -234,6 +335,7 @@ def load_all_amass_npz(path: str | Path) -> dict[str, AMASSSequence]:
     - Multi-trial object container under ``trials`` (dict/list of records).
     """
     source = Path(path).resolve()
+    shape_defaults = _load_shape_fallback(source)
     with np.load(source, allow_pickle=True) as npz:
         shared_fields = {name: npz[name] for name in _SHARED_FIELDS if name in npz.files}
         prefixed_records: dict[str, dict[str, Any]] = {}
@@ -242,7 +344,7 @@ def load_all_amass_npz(path: str | Path) -> dict[str, AMASSSequence]:
             if "/" not in key:
                 continue
             trial_name, field_name = key.rsplit("/", 1)
-            if field_name in _REQUIRED_FIELDS:
+            if field_name in _KNOWN_FIELDS:
                 prefixed_records.setdefault(trial_name, {})[field_name] = npz[key]
 
         if prefixed_records:
@@ -250,6 +352,7 @@ def load_all_amass_npz(path: str | Path) -> dict[str, AMASSSequence]:
             for trial_name, fields in prefixed_records.items():
                 merged_fields = dict(shared_fields)
                 merged_fields.update(fields)
+                merged_fields = _apply_shape_fallback(merged_fields, shape_defaults)
                 sequences[str(trial_name)] = _build_sequence_from_fields(source, merged_fields)
             return sequences
 
@@ -260,11 +363,13 @@ def load_all_amass_npz(path: str | Path) -> dict[str, AMASSSequence]:
                 for trial_name, fields in trial_records.items():
                     merged_fields = dict(shared_fields)
                     merged_fields.update(fields)
+                    merged_fields = _apply_shape_fallback(merged_fields, shape_defaults)
                     sequences[str(trial_name)] = _build_sequence_from_fields(source, merged_fields)
                 return sequences
 
         # Fallback: standard AMASS single-trial layout.
         top_level_fields = {name: npz[name] for name in npz.files}
+        top_level_fields = _apply_shape_fallback(top_level_fields, shape_defaults)
         default_trial_name = source.stem
         return {default_trial_name: _build_sequence_from_fields(source, top_level_fields)}
 
