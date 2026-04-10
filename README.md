@@ -149,6 +149,23 @@ GRF values are explicitly encoded with zeros when no contact is detected, so CSV
 - `--final-csv-path /custom/output.csv` (optional)
 - `--cleanup-intermediate` (keep only final CSV)
 
+## CSV Explorer (PDF Report)
+
+You can generate a full multi-page PDF report from any unified output CSV with:
+
+```bash
+python scripts/csv_explorer.py \
+  --input-csv outputs/bsm/A3-_Swing_arms_stageii.csv \
+  --output-pdf outputs/bsm/A3-_Swing_arms_stageii_report.pdf
+```
+
+The report includes:
+
+- global summary (frames, duration, sample rate, detected DOFs and GRFs)
+- motion overview statistics
+- one page per DOF with position/velocity/acceleration/(torque if present)
+- GRF pages for each contact body and total GRF
+
 ## Legacy Scripts
 
 The previous pipelines are still available:
