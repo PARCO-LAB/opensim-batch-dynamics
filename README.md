@@ -1,36 +1,63 @@
-# AMASS -> OpenSim Torque-Only Pipeline
+# AMASS -> BSM OpenSim Unified CSV Pipeline
 
-This repository contains only the files needed to convert an AMASS `.npz` sequence into:
+This repository provides an end-to-end pipeline that takes an AMASS `.npz` file and produces a **single unified `.csv`** with:
 
-- `.mot` (OpenSim inverse kinematics motion)
-- `.osim` (scaled torque-only model, no muscles)
-- `.csv` (frame-by-frame DOF table for the torque-only model, including velocity and acceleration columns)
+- DOF positions
+- DOF velocities
+- DOF accelerations
+- DOF torques
+- Ground reaction forces (per foot + total)
+- Binary contact codes (`0/1`) per foot
 
-The default model is `model/LaiUhlrich2022_torque_only.osim`.
+`knee_angle_r_beta` and `knee_angle_l_beta` are removed from the final output (they are always `NaN`), so the final CSV contains **49 effective DOFs**.
 
-## Minimal Repository Structure
+Main entrypoint:
 
-- `scripts/run_amass_to_opensim.py`: single CLI entrypoint
-- `src/opensim_batch_dynamics/`: pipeline implementation
-- `assets/opencap/`: XML configs and marker mapping used for scaling and IK
-- `model/LaiUhlrich2022_torque_only.osim`: torque-actuated model (no muscles)
-- `model/Geometry/`: OpenSim mesh files required by the model
-- `model/smpl/SMPLX_NEUTRAL.npz`: SMPL-X model file
+- [run_amass_to_bsm_csv.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/run_amass_to_bsm_csv.py)
+- `--trial all` runs every trial found inside a multi-trial `.npz` and exports one CSV per trial.
 
-## Setup with Conda
+## Required Inputs and Assets
 
-### Ubuntu
+- AMASS input file (example): `data/A3-_Swing_arms_stageii.npz`
+- SMPL-X model file: `model/smpl/SMPLX_NEUTRAL.npz`
+- BSM OpenSim model: `model/bsm/bsm.osim`
+- BSM geometry folder: `model/bsm/Geometry/`
+- Marker map: `assets/smpl2ab/bsm_markers_smplx.yaml`
+- Local AddBiomechanics checkout (see setup below)
 
-1. Install Miniconda (if needed):
+## Ubuntu Setup
+
+1. Install system dependencies:
 
 ```bash
 sudo apt update
-sudo apt install -y wget
+sudo apt install -y git wget
+```
+
+2. Install Conda (Miniconda), if needed:
+
+```bash
 wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
-bash miniconda.sh -b -p $HOME/miniconda3
-eval "$($HOME/miniconda3/bin/conda shell.bash hook)"
+bash miniconda.sh -b -p "$HOME/miniconda3"
+eval "$("$HOME/miniconda3/bin/conda" shell.bash hook)"
 ```
 
+3. Create and activate the environment:
+
+```bash
+conda env create -f environment.yml
+conda activate opensim-torque
+```
+
+4. Clone AddBiomechanics:
+
+```bash
+git clone https://github.com/keenon/AddBiomechanics.git "$HOME/AddBiomechanics"
+```
+
+## macOS Setup (Apple Silicon + Intel)
+
+1. Install Conda (Miniconda or Miniforge).
 2. Create and activate the environment:
 
 ```bash
@@ -38,107 +65,93 @@ conda env create -f environment.yml
 conda activate opensim-torque
 ```
 
-### macOS (Apple Silicon and Intel)
-
-1. Install Miniconda for your architecture:
-
-- Apple Silicon (M1/M2/M3):
+3. Clone AddBiomechanics:
 
 ```bash
-curl -L -o miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-arm64.sh
-bash miniconda.sh -b -p $HOME/miniconda3
-eval "$($HOME/miniconda3/bin/conda shell.zsh hook)"
+git clone https://github.com/keenon/AddBiomechanics.git "$HOME/AddBiomechanics"
 ```
 
-- Intel:
+Notes for macOS:
+
+- The pipeline script sets `KMP_DUPLICATE_LIB_OK=TRUE` automatically to avoid OpenMP runtime conflicts.
+- If `python` is not available in your shell, use `python3` (inside the activated conda env, `python` is usually available).
+
+## One Command End-to-End
+
+Run the full pipeline with one Python command:
 
 ```bash
-curl -L -o miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-x86_64.sh
-bash miniconda.sh -b -p $HOME/miniconda3
-eval "$($HOME/miniconda3/bin/conda shell.zsh hook)"
-```
-
-2. Create and activate the environment:
-
-```bash
-conda env create -f environment.yml
-conda activate opensim-torque
-```
-
-### Quick Environment Check
-
-```bash
-python -c "import opensim, torch, smplx; print('Environment OK')"
-```
-
-## Run the Pipeline
-
-```bash
-python scripts/run_amass_to_opensim.py \
+python scripts/run_amass_to_bsm_csv.py \
   --input data/A3-_Swing_arms_stageii.npz \
-  --trial demo_torque \
-  --output-dir outputs \
-  --mass-kg 75 \
-  --height-m 1.75 \
-  --sex neutral
+  --trial A3_swing_full \
+  --output-dir outputs/bsm \
+  --smplx-model-dir model/smpl \
+  --bsm-model model/bsm/bsm.osim \
+  --addbio-root "$HOME/AddBiomechanics" \
+  --id-grf-mode estimated \
+  --cleanup-intermediate
 ```
 
-## Generated Outputs
+If your shell does not resolve `python`, run the same command with `python3`.
 
-- `outputs/MarkerData/<trial>/<trial>.trc`
-- `outputs/OpenSim/Model/<trial>/LaiUhlrich2022_torque_only_scaled.osim`
-- `outputs/OpenSim/IK/<trial>/<trial>.mot`
-- `outputs/OpenSim/IK/<trial>/<trial>_dofs.csv`
-
-The script prints a final JSON payload with the absolute paths of all generated files.
-
-The CSV contains:
-
-- Position columns: `<dof>`
-- Velocity columns: `<dof>_vel`
-- Acceleration columns: `<dof>_acc`
-
-Velocity and acceleration are computed from filtered DOF trajectories.
-Filtering uses a 4th-order zero-phase Butterworth low-pass filter.
-
-## Useful CLI Options
-
-- `--skip-scale`: skip scaling and use `--model-path` directly
-- `--skip-ik`: do not run IK (so no `.mot` and no `.csv`)
-- `--trc-only`: export only TRC files
-- `--csv-path /path/file.csv`: custom CSV output path
-- `--csv-model-path /path/model.osim`: model used to order CSV DOF columns
-- `--missing-fill 0`: fill value for DOFs missing in `.mot` (default: `nan`)
-- `--filter-mode auto|walking|dynamic|none`: filtering strategy
-- `--filter-cutoff-hz 20`: explicit cutoff override in Hz
-- `--no-velocity-columns`: disable `<dof>_vel` columns
-- `--no-acceleration-columns`: disable `<dof>_acc` columns
-
-## Practical Notes
-
-- This repo includes only `SMPLX_NEUTRAL.npz`. For male/female AMASS files, you can still run with `--sex neutral`.
-- If OpenSim reports missing mesh files, make sure `model/Geometry` is present next to the `.osim` model.
-
-## Replay in Nimble (optional)
-
-You can replay the generated DOF CSV on the OpenSim model with:
+To export one CSV per trial from a multi-trial `.npz`, use:
 
 ```bash
-python scripts/run_nimble.py \
-  --osim model/LaiUhlrich2022_torque_only.osim \
-  --csv outputs/OpenSim/IK/demo_torque/demo_torque_dofs.csv \
-  --max-frames 200
+python scripts/run_amass_to_bsm_csv.py \
+  --input data/your_multitrial_file.npz \
+  --trial all \
+  --output-dir outputs/bsm \
+  --smplx-model-dir model/smpl \
+  --bsm-model model/bsm/bsm.osim \
+  --addbio-root "$HOME/AddBiomechanics" \
+  --id-grf-mode estimated \
+  --cleanup-intermediate
 ```
 
-By default geometry loading is disabled (faster and quieter).  
-If you want mesh loading too, add `--load-geometry --geometry-dir model/Geometry`.
+Final output:
 
-Optional realtime playback:
+- `outputs/bsm/A3_swing_full.csv`
 
-```bash
-python scripts/run_nimble.py \
-  --osim model/LaiUhlrich2022_torque_only.osim \
-  --csv outputs/OpenSim/IK/demo_torque/demo_torque_dofs.csv \
-  --realtime --speed 1.0
-```
-- `auto` filter mode uses 12 Hz for gait-like trial names and 30 Hz otherwise.
+With `--cleanup-intermediate`, all temporary files under `outputs/bsm/<trial>/` are removed after a successful run, leaving only the final CSV.
+
+## Output Format
+
+The unified CSV includes:
+
+- `frame`, `time`
+- For each DOF: `<dof>`, `<dof>_vel`, `<dof>_acc`, `<dof>_tau`
+- GRF columns (per contact body and total)
+- Contact code columns (for example `calcn_l_contact`, `calcn_r_contact`)
+
+GRF values are explicitly encoded with zeros when no contact is detected, so CSV schemas stay consistent across motions (including jumps/flight phases).
+
+## Pipeline Summary
+
+1. Load AMASS (`SMPL-X`) from `.npz`.
+2. Run SMPL-X forward pass.
+3. Extract BSM virtual markers from SMPL-X vertices.
+4. Export `markers.trc`.
+5. Run AddBiomechanics scaling + kinematic fit.
+6. Export fitted `.osim` and `.mot`.
+7. Compute DOF kinematics (`q`, `qdot`, `qddot`).
+8. Estimate contact wrenches/GRF from motion.
+9. Run inverse dynamics in OpenSim.
+10. Merge kinematics + torques + GRF/contact into one final CSV.
+
+## Key CLI Options
+
+- `--addbio-root /path/to/AddBiomechanics`
+- `--id-grf-mode {estimated,none}` (default: `estimated`)
+- `--id-contact-bodies calcn_l,calcn_r` (default)
+- `--id-friction-coeff 0.8` (default)
+- `--id-filter-mode {auto,walking,dynamic,none}` (default: `auto`)
+- `--id-cutoff-hz <float>` (optional custom cutoff)
+- `--final-csv-path /custom/output.csv` (optional)
+- `--cleanup-intermediate` (keep only final CSV)
+
+## Legacy Scripts
+
+The previous pipelines are still available:
+
+- [run_amass_to_opensim.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/run_amass_to_opensim.py)
+- [run_amass_to_opencap_legacy.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/run_amass_to_opencap_legacy.py)
