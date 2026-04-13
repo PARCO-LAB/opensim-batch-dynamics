@@ -159,9 +159,11 @@ Note on SMB paths:
 The unified CSV includes:
 
 - `frame`, `time`
+- Subject metadata: `subject_mass_kg`, `subject_height_m`
+- Body scaling metadata: `<body>_scale_x`, `<body>_scale_y`, `<body>_scale_z` (one triplet for each model body)
 - For each DOF: `<dof>`, `<dof>_vel`, `<dof>_acc`, `<dof>_tau`
-- GRF columns (per contact body and total)
-- Contact code columns (for example `calcn_l_contact`, `calcn_r_contact`)
+- GRF columns (for every detected contact body and total)
+- Contact code columns (for every detected contact body, for example `hand_l_contact`, `tibia_r_contact`, `calcn_l_contact`)
 
 GRF values are explicitly encoded with zeros when no contact is detected, so CSV schemas stay consistent across motions (including jumps/flight phases).
 
@@ -182,7 +184,7 @@ GRF values are explicitly encoded with zeros when no contact is detected, so CSV
 
 - `--addbio-root /path/to/AddBiomechanics`
 - `--id-grf-mode {estimated,none}` (default: `estimated`)
-- `--id-contact-bodies calcn_l,calcn_r` (default)
+- `--id-contact-bodies all` (default; uses all model body nodes as contact candidates)
 - `--id-friction-coeff 0.8` (default)
 - `--id-filter-mode {auto,walking,dynamic,none}` (default: `auto`)
 - `--id-cutoff-hz <float>` (optional custom cutoff)

@@ -124,7 +124,7 @@ def parse_args() -> argparse.Namespace:
         default="estimated",
         choices=["estimated", "none"],
     )
-    parser.add_argument("--id-contact-bodies", default="calcn_l,calcn_r")
+    parser.add_argument("--id-contact-bodies", default="all")
     parser.add_argument("--id-friction-coeff", type=float, default=0.8)
     parser.add_argument("--id-contact-height-threshold-m", type=float, default=0.06)
     parser.add_argument("--id-contact-speed-threshold-mps", type=float, default=0.6)

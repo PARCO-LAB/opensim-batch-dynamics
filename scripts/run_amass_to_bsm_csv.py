@@ -86,8 +86,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--id-contact-bodies",
-        default="calcn_l,calcn_r",
-        help="Comma-separated contact body names used to estimate GRF (default: calcn_l,calcn_r)",
+        default="all",
+        help=(
+            "Comma-separated contact body names used to estimate GRF. "
+            "Use 'all' (default) to consider all body nodes."
+        ),
     )
     parser.add_argument(
         "--id-friction-coeff",
@@ -149,6 +152,30 @@ def _resolve_all_mode_final_csv_root(args: argparse.Namespace, output_root: Path
         )
     custom_path.mkdir(parents=True, exist_ok=True)
     return custom_path
+
+
+def _parse_contact_body_names(raw_names: str) -> tuple[str, ...]:
+    names = tuple(name.strip() for name in raw_names.split(",") if name.strip())
+    if not names:
+        return ("all",)
+    return names
+
+
+def _fallback_contact_bodies_for_csv(contact_body_names: tuple[str, ...]) -> tuple[str, ...]:
+    """
+    Build safe fallback names for final CSV export.
+
+    We avoid sentinel names like 'all'/'auto' because they are not actual body
+    names and would create invalid columns when GRF/contact CSV is unavailable.
+    """
+    filtered = tuple(
+        name
+        for name in contact_body_names
+        if name.lower() not in {"all", "auto", "*"}
+    )
+    if filtered:
+        return filtered
+    return ("calcn_l", "calcn_r")
 
 
 def _run_single_trial_pipeline(
@@ -252,9 +279,8 @@ def _run_single_trial_pipeline(
     torque_summary = None
     final_csv_summary = None
     if not args.skip_inverse_dynamics:
-        contact_body_names = tuple(
-            body.strip() for body in args.id_contact_bodies.split(",") if body.strip()
-        )
+        contact_body_names = _parse_contact_body_names(args.id_contact_bodies)
+        fallback_contact_bodies = _fallback_contact_bodies_for_csv(contact_body_names)
         id_output_subdir = "ID_estimatedGRF" if args.id_grf_mode == "estimated" else "ID_noGRF"
         torque_summary = run_inverse_dynamics_and_export_torque_csv(
             model_path=engine_result.final_model_path,
@@ -275,8 +301,10 @@ def _run_single_trial_pipeline(
             torque_csv_path=torque_summary.torque_csv_path,
             output_csv_path=resolved_final_csv_path,
             contact_wrench_csv_path=torque_summary.contact_wrench_csv_path,
+            subject_json_path=subject_folder.subject_json_path,
+            model_path=engine_result.final_model_path,
             excluded_dofs=("knee_angle_r_beta", "knee_angle_l_beta"),
-            fallback_contact_bodies=contact_body_names if contact_body_names else ("calcn_l", "calcn_r"),
+            fallback_contact_bodies=fallback_contact_bodies,
         )
 
     summary = {
@@ -311,6 +339,9 @@ def _run_single_trial_pipeline(
     if final_csv_summary is not None:
         summary["final_dof_count"] = len(final_csv_summary.dof_names)
         summary["final_contact_bodies"] = list(final_csv_summary.contact_body_names)
+        summary["final_body_scale_names"] = list(final_csv_summary.body_scale_names)
+        summary["final_subject_mass_kg"] = final_csv_summary.mass_kg
+        summary["final_subject_height_m"] = final_csv_summary.height_m
         summary["excluded_dofs_in_final_csv"] = ["knee_angle_r_beta", "knee_angle_l_beta"]
 
     if args.cleanup_intermediate:

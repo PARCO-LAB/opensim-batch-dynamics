@@ -196,7 +196,7 @@ def _estimate_contact_wrenches_from_kinematics(
     force_cutoff_hz: float | None,
 ) -> tuple[Path, Path, Path]:
     """
-    Estimate per-foot contact wrenches from kinematics and export OpenSim GRF artifacts.
+    Estimate multi-body contact wrenches from kinematics and export OpenSim GRF artifacts.
 
     This implementation enforces linear COM dynamics:
         sum(F_contacts) ~= m * (a_com - g)
@@ -237,20 +237,39 @@ def _estimate_contact_wrenches_from_kinematics(
     up = -gravity / gravity_norm
     mass_kg = float(skel.getMass())
 
-    available_names = {skel.getBodyNode(i).getName() for i in range(skel.getNumBodyNodes())}
-    selected_names = [name for name in contact_body_names if name in available_names]
-    if len(selected_names) < 2:
-        for fallback in ("toes_l", "toes_r", "foot_l", "foot_r", "calcn_l", "calcn_r"):
-            if fallback in available_names and fallback not in selected_names:
+    available_names = [skel.getBodyNode(i).getName() for i in range(skel.getNumBodyNodes())]
+    available_set = set(available_names)
+
+    requested_names = tuple(name.strip() for name in contact_body_names if name.strip())
+    requested_lower = {name.lower() for name in requested_names}
+    use_all_bodies = bool(requested_lower & {"all", "auto", "*"})
+
+    if use_all_bodies:
+        selected_names = [name for name in available_names if name.lower() != "ground"]
+    else:
+        selected_names = [name for name in requested_names if name in available_set]
+
+    if not selected_names:
+        for fallback in (
+            "toes_l",
+            "toes_r",
+            "foot_l",
+            "foot_r",
+            "calcn_l",
+            "calcn_r",
+            "hand_l",
+            "hand_r",
+        ):
+            if fallback in available_set and fallback not in selected_names:
                 selected_names.append(fallback)
-            if len(selected_names) >= 2:
-                break
-    if len(selected_names) < 2:
+    if not selected_names and available_names:
+        # Last-resort fallback: keep pipeline runnable on unfamiliar models.
+        selected_names = [available_names[0]]
+    if not selected_names:
         raise ValueError(
-            "Could not resolve at least two contact bodies for GRF estimation. "
-            f"Requested={contact_body_names}, available={sorted(available_names)}"
+            "Could not resolve any contact body for GRF estimation. "
+            f"Requested={contact_body_names}, available={available_names}"
         )
-    selected_names = selected_names[:2]
     contact_nodes = [skel.getBodyNode(name) for name in selected_names]
 
     frames = poses.shape[1]
@@ -554,7 +573,7 @@ def run_inverse_dynamics_with_estimated_grf(
     trial_name: str,
     filter_mode: str = "auto",
     cutoff_hz: float | None = None,
-    contact_body_names: tuple[str, ...] = ("calcn_l", "calcn_r"),
+    contact_body_names: tuple[str, ...] = ("all",),
     friction_coeff: float = 0.8,
     contact_height_threshold_m: float = 0.06,
     contact_speed_threshold_mps: float = 0.6,
@@ -701,7 +720,7 @@ def run_inverse_dynamics_and_export_torque_csv(
     filter_mode: str = "auto",
     cutoff_hz: float | None = None,
     grf_mode: str = "estimated",
-    contact_body_names: tuple[str, ...] = ("calcn_l", "calcn_r"),
+    contact_body_names: tuple[str, ...] = ("all",),
     friction_coeff: float = 0.8,
     contact_height_threshold_m: float = 0.06,
     contact_speed_threshold_mps: float = 0.6,
