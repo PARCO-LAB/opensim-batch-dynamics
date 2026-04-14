@@ -75,16 +75,29 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--skip-existing-csv",
+        dest="skip_existing",
+        action="store_true",
+        help="Skip files whose final CSV already exists and is non-empty (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-skip-existing-csv",
+        dest="skip_existing",
+        action="store_false",
+        help="Do not skip existing CSVs.",
+    )
+    # Backward-compatible aliases.
+    parser.add_argument(
         "--skip-existing",
         dest="skip_existing",
         action="store_true",
-        help="Skip files whose final CSV already exists (default: enabled).",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--no-skip-existing",
         dest="skip_existing",
         action="store_false",
-        help="Do not skip existing CSVs.",
+        help=argparse.SUPPRESS,
     )
     parser.set_defaults(skip_existing=True)
     parser.add_argument(
@@ -236,13 +249,17 @@ def _build_single_run_cmd(
     return cmd
 
 
+def _is_existing_csv_ready(path: Path) -> bool:
+    return path.exists() and path.is_file() and path.stat().st_size > 0
+
+
 def _run_single_task(
     args: argparse.Namespace,
     pipeline_script: Path,
     output_root: Path,
     task: BatchTask,
 ) -> BatchTaskResult:
-    if args.skip_existing and task.output_csv_path.exists():
+    if args.skip_existing and _is_existing_csv_ready(task.output_csv_path):
         return BatchTaskResult(
             task=task,
             status="skipped",
@@ -395,6 +412,11 @@ def main() -> int:
     print(f"Discovered {len(tasks)} .npz files under: {input_root}")
     print(f"Output root: {output_root}")
     print(f"Workers: {args.workers}")
+    if args.skip_existing:
+        existing = sum(1 for task in tasks if _is_existing_csv_ready(task.output_csv_path))
+        print(f"Skip existing CSVs: enabled ({existing} already present)")
+    else:
+        print("Skip existing CSVs: disabled")
 
     if args.dry_run:
         for idx, task in enumerate(tasks, start=1):

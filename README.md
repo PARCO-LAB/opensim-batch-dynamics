@@ -147,12 +147,53 @@ Useful options:
 
 - `--dry-run` to preview discovered files and planned outputs
 - `--limit N` to run only the first `N` discovered files
-- `--no-skip-existing` to force re-run even when output CSV already exists
+- `--skip-existing-csv` (default) skips files when the destination CSV already exists and is non-empty
+- `--no-skip-existing-csv` to force re-run even when output CSV already exists
 - `--no-cleanup-intermediate` to keep intermediate artifacts
 
 Note on SMB paths:
 
 - If your dataset path is like `smb://parconas.di.univr.it/MAEVE/dataset/AMASS`, mount it first (for example to `/Volumes/AMASS`) and pass the mounted local path to `--input-root`.
+
+## SLURM Parallel Runner
+
+For HPC clusters, use the SLURM helper script:
+
+```bash
+python scripts/run_amass_batch_slurm.py submit \
+  --input-root /path/to/AMASS \
+  --output-dir outputs/bsm_batch \
+  --smplx-model-dir model/smpl \
+  --bsm-model model/bsm/bsm.osim \
+  --addbio-root "$HOME/AddBiomechanics" \
+  --id-grf-mode estimated \
+  --cleanup-intermediate \
+  --slurm-job-name amass_bsm \
+  --slurm-partition cpu \
+  --slurm-time 08:00:00 \
+  --slurm-cpus-per-task 4 \
+  --slurm-mem 16G \
+  --slurm-array-parallelism 32 \
+  --slurm-setup-cmd 'source "$HOME/miniconda3/etc/profile.d/conda.sh"' \
+  --slurm-setup-cmd 'conda activate opensim-torque' \
+  --submit
+```
+
+What this script does:
+
+- discovers `.npz` files recursively
+- skips existing destination CSVs by default (`--skip-existing-csv`)
+- writes a task manifest at `outputs/bsm_batch/slurm/manifest.jsonl`
+- writes an SBATCH script at `outputs/bsm_batch/slurm/run_batch.sbatch`
+- launches a SLURM array job (if `--submit` is passed)
+- stores per-task worker status JSON files under `outputs/bsm_batch/slurm/results/`
+
+Useful SLURM workflow:
+
+- use `--dry-run` first to generate and inspect manifest + SBATCH script without submitting
+- omit `--submit` if you want to manually run the printed `sbatch ...` command
+- use `--no-skip-existing-csv` when you intentionally want to recompute all outputs
+- tune `--slurm-array-parallelism` to cap concurrent jobs (for example `%32`)
 
 ## Output Format
 
