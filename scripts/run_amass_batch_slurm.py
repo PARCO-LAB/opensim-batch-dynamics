@@ -26,6 +26,14 @@ class BatchTask:
     trial_name: str
 
 
+@dataclass(frozen=True)
+class SbatchChunk:
+    script_path: Path
+    sbatch_cmd: list[str]
+    task_index_offset: int
+    task_count: int
+
+
 def _sanitize_component(text: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("._-")
     return cleaned or "trial"
@@ -179,7 +187,9 @@ def _write_sbatch_script(
     output_root: Path,
     manifest_path: Path,
     task_count: int,
-) -> tuple[Path, list[str]]:
+    task_index_offset: int = 0,
+    chunk_index: int = 0,
+) -> SbatchChunk:
     repo_root = Path(__file__).resolve().parents[1]
     slurm_root = output_root / "slurm"
     slurm_root.mkdir(parents=True, exist_ok=True)
@@ -191,7 +201,8 @@ def _write_sbatch_script(
     )
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    script_path = slurm_root / "run_batch.sbatch"
+    script_name = "run_batch.sbatch" if chunk_index == 0 else f"run_batch_{chunk_index:04d}.sbatch"
+    script_path = slurm_root / script_name
     array_spec = f"0-{task_count - 1}"
     if args.slurm_array_parallelism is not None:
         if args.slurm_array_parallelism < 1:
@@ -205,6 +216,8 @@ def _write_sbatch_script(
         "worker",
         "--manifest",
         str(manifest_path),
+        "--task-index-offset",
+        str(task_index_offset),
     ]
     if args.skip_existing:
         worker_cmd.append("--skip-existing-csv")
@@ -246,7 +259,46 @@ def _write_sbatch_script(
     script_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     script_path.chmod(0o755)
     sbatch_cmd = ["sbatch", str(script_path)]
-    return script_path, sbatch_cmd
+    return SbatchChunk(
+        script_path=script_path,
+        sbatch_cmd=sbatch_cmd,
+        task_index_offset=task_index_offset,
+        task_count=task_count,
+    )
+
+
+def _build_sbatch_chunks(
+    args: argparse.Namespace,
+    output_root: Path,
+    manifest_path: Path,
+    task_count: int,
+) -> list[SbatchChunk]:
+    max_array_size = args.slurm_max_array_size
+    if max_array_size is not None and max_array_size < 1:
+        raise ValueError("--slurm-max-array-size must be >= 1")
+
+    chunk_size = task_count
+    if max_array_size is not None:
+        chunk_size = min(task_count, max_array_size)
+
+    chunks: list[SbatchChunk] = []
+    task_index_offset = 0
+    chunk_index = 0
+    while task_index_offset < task_count:
+        current_task_count = min(chunk_size, task_count - task_index_offset)
+        chunks.append(
+            _write_sbatch_script(
+                args=args,
+                output_root=output_root,
+                manifest_path=manifest_path,
+                task_count=current_task_count,
+                task_index_offset=task_index_offset,
+                chunk_index=chunk_index,
+            )
+        )
+        task_index_offset += current_task_count
+        chunk_index += 1
+    return chunks
 
 
 def _read_manifest_record(manifest_path: Path, task_index: int) -> dict[str, object]:
@@ -326,12 +378,14 @@ def _run_submit(args: argparse.Namespace) -> int:
         for task in runnable
     ]
     manifest_path = _write_manifest(output_root=output_root, tasks=runnable, commands=commands)
-    sbatch_path, sbatch_cmd = _write_sbatch_script(
+    sbatch_chunks = _build_sbatch_chunks(
         args=args,
         output_root=output_root,
         manifest_path=manifest_path,
         task_count=len(runnable),
     )
+    sbatch_paths = [str(chunk.script_path) for chunk in sbatch_chunks]
+    sbatch_cmds = [chunk.sbatch_cmd for chunk in sbatch_chunks]
 
     _write_json(
         plan_path,
@@ -343,15 +397,28 @@ def _run_submit(args: argparse.Namespace) -> int:
             "skipped_existing": skipped_existing,
             "scheduled_tasks": len(runnable),
             "manifest_path": str(manifest_path),
-            "sbatch_script": str(sbatch_path),
-            "sbatch_command": sbatch_cmd,
+            "sbatch_script": sbatch_paths[0],
+            "sbatch_command": sbatch_cmds[0],
+            "sbatch_scripts": sbatch_paths,
+            "sbatch_commands": sbatch_cmds,
+            "sbatch_chunk_count": len(sbatch_chunks),
             "submitted": False,
         },
     )
 
     print(f"Manifest: {manifest_path}")
-    print(f"SBATCH script: {sbatch_path}")
-    print(f"SBATCH command: {shlex.join(sbatch_cmd)}")
+    if len(sbatch_chunks) == 1:
+        print(f"SBATCH script: {sbatch_chunks[0].script_path}")
+        print(f"SBATCH command: {shlex.join(sbatch_chunks[0].sbatch_cmd)}")
+    else:
+        print(f"SBATCH scripts: {len(sbatch_chunks)} chunks")
+        for chunk in sbatch_chunks[:5]:
+            print(
+                f"  chunk offset={chunk.task_index_offset} count={chunk.task_count}: "
+                f"{shlex.join(chunk.sbatch_cmd)}"
+            )
+        if len(sbatch_chunks) > 5:
+            print(f"  ... {len(sbatch_chunks) - 5} more chunks")
 
     if args.dry_run:
         preview = min(5, len(runnable))
@@ -368,24 +435,45 @@ def _run_submit(args: argparse.Namespace) -> int:
         print(f"Plan summary: {plan_path}")
         return 0
 
-    result = subprocess.run(
-        sbatch_cmd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.stdout.strip():
-        print(result.stdout.strip())
-    if result.stderr.strip():
-        print(result.stderr.strip())
-
     submitted_payload = json.loads(plan_path.read_text(encoding="utf-8"))
-    submitted_payload["submitted"] = result.returncode == 0
-    submitted_payload["sbatch_stdout"] = result.stdout.strip()
-    submitted_payload["sbatch_stderr"] = result.stderr.strip()
+    submission_results: list[dict[str, object]] = []
+    all_ok = True
+    combined_stdout: list[str] = []
+    combined_stderr: list[str] = []
+    for chunk in sbatch_chunks:
+        result = subprocess.run(
+            chunk.sbatch_cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.stdout.strip():
+            print(result.stdout.strip())
+            combined_stdout.append(result.stdout.strip())
+        if result.stderr.strip():
+            print(result.stderr.strip())
+            combined_stderr.append(result.stderr.strip())
+        submission_results.append(
+            {
+                "script_path": str(chunk.script_path),
+                "sbatch_command": chunk.sbatch_cmd,
+                "task_index_offset": chunk.task_index_offset,
+                "task_count": chunk.task_count,
+                "returncode": result.returncode,
+                "stdout": result.stdout.strip(),
+                "stderr": result.stderr.strip(),
+            }
+        )
+        if result.returncode != 0:
+            all_ok = False
+
+    submitted_payload["submitted"] = all_ok
+    submitted_payload["sbatch_stdout"] = "\n".join(combined_stdout)
+    submitted_payload["sbatch_stderr"] = "\n".join(combined_stderr)
+    submitted_payload["sbatch_submission_results"] = submission_results
     _write_json(plan_path, submitted_payload)
     print(f"Plan summary: {plan_path}")
-    return 0 if result.returncode == 0 else result.returncode
+    return 0 if all_ok else 1
 
 
 def _run_worker(args: argparse.Namespace) -> int:
@@ -403,6 +491,7 @@ def _run_worker(args: argparse.Namespace) -> int:
                 "job with SLURM_ARRAY_TASK_ID."
             )
         task_index = int(raw_idx)
+    task_index += int(args.task_index_offset)
 
     record = _read_manifest_record(manifest_path, task_index=task_index)
     command = [str(token) for token in record["command"]]  # type: ignore[index]
@@ -608,6 +697,15 @@ def parse_args() -> argparse.Namespace:
     submit.add_argument("--slurm-cpus-per-task", type=int, default=4)
     submit.add_argument("--slurm-mem", default="16G")
     submit.add_argument(
+        "--slurm-max-array-size",
+        type=int,
+        default=1000,
+        help=(
+            "Maximum number of tasks per submitted SLURM array chunk. Large batches are "
+            "split into multiple sbatch scripts automatically (default: %(default)s)."
+        ),
+    )
+    submit.add_argument(
         "--slurm-array-parallelism",
         type=int,
         default=None,
@@ -639,6 +737,7 @@ def parse_args() -> argparse.Namespace:
     )
     worker.add_argument("--manifest", required=True)
     worker.add_argument("--task-index", type=int, default=None)
+    worker.add_argument("--task-index-offset", type=int, default=0)
     worker.add_argument(
         "--skip-existing-csv",
         dest="skip_existing",
