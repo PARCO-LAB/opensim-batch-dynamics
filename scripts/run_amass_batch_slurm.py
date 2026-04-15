@@ -13,6 +13,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+DEFAULT_HPC_INPUT_ROOT = "storage/emartini/AMASS/AMASS"
+DEFAULT_HPC_OUTPUT_DIR = "storage/emartini/AMASS_torque"
+
 
 @dataclass(frozen=True)
 class BatchTask:
@@ -43,6 +46,27 @@ def _resolve_pipeline_script(path_from_arg: str | None) -> Path:
         return Path(path_from_arg).resolve()
     repo_root = Path(__file__).resolve().parents[1]
     return (repo_root / "scripts" / "run_amass_to_bsm_csv.py").resolve()
+
+
+def _resolve_submit_path(path_from_arg: str) -> Path:
+    raw_path = Path(os.path.expandvars(path_from_arg)).expanduser()
+    if raw_path.is_absolute():
+        return raw_path.resolve()
+
+    repo_root = Path(__file__).resolve().parents[1]
+    home_candidate = (Path.home() / raw_path).resolve()
+    cwd_candidate = (Path.cwd() / raw_path).resolve()
+    repo_candidate = (repo_root / raw_path).resolve()
+
+    if raw_path.parts and raw_path.parts[0] == "storage":
+        candidates = [home_candidate, cwd_candidate, repo_candidate]
+    else:
+        candidates = [cwd_candidate, repo_candidate, home_candidate]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def _discover_npz_files(input_root: Path) -> list[Path]:
@@ -249,8 +273,8 @@ def _run_submit(args: argparse.Namespace) -> int:
             "pass the mounted local path to --input-root."
         )
 
-    input_root = Path(args.input_root).resolve()
-    output_root = Path(args.output_dir).resolve()
+    input_root = _resolve_submit_path(args.input_root)
+    output_root = _resolve_submit_path(args.output_dir)
     pipeline_script = _resolve_pipeline_script(args.pipeline_script)
     if not input_root.exists():
         raise FileNotFoundError(f"Input root not found: {input_root}")
@@ -553,8 +577,22 @@ def parse_args() -> argparse.Namespace:
         "submit",
         help="Build manifest + SBATCH script and optionally submit SLURM array jobs.",
     )
-    submit.add_argument("--input-root", required=True)
-    submit.add_argument("--output-dir", default="outputs/bsm_batch")
+    submit.add_argument(
+        "--input-root",
+        default=DEFAULT_HPC_INPUT_ROOT,
+        help=(
+            "Root folder containing AMASS .npz files. Relative paths starting with "
+            "'storage/' are resolved from $HOME (default: %(default)s)."
+        ),
+    )
+    submit.add_argument(
+        "--output-dir",
+        default=DEFAULT_HPC_OUTPUT_DIR,
+        help=(
+            "Destination root for generated CSVs/logs. Relative paths starting with "
+            "'storage/' are resolved from $HOME (default: %(default)s)."
+        ),
+    )
     submit.add_argument("--limit", type=int, default=None)
     submit.add_argument("--dry-run", action="store_true")
     submit.add_argument(

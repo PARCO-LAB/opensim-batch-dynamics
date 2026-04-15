@@ -161,8 +161,6 @@ For HPC clusters, use the SLURM helper script:
 
 ```bash
 python scripts/run_amass_batch_slurm.py submit \
-  --input-root /path/to/AMASS \
-  --output-dir outputs/bsm_batch \
   --smplx-model-dir model/smpl \
   --bsm-model model/bsm/bsm.osim \
   --addbio-root "$HOME/AddBiomechanics" \
@@ -178,6 +176,28 @@ python scripts/run_amass_batch_slurm.py submit \
   --slurm-setup-cmd 'conda activate opensim-torque' \
   --submit
 ```
+
+On the UniVR HPC layout described in this project, the script now defaults to:
+
+- input root: `~/storage/emartini/AMASS/AMASS`
+- output root: `~/storage/emartini/AMASS_torque`
+
+Assuming `~/storage` is a symlink to `/storage-large/shared-folders/gr_bombieri/emartini`, the shortest working submit command is:
+
+```bash
+python scripts/run_amass_batch_slurm.py submit \
+  --addbio-root "$HOME/AddBiomechanics" \
+  --slurm-job-name amass_bsm \
+  --slurm-time 08:00:00 \
+  --slurm-cpus-per-task 4 \
+  --slurm-mem 16G \
+  --slurm-array-parallelism 32 \
+  --slurm-setup-cmd 'source "$HOME/miniconda3/etc/profile.d/conda.sh"' \
+  --slurm-setup-cmd 'conda activate opensim-torque' \
+  --submit
+```
+
+If your cluster requires an explicit partition or account, add `--slurm-partition ...` and/or `--slurm-account ...`.
 
 What this script does:
 
