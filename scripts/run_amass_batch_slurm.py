@@ -167,8 +167,13 @@ def _write_manifest(output_root: Path, tasks: list[BatchTask], commands: list[li
     slurm_root = output_root / "slurm"
     slurm_root.mkdir(parents=True, exist_ok=True)
     manifest_path = slurm_root / "manifest.jsonl"
+    if len(tasks) != len(commands):
+        raise ValueError(
+            f"Task/command count mismatch while writing manifest: {len(tasks)} tasks vs "
+            f"{len(commands)} commands"
+        )
     with manifest_path.open("w", encoding="utf-8") as handle:
-        for index, (task, command) in enumerate(zip(tasks, commands, strict=True)):
+        for index, (task, command) in enumerate(zip(tasks, commands)):
             payload = {
                 "index": index,
                 "relative_path": task.relative_path.as_posix(),
