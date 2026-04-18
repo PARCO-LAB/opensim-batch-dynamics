@@ -61,6 +61,19 @@ def _to_float(value: Any) -> float:
     return float(value)
 
 
+def _is_supported_split_surface_model_type(surface_model_type: str) -> bool:
+    """
+    Accept split-pose formats derived from SMPL-X.
+
+    Some AMASS-like exports use values such as ``smplx_locked_head`` while still
+    providing standard SMPL-X split fields.
+    """
+    normalized = (surface_model_type or "").strip().lower()
+    if normalized in {"unknown", "smplx"}:
+        return True
+    return normalized.startswith("smplx")
+
+
 @dataclass
 class AMASSSequence:
     """In-memory AMASS sample split into SMPL-X fields used by the pipeline."""
@@ -175,9 +188,9 @@ def _build_sequence_from_fields(
     has_legacy_poses = "poses" in fields
 
     if has_split_smplx_fields:
-        if surface_model_type not in {"smplx", "unknown"}:
+        if not _is_supported_split_surface_model_type(surface_model_type):
             raise ValueError(
-                "Unsupported split-pose format with surface_model_type != 'smplx'. "
+                "Unsupported split-pose format with unsupported surface_model_type. "
                 f"Found '{surface_model_type}'."
             )
         root_orient = np.asarray(fields["root_orient"], dtype=np.float32)

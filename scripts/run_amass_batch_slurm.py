@@ -78,10 +78,16 @@ def _resolve_submit_path(path_from_arg: str) -> Path:
 
 
 def _discover_npz_files(input_root: Path) -> list[Path]:
+    excluded_names = {
+        "shape.npz",
+        "neutral_stagei.npz",
+        "female_stagei.npz",
+        "male_stagei.npz",
+    }
     files = [
         path
         for path in input_root.rglob("*.npz")
-        if path.is_file() and path.name.lower() != "shape.npz"
+        if path.is_file() and path.name.lower() not in excluded_names
     ]
     files.sort()
     return files
