@@ -329,6 +329,30 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def _load_previous_result_statuses(output_root: Path) -> dict[str, str]:
+    """
+    Load previous SLURM worker results, keyed by relative_path.
+
+    Newer result files (by mtime) overwrite older statuses for the same path.
+    """
+    results_dir = output_root / "slurm" / "results"
+    if not results_dir.exists():
+        return {}
+    files = sorted(results_dir.glob("task_*.json"), key=lambda p: p.stat().st_mtime)
+    statuses: dict[str, str] = {}
+    for path in files:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            rel = str(payload.get("relative_path", "")).strip()
+            status = str(payload.get("status", "")).strip().lower()
+            if rel and status:
+                statuses[rel] = status
+        except Exception:
+            # Ignore malformed historical files.
+            continue
+    return statuses
+
+
 def _run_submit(args: argparse.Namespace) -> int:
     if str(args.input_root).startswith("smb://"):
         raise ValueError(
@@ -349,17 +373,35 @@ def _run_submit(args: argparse.Namespace) -> int:
         raise ValueError("--slurm-cpus-per-task must be >= 1")
 
     tasks = _build_tasks(input_root=input_root, output_root=output_root, limit=args.limit)
+    previous_status = _load_previous_result_statuses(output_root=output_root)
     skipped_existing = 0
+    skipped_previous_ok = 0
     runnable: list[BatchTask] = []
     for task in tasks:
         if args.skip_existing and _is_existing_csv_ready(task.output_csv_path):
             skipped_existing += 1
             continue
+        if args.skip_previously_ok and previous_status.get(task.relative_path.as_posix()) == "ok":
+            skipped_previous_ok += 1
+            continue
         runnable.append(task)
+
+    total_runnable = len(runnable)
+    if args.max_submit_tasks is not None:
+        if args.max_submit_tasks < 1:
+            raise ValueError("--max-submit-tasks must be >= 1")
+        runnable = runnable[: args.max_submit_tasks]
 
     print(f"Discovered {len(tasks)} .npz files under: {input_root}")
     print(f"Skip existing CSVs: {'enabled' if args.skip_existing else 'disabled'}")
     print(f"Already present CSVs skipped at submit-time: {skipped_existing}")
+    print(
+        "Previously successful tasks skipped at submit-time: "
+        f"{skipped_previous_ok} (from {output_root / 'slurm' / 'results'})"
+    )
+    if args.max_submit_tasks is not None:
+        print(f"Max tasks per submit: {args.max_submit_tasks}")
+    print(f"Total pending before cap: {total_runnable}")
     print(f"Runnable SLURM tasks: {len(runnable)}")
 
     slurm_root = output_root / "slurm"
@@ -374,6 +416,8 @@ def _run_submit(args: argparse.Namespace) -> int:
                 "pipeline_script": str(pipeline_script),
                 "total_discovered": len(tasks),
                 "skipped_existing": skipped_existing,
+                "skipped_previous_ok": skipped_previous_ok,
+                "pending_before_cap": total_runnable,
                 "scheduled_tasks": 0,
                 "sbatch_script": None,
                 "sbatch_command": None,
@@ -406,6 +450,8 @@ def _run_submit(args: argparse.Namespace) -> int:
             "pipeline_script": str(pipeline_script),
             "total_discovered": len(tasks),
             "skipped_existing": skipped_existing,
+            "skipped_previous_ok": skipped_previous_ok,
+            "pending_before_cap": total_runnable,
             "scheduled_tasks": len(runnable),
             "manifest_path": str(manifest_path),
             "sbatch_script": sbatch_paths[0],
@@ -694,6 +740,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     submit.add_argument("--limit", type=int, default=None)
+    submit.add_argument(
+        "--max-submit-tasks",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap on number of pending tasks to schedule in this submit call. "
+            "Useful to avoid overloading the scheduler."
+        ),
+    )
     submit.add_argument("--dry-run", action="store_true")
     submit.add_argument(
         "--submit",
@@ -701,6 +756,22 @@ def parse_args() -> argparse.Namespace:
         help="If set, call sbatch automatically. Otherwise only generate files/instructions.",
     )
     _add_pipeline_forwarded_args(submit)
+    submit.add_argument(
+        "--skip-previously-ok",
+        dest="skip_previously_ok",
+        action="store_true",
+        help=(
+            "Skip files marked as successful in previous SLURM worker results "
+            "(default: enabled)."
+        ),
+    )
+    submit.add_argument(
+        "--no-skip-previously-ok",
+        dest="skip_previously_ok",
+        action="store_false",
+        help="Do not use previous SLURM worker results for submit-time filtering.",
+    )
+    submit.set_defaults(skip_previously_ok=True)
     submit.add_argument("--slurm-job-name", default="amass_bsm")
     submit.add_argument("--slurm-partition", default=None)
     submit.add_argument("--slurm-account", default=None)
