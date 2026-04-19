@@ -126,8 +126,14 @@ def _build_single_run_cmd(
     task: BatchTask,
     output_root: Path,
 ) -> list[str]:
+    # When SLURM setup commands activate an environment, prefer its `python`
+    # for child pipeline runs unless user explicitly overrides `--python-exe`.
+    python_exe = args.python_exe
+    if args.slurm_setup_cmd and args.python_exe == sys.executable:
+        python_exe = "python"
+
     cmd = [
-        args.python_exe,
+        python_exe,
         str(pipeline_script),
         "--input",
         str(task.input_path),
@@ -220,7 +226,14 @@ def _write_sbatch_script(
             raise ValueError("--slurm-array-parallelism must be >= 1")
         array_spec = f"{array_spec}%{args.slurm_array_parallelism}"
 
-    slurm_python_exe = args.slurm_python_exe or args.python_exe
+    # If user provides setup commands (e.g. conda activate), prefer `python`
+    # from the activated environment unless explicitly overridden.
+    if args.slurm_python_exe:
+        slurm_python_exe = args.slurm_python_exe
+    elif args.slurm_setup_cmd:
+        slurm_python_exe = "python"
+    else:
+        slurm_python_exe = args.python_exe
     worker_cmd = [
         slurm_python_exe,
         str(Path(__file__).resolve()),
@@ -258,6 +271,25 @@ def _write_sbatch_script(
     )
     for setup_cmd in args.slurm_setup_cmd:
         lines.append(setup_cmd)
+    lines.extend(
+        [
+            # Avoid importing incompatible packages from ~/.local on compute nodes.
+            "unset PYTHONPATH",
+            "export PYTHONNOUSERSITE=1",
+            # If a Conda env is active, ensure `python` resolves from it.
+            'if [[ -n "${CONDA_PREFIX:-}" ]]; then',
+            '  PY_BIN="$(command -v python || true)"',
+            '  case "$PY_BIN" in',
+            '    "$CONDA_PREFIX"/*) ;;',
+            '    *)',
+            '      echo "ERROR: python does not come from active CONDA_PREFIX=$CONDA_PREFIX";',
+            '      echo "Resolved python: $PY_BIN";',
+            "      exit 2;",
+            "      ;;",
+            "  esac",
+            "fi",
+        ]
+    )
     lines.extend(
         [
             "export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}",
