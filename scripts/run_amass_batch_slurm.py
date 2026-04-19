@@ -329,6 +329,50 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def _should_retry_sbatch(stderr_text: str) -> bool:
+    msg = (stderr_text or "").lower()
+    return (
+        "temporarily unable to accept job" in msg
+        or "resource temporarily unavailable" in msg
+        or "socket timed out" in msg
+        or "connection timed out" in msg
+    )
+
+
+def _submit_chunk_with_retry(
+    chunk: SbatchChunk,
+    retries: int,
+    initial_sleep_s: float,
+) -> tuple[subprocess.CompletedProcess[str], int]:
+    """
+    Submit one sbatch chunk with retry/backoff on transient scheduler errors.
+
+    Returns the final CompletedProcess and the number of retries performed.
+    """
+    attempts = 0
+    sleep_s = max(0.1, float(initial_sleep_s))
+    while True:
+        result = subprocess.run(
+            chunk.sbatch_cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return result, attempts
+        if attempts >= retries:
+            return result, attempts
+        if not _should_retry_sbatch(result.stderr):
+            return result, attempts
+        attempts += 1
+        print(
+            f"Transient sbatch failure for chunk offset={chunk.task_index_offset} "
+            f"(attempt {attempts}/{retries}). Retrying in {sleep_s:.1f}s..."
+        )
+        time.sleep(sleep_s)
+        sleep_s = min(sleep_s * 2.0, 60.0)
+
+
 def _load_previous_result_statuses(output_root: Path) -> dict[str, str]:
     """
     Load previous SLURM worker results, keyed by relative_path.
@@ -498,11 +542,10 @@ def _run_submit(args: argparse.Namespace) -> int:
     combined_stdout: list[str] = []
     combined_stderr: list[str] = []
     for chunk in sbatch_chunks:
-        result = subprocess.run(
-            chunk.sbatch_cmd,
-            capture_output=True,
-            text=True,
-            check=False,
+        result, retries_used = _submit_chunk_with_retry(
+            chunk=chunk,
+            retries=args.sbatch_retries,
+            initial_sleep_s=args.sbatch_retry_sleep_s,
         )
         if result.stdout.strip():
             print(result.stdout.strip())
@@ -516,6 +559,7 @@ def _run_submit(args: argparse.Namespace) -> int:
                 "sbatch_command": chunk.sbatch_cmd,
                 "task_index_offset": chunk.task_index_offset,
                 "task_count": chunk.task_count,
+                "retry_count": retries_used,
                 "returncode": result.returncode,
                 "stdout": result.stdout.strip(),
                 "stderr": result.stderr.strip(),
@@ -523,6 +567,8 @@ def _run_submit(args: argparse.Namespace) -> int:
         )
         if result.returncode != 0:
             all_ok = False
+        if args.sbatch_submit_interval_s > 0:
+            time.sleep(args.sbatch_submit_interval_s)
 
     submitted_payload["submitted"] = all_ok
     submitted_payload["sbatch_stdout"] = "\n".join(combined_stdout)
@@ -778,6 +824,27 @@ def parse_args() -> argparse.Namespace:
     submit.add_argument("--slurm-time", default="08:00:00")
     submit.add_argument("--slurm-cpus-per-task", type=int, default=4)
     submit.add_argument("--slurm-mem", default="16G")
+    submit.add_argument(
+        "--sbatch-retries",
+        type=int,
+        default=6,
+        help="Retry count for transient sbatch submission failures (default: %(default)s).",
+    )
+    submit.add_argument(
+        "--sbatch-retry-sleep-s",
+        type=float,
+        default=5.0,
+        help="Initial retry sleep in seconds for transient sbatch failures (default: %(default)s).",
+    )
+    submit.add_argument(
+        "--sbatch-submit-interval-s",
+        type=float,
+        default=1.0,
+        help=(
+            "Sleep interval between sbatch submissions (seconds) to avoid overloading "
+            "the scheduler (default: %(default)s)."
+        ),
+    )
     submit.add_argument(
         "--slurm-max-array-size",
         type=int,
