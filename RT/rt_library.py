@@ -11,6 +11,8 @@ STAGE1_MAX_OSQP_ITERS = 3000
 STAGE2_EPS_ABS = 2e-4
 STAGE2_EPS_REL = 2e-4
 STAGE2_MAX_OSQP_ITERS = 5000
+CONTACT_ON_SCORE = 0.52
+CONTACT_OFF_SCORE = 0.34
 FOOT_BODIES = {
     "left": ("calcn_l", "toes_l"),
     "right": ("calcn_r", "toes_r"),
@@ -297,7 +299,8 @@ def qpid(
                     break
 
                 valid_key = np.packbits(valid.astype(np.uint8)).tobytes()
-                cache_key = (n_dof_full, valid_key)
+                has_q_sensor = bool(q_meas is not None and q_weights is not None)
+                cache_key = (n_dof_full, valid_key, has_q_sensor)
                 if cache_key not in QPIK_CACHE:
                     dq_var = cp.Variable(n_dof_full)
                     q_param = cp.Parameter(n_dof_full)
@@ -308,15 +311,20 @@ def qpid(
                     dq_u_param = cp.Parameter(n_dof_full)
                     q_l_param = cp.Parameter(n_dof_full)
                     q_u_param = cp.Parameter(n_dof_full)
-                    qik_A_step_param = cp.Parameter((n_dof_full, n_dof_full))
-                    qik_A_prior_param = cp.Parameter((n_dof_full, n_dof_full))
                     qik_b_prior_param = cp.Parameter(n_dof_full)
-                    qik_A_sensor_param = cp.Parameter((n_dof_full, n_dof_full))
-                    qik_b_sensor_param = cp.Parameter(n_dof_full)
                     objective = cp.sum_squares(qik_A_meas_param @ dq_var - qik_b_meas_param)
-                    objective += cp.sum_squares(qik_A_step_param @ dq_var)
-                    objective += cp.sum_squares(qik_A_prior_param @ dq_var - qik_b_prior_param)
-                    objective += cp.sum_squares(qik_A_sensor_param @ dq_var - qik_b_sensor_param)
+                    objective += cp.sum_squares(np.diag(step_w) @ dq_var)
+                    if has_q_sensor:
+                        qik_A_prior_param = cp.Parameter((n_dof_full, n_dof_full))
+                        qik_A_sensor_param = cp.Parameter((n_dof_full, n_dof_full))
+                        qik_b_sensor_param = cp.Parameter(n_dof_full)
+                        objective += cp.sum_squares(qik_A_prior_param @ dq_var - qik_b_prior_param)
+                        objective += cp.sum_squares(qik_A_sensor_param @ dq_var - qik_b_sensor_param)
+                    else:
+                        qik_A_prior_param = None
+                        qik_A_sensor_param = None
+                        qik_b_sensor_param = None
+                        objective += cp.sum_squares(np.diag(prior_w) @ dq_var - qik_b_prior_param)
                     constraints = [
                         q_param + dq_var >= q_l_param,
                         q_param + dq_var <= q_u_param,
@@ -334,7 +342,6 @@ def qpid(
                         "dq_u": dq_u_param,
                         "q_l": q_l_param,
                         "q_u": q_u_param,
-                        "A_step": qik_A_step_param,
                         "A_prior": qik_A_prior_param,
                         "b_prior": qik_b_prior_param,
                         "A_sensor": qik_A_sensor_param,
@@ -351,17 +358,13 @@ def qpid(
                 problem["dq_u"].value = dq_step_cap
                 problem["q_l"].value = q_lower
                 problem["q_u"].value = q_upper
-                problem["A_step"].value = np.diag(step_w)
-                problem["A_prior"].value = np.diag(prior_w)
                 problem["b_prior"].value = prior_w * (q_pred - q_hat)
-                if q_meas is not None and q_weights is not None:
+                if problem["A_sensor"] is not None:
                     q_sensor = np.where(np.isfinite(q_meas), q_meas, q_pred)
                     q_sensor_w = 1.5 * np.where(np.isfinite(q_meas), q_weights, 0.0)
-                else:
-                    q_sensor = q_pred
-                    q_sensor_w = np.zeros(n_dof_full, dtype=float)
-                problem["A_sensor"].value = np.diag(q_sensor_w)
-                problem["b_sensor"].value = q_sensor_w * (q_sensor - q_hat)
+                    problem["A_prior"].value = np.diag(prior_w)
+                    problem["A_sensor"].value = np.diag(q_sensor_w)
+                    problem["b_sensor"].value = q_sensor_w * (q_sensor - q_hat)
 
                 try:
                     problem["problem"].solve(
@@ -413,8 +416,11 @@ def qpid(
 
         model.setPositions(q_hat)
         model.setVelocities(dq_hat)
+        model.setAccelerations(ddq_hat)
 
         gravity = np.array(model.getGravity(), dtype=float).reshape(3)
+        mass_kg = float(model.getMass())
+        body_weight = mass_kg * max(np.linalg.norm(gravity), EPS)
         if np.linalg.norm(gravity) < EPS:
             up = np.array([0.0, 0.0, 1.0], dtype=float)
         else:
@@ -428,6 +434,29 @@ def qpid(
         tangent_2 = np.cross(up, tangent_1)
         tangent_2 /= max(np.linalg.norm(tangent_2), EPS)
         ground_basis = np.vstack([tangent_1, tangent_2, up])
+        com_position = np.array(model.getCOM(), dtype=float).reshape(3)
+        com_velocity = np.array(model.getCOMLinearVelocity(), dtype=float).reshape(3)
+        com_acceleration = np.array(model.getCOMLinearAcceleration(), dtype=float).reshape(3)
+        support_force_target = mass_kg * (com_acceleration - gravity)
+        support_force_local = ground_basis @ support_force_target
+        prev_support_force_local = ground_basis @ (
+            np.array(state["foot_forces"]["left"], dtype=float) + np.array(state["foot_forces"]["right"], dtype=float)
+        )
+        force_step_limit = np.array([0.25 * body_weight, 0.25 * body_weight, 0.50 * body_weight], dtype=float)
+        support_force_local = prev_support_force_local + np.clip(
+            support_force_local - prev_support_force_local,
+            -force_step_limit,
+            force_step_limit,
+        )
+        support_force_local[2] = np.clip(support_force_local[2], 0.0, 3.5 * body_weight)
+        tangential_norm = float(np.linalg.norm(support_force_local[:2]))
+        tangential_limit = float(mu) * support_force_local[2]
+        if tangential_norm > tangential_limit > 0.0:
+            support_force_local[:2] *= tangential_limit / tangential_norm
+        if support_force_local[2] <= 0.03 * body_weight:
+            support_force_local[:] = 0.0
+        support_force_target = ground_basis.T @ support_force_local
+        support_ratio = float(support_force_local[2] / max(body_weight, EPS))
 
         joint_confidence = np.mean(measurement_weights, axis=1)
         joint_conf_lookup = {}
@@ -502,19 +531,74 @@ def qpid(
             cue["anchor_bias"] = 0.5 * (cue["heel_bias"] + cue["toe_bias"])
             ankle_name = "ankle_l" if side == "left" else "ankle_r"
             cue["joint_confidence"] = joint_conf_lookup.get(ankle_name, float(np.mean(joint_confidence)) if joint_confidence.size > 0 else 0.0)
+            height_score = np.clip(1.0 - max(height, 0.0) / 0.16, 0.0, 1.0)
+            velocity_score = np.clip(1.0 - abs(vertical_velocity) / 1.4, 0.0, 1.0)
+            support_bonus = np.clip(support_ratio / 0.45, 0.0, 1.0)
             cue["confidence"] = float(
                 np.clip(
-                    0.5 * cue["joint_confidence"]
-                    + 0.25 * np.clip(1.0 - max(height, 0.0) / 0.08, 0.0, 1.0)
-                    + 0.25 * np.clip(1.0 - abs(vertical_velocity) / 0.8, 0.0, 1.0),
+                    0.40 * cue["joint_confidence"]
+                    + 0.30 * height_score
+                    + 0.15 * velocity_score
+                    + 0.10 * float(state["contact_state"][side])
+                    + 0.05 * support_bonus,
                     0.0,
                     1.0,
                 )
             )
+            cue["score"] = cue["confidence"]
             if state["contact_state"][side]:
-                cue["contact"] = bool(height <= 0.11 and abs(vertical_velocity) <= 1.2)
+                cue["contact"] = bool(cue["score"] >= CONTACT_OFF_SCORE and height <= 0.18)
             else:
-                cue["contact"] = bool(height <= 0.08 and abs(vertical_velocity) <= 0.8)
+                cue["contact"] = bool(cue["score"] >= CONTACT_ON_SCORE and height <= 0.14)
+
+        contact_state = {
+            "left": bool(foot_cues["left"]["contact"]),
+            "right": bool(foot_cues["right"]["contact"]),
+        }
+        if support_ratio >= 0.08 and not (contact_state["left"] or contact_state["right"]):
+            best_side = min(
+                ["left", "right"],
+                key=lambda side: (
+                    foot_cues[side]["height"] - 0.05 * foot_cues[side]["score"],
+                    abs(foot_cues[side]["vertical_velocity"]),
+                ),
+            )
+            contact_state[best_side] = True
+        if support_ratio >= 0.25:
+            for side in ["left", "right"]:
+                if foot_cues[side]["score"] >= 0.40 and foot_cues[side]["height"] <= 0.18:
+                    contact_state[side] = True
+        if support_ratio <= 0.02:
+            for side in ["left", "right"]:
+                if foot_cues[side]["score"] < 0.75:
+                    contact_state[side] = False
+
+        support_force_split = np.zeros(6, dtype=float)
+        active_support_sides = [side for side in ["left", "right"] if contact_state[side]]
+        if support_force_local[2] > 0.0 and len(active_support_sides) > 0:
+            com_plane = com_position - (float(np.dot(com_position, up)) - float(floor_height)) * up
+            weights = []
+            for side in active_support_sides:
+                cue = foot_cues[side]
+                anchor_plane = cue["anchor_position"] - (float(np.dot(cue["anchor_position"], up)) - float(floor_height)) * up
+                planar_delta = anchor_plane - com_plane
+                planar_delta -= float(np.dot(planar_delta, up)) * up
+                distance = float(np.linalg.norm(planar_delta))
+                weight = (0.20 + cue["score"] + 0.15 * float(state["contact_state"][side])) / max(distance + 0.05, 1e-3)
+                weights.append(weight)
+            weights = np.array(weights, dtype=float)
+            weights /= max(float(np.sum(weights)), EPS)
+            for idx, side in enumerate(active_support_sides):
+                side_force_local = weights[idx] * support_force_local
+                side_tangential_norm = float(np.linalg.norm(side_force_local[:2]))
+                side_tangential_limit = float(mu) * side_force_local[2]
+                if side_tangential_norm > side_tangential_limit > 0.0:
+                    side_force_local[:2] *= side_tangential_limit / side_tangential_norm
+                side_force_world = ground_basis.T @ side_force_local
+                if side == "left":
+                    support_force_split[:3] = side_force_world
+                else:
+                    support_force_split[3:6] = side_force_world
 
         model.setPositions(q_hat)
         model.setVelocities(dq_hat)
@@ -528,21 +612,16 @@ def qpid(
         n_act = len(active_act_dofs)
         q_target = q_hat[active_dofs]
         dq_target = np.clip(dq_hat[active_dofs], -dq_cap[active_dofs], dq_cap[active_dofs])
-        ddq_target = ddq_hat[active_dofs]
+        ddq_target = 0.60 * ddq_hat[active_dofs] + 0.40 * state["ddq"][active_dofs]
         rel = dof_reliability[active_dofs]
 
         w_q = 35.0 * (0.2 + rel)
         w_dq = 4.0 * (0.2 + rel)
-        w_ddq = 0.30 * (0.1 + rel)
+        w_ddq = 1.00 * (0.15 + rel)
         if n_dof >= 6:
             w_q[:6] *= 4.0
             w_dq[:6] *= 2.0
             w_ddq[:6] *= 1.5
-
-        contact_state = {
-            "left": bool(foot_cues["left"]["contact"]),
-            "right": bool(foot_cues["right"]["contact"]),
-        }
 
         J_force = np.zeros((n_dof, 6), dtype=float)
         for foot_idx, side in enumerate(["left", "right"]):
@@ -563,10 +642,10 @@ def qpid(
         ddq_pos_lower = 2.0 * (q_lower[active_dofs] + q_margin - q_prev[active_dofs] - dt_sim * dq_prev[active_dofs]) / max(dt_sim * dt_sim, EPS)
         ddq_vel_upper = (dq_cap[active_dofs] - dq_prev[active_dofs]) / max(dt_sim, EPS)
         ddq_vel_lower = (-dq_cap[active_dofs] - dq_prev[active_dofs]) / max(dt_sim, EPS)
-        ddq_abs = np.ones(n_dof, dtype=float) * 120.0
+        ddq_abs = np.ones(n_dof, dtype=float) * 90.0
         if n_dof >= 6:
-            ddq_abs[:3] = 80.0
-            ddq_abs[3:6] = 60.0
+            ddq_abs[:3] = 50.0
+            ddq_abs[3:6] = 40.0
         ddq_upper = np.minimum.reduce([ddq_pos_upper, ddq_vel_upper, ddq_abs])
         ddq_lower = np.maximum.reduce([ddq_pos_lower, ddq_vel_lower, -ddq_abs])
         bad = ddq_lower > ddq_upper
@@ -607,21 +686,30 @@ def qpid(
             b_dq_param = cp.Parameter(n_dof)
             A_ddq_param = cp.Parameter((n_dof, n_dof))
             b_ddq_param = cp.Parameter(n_dof)
-            A_tau_s_param = cp.Parameter((n_act, n_act))
             b_tau_s_param = cp.Parameter(n_act)
-            A_tau_r_param = cp.Parameter((n_act, n_act))
-            A_force_s_param = cp.Parameter((6, 6))
             b_force_s_param = cp.Parameter(6)
-            A_force_r_param = cp.Parameter((6, 6))
-            A_root_param = cp.Parameter((6, 6))
+            b_root_s_param = cp.Parameter(6)
+            A_force_net_param = cp.Parameter((3, 6))
+            b_force_net_param = cp.Parameter(3)
+            A_force_split_param = cp.Parameter((6, 6))
+            b_force_split_param = cp.Parameter(6)
+            tau_smooth_const = np.diag(np.ones(n_act, dtype=float) * 0.05)
+            tau_reg_const = np.diag(np.ones(n_act, dtype=float) * 0.004)
+            force_smooth_const = np.diag(np.ones(6, dtype=float) * 0.06)
+            force_reg_const = np.diag(np.ones(6, dtype=float) * 0.004)
+            root_smooth_const = np.diag(np.array([0.10, 0.10, 0.10, 0.05, 0.05, 0.05], dtype=float))
+            root_const = np.diag(np.array([0.75, 0.75, 0.75, 0.30, 0.30, 0.30], dtype=float))
             objective = cp.sum_squares(A_q_param @ ddq_var - b_q_param)
             objective += cp.sum_squares(A_dq_param @ ddq_var - b_dq_param)
             objective += cp.sum_squares(A_ddq_param @ ddq_var - b_ddq_param)
-            objective += cp.sum_squares(A_tau_s_param @ tau_var - b_tau_s_param)
-            objective += cp.sum_squares(A_tau_r_param @ tau_var)
-            objective += cp.sum_squares(A_force_s_param @ force_var - b_force_s_param)
-            objective += cp.sum_squares(A_force_r_param @ force_var)
-            objective += cp.sum_squares(A_root_param @ root_var)
+            objective += cp.sum_squares(tau_smooth_const @ tau_var - b_tau_s_param)
+            objective += cp.sum_squares(tau_reg_const @ tau_var)
+            objective += cp.sum_squares(force_smooth_const @ force_var - b_force_s_param)
+            objective += cp.sum_squares(force_reg_const @ force_var)
+            objective += cp.sum_squares(A_force_net_param @ force_var - b_force_net_param)
+            objective += cp.sum_squares(A_force_split_param @ force_var - b_force_split_param)
+            objective += cp.sum_squares(root_smooth_const @ root_var - b_root_s_param)
+            objective += cp.sum_squares(root_const @ root_var)
             constraints = [
                 M_param @ ddq_var + h_param == S_T @ tau_var + J_force_param @ force_var + S_root @ root_var,
                 ddq_var >= ddq_lower_param,
@@ -680,13 +768,13 @@ def qpid(
                 "b_dq": b_dq_param,
                 "A_ddq": A_ddq_param,
                 "b_ddq": b_ddq_param,
-                "A_tau_s": A_tau_s_param,
                 "b_tau_s": b_tau_s_param,
-                "A_tau_r": A_tau_r_param,
-                "A_force_s": A_force_s_param,
                 "b_force_s": b_force_s_param,
-                "A_force_r": A_force_r_param,
-                "A_root": A_root_param,
+                "b_root_s": b_root_s_param,
+                "A_force_net": A_force_net_param,
+                "b_force_net": b_force_net_param,
+                "A_force_split": A_force_split_param,
+                "b_force_split": b_force_split_param,
                 "J_meas": J_meas_param,
                 "meas_b": meas_b_param,
                 "side_params": side_params,
@@ -706,23 +794,27 @@ def qpid(
         problem["b_ddq"].value = w_ddq * ddq_target
         if n_act > 0:
             tau_prev_active = state["tau"][active_act_dofs - 6]
-            tau_smooth_w = np.ones(n_act, dtype=float) * 0.05
-            tau_reg_w = np.ones(n_act, dtype=float) * 0.004
-            problem["A_tau_s"].value = np.diag(tau_smooth_w)
-            problem["b_tau_s"].value = tau_smooth_w * tau_prev_active
-            problem["A_tau_r"].value = np.diag(tau_reg_w)
+            problem["b_tau_s"].value = 0.05 * tau_prev_active
         else:
-            problem["A_tau_s"].value = np.zeros((0, 0), dtype=float)
             problem["b_tau_s"].value = np.zeros(0, dtype=float)
-            problem["A_tau_r"].value = np.zeros((0, 0), dtype=float)
         force_prev = np.concatenate([state["foot_forces"]["left"], state["foot_forces"]["right"]])
-        force_smooth_w = np.ones(6, dtype=float) * 0.06
-        force_reg_w = np.ones(6, dtype=float) * 0.004
-        root_w = np.array([0.40, 0.40, 0.40, 0.20, 0.20, 0.20], dtype=float)
-        problem["A_force_s"].value = np.diag(force_smooth_w)
-        problem["b_force_s"].value = force_smooth_w * force_prev
-        problem["A_force_r"].value = np.diag(force_reg_w)
-        problem["A_root"].value = np.diag(root_w)
+        problem["b_force_s"].value = 0.06 * force_prev
+        problem["b_root_s"].value = np.array([0.10, 0.10, 0.10, 0.05, 0.05, 0.05], dtype=float) * state["root_residual"]
+        net_force_w = np.array([0.008, 0.008, 0.028], dtype=float) * (0.3 + min(support_ratio, 1.5))
+        split_force_w = np.ones(6, dtype=float) * 0.0
+        split_force_w[:3] = 0.006 * (0.3 + foot_cues["left"]["score"]) * float(contact_state["left"])
+        split_force_w[3:6] = 0.006 * (0.3 + foot_cues["right"]["score"]) * float(contact_state["right"])
+        problem["A_force_net"].value = np.diag(net_force_w) @ np.array(
+            [
+                [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+        problem["b_force_net"].value = net_force_w * support_force_target
+        problem["A_force_split"].value = np.diag(split_force_w)
+        problem["b_force_split"].value = split_force_w * support_force_split
         if problem["J_meas"] is not None:
             problem["J_meas"].value = np.diag(meas_w) @ (0.5 * dt_sim * dt_sim * (J_meas + PARAM_DENSE_EPS))
             problem["meas_b"].value = meas_w * meas_b
@@ -732,8 +824,8 @@ def qpid(
             if side_params is None:
                 continue
             J_side = foot_cues[side]["anchor_jacobian"][:, active_dofs]
-            w_acc = np.array([0.10, 0.10, 0.30], dtype=float) * (0.3 + foot_cues[side]["confidence"])
-            w_vel = np.array([0.03, 0.03, 0.08], dtype=float) * (0.3 + foot_cues[side]["confidence"])
+            w_acc = np.array([0.05, 0.05, 0.18], dtype=float) * (0.3 + foot_cues[side]["confidence"])
+            w_vel = np.array([0.015, 0.015, 0.05], dtype=float) * (0.3 + foot_cues[side]["confidence"])
             side_params["A_acc"].value = np.diag(w_acc) @ (J_side + PARAM_DENSE_EPS)
             side_params["b_acc"].value = -w_acc * foot_cues[side]["anchor_bias"]
             side_params["A_vel"].value = np.diag(w_vel) @ (dt_sim * (J_side + PARAM_DENSE_EPS))
