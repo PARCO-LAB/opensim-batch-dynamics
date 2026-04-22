@@ -13,6 +13,9 @@ STAGE2_EPS_REL = 2e-4
 STAGE2_MAX_OSQP_ITERS = 5000
 CONTACT_ON_SCORE = 0.52
 CONTACT_OFF_SCORE = 0.34
+FOOT_COP_HALF_LENGTH = 0.11
+FOOT_COP_HALF_WIDTH = 0.045
+FOOT_TORSION_RADIUS = 0.07
 FOOT_BODIES = {
     "left": ("calcn_l", "toes_l"),
     "right": ("calcn_r", "toes_r"),
@@ -35,6 +38,7 @@ def initialize_rt_state(
     tau_full=None,
     root_residual=None,
     foot_forces=None,
+    foot_wrenches=None,
     contact_state=None,
     floor_height=np.nan,
 ):
@@ -52,6 +56,10 @@ def initialize_rt_state(
             "left": np.zeros(3, dtype=float),
             "right": np.zeros(3, dtype=float),
         },
+        "foot_wrenches": {
+            "left": np.zeros(6, dtype=float),
+            "right": np.zeros(6, dtype=float),
+        },
         "contact_state": {
             "left": False,
             "right": False,
@@ -63,6 +71,10 @@ def initialize_rt_state(
         for side in state["foot_forces"]:
             if side in foot_forces:
                 state["foot_forces"][side] = np.array(foot_forces[side], dtype=float).copy()
+    if foot_wrenches is not None:
+        for side in state["foot_wrenches"]:
+            if side in foot_wrenches:
+                state["foot_wrenches"][side] = np.array(foot_wrenches[side], dtype=float).copy()
     if contact_state is not None:
         for side in state["contact_state"]:
             if side in contact_state:
@@ -166,6 +178,20 @@ def qpid(
             tau=np.zeros(n_act_full, dtype=float) if tau_prev is None else tau_prev,
         )
     else:
+        foot_force_state = state.get(
+            "foot_forces",
+            {
+                "left": np.zeros(3, dtype=float),
+                "right": np.zeros(3, dtype=float),
+            },
+        )
+        foot_wrench_state = state.get(
+            "foot_wrenches",
+            {
+                "left": np.zeros(6, dtype=float),
+                "right": np.zeros(6, dtype=float),
+            },
+        )
         state = {
             "q": np.array(state["q"], dtype=float).copy(),
             "dq": np.array(state["dq"], dtype=float).copy(),
@@ -174,8 +200,12 @@ def qpid(
             "tau_full": np.array(state["tau_full"], dtype=float).copy(),
             "root_residual": np.array(state["root_residual"], dtype=float).copy(),
             "foot_forces": {
-                "left": np.array(state["foot_forces"]["left"], dtype=float).copy(),
-                "right": np.array(state["foot_forces"]["right"], dtype=float).copy(),
+                "left": np.array(foot_force_state["left"], dtype=float).copy(),
+                "right": np.array(foot_force_state["right"], dtype=float).copy(),
+            },
+            "foot_wrenches": {
+                "left": np.array(foot_wrench_state["left"], dtype=float).copy(),
+                "right": np.array(foot_wrench_state["right"], dtype=float).copy(),
             },
             "contact_state": {
                 "left": bool(state["contact_state"]["left"]),
@@ -529,6 +559,27 @@ def qpid(
             cue["anchor_position"] = 0.5 * (cue["heel_position"] + cue["toe_position"])
             cue["anchor_jacobian"] = 0.5 * (cue["heel_jacobian"] + cue["toe_jacobian"])
             cue["anchor_bias"] = 0.5 * (cue["heel_bias"] + cue["toe_bias"])
+            cue["anchor_angular_jacobian"] = np.array(model.getAngularJacobian(cue["heel_body"]), dtype=float)
+            cue["anchor_angular_bias"] = np.array(model.getAngularJacobianDeriv(cue["heel_body"]), dtype=float) @ dq_hat
+            cue["anchor_angular_velocity"] = cue["anchor_angular_jacobian"] @ dq_hat
+            foot_forward = cue["toe_position"] - cue["heel_position"]
+            foot_forward -= float(np.dot(foot_forward, up)) * up
+            foot_forward_norm = float(np.linalg.norm(foot_forward))
+            if foot_forward_norm < 1e-6:
+                foot_forward = tangent_1.copy()
+            else:
+                foot_forward /= foot_forward_norm
+            foot_lateral = np.cross(up, foot_forward)
+            foot_lateral_norm = float(np.linalg.norm(foot_lateral))
+            if foot_lateral_norm < 1e-6:
+                foot_lateral = tangent_2.copy()
+            else:
+                foot_lateral /= foot_lateral_norm
+            cue["foot_basis"] = np.vstack([foot_forward, foot_lateral, up])
+            foot_span = float(np.linalg.norm(cue["toe_position"] - cue["heel_position"] - np.dot(cue["toe_position"] - cue["heel_position"], up) * up))
+            cue["cop_half_length"] = float(np.clip(0.5 * foot_span + 0.015, 0.05, 0.14))
+            cue["cop_half_width"] = float(np.clip(0.35 * cue["cop_half_length"], 0.025, 0.06))
+            cue["torsion_limit"] = float(0.5 * (cue["cop_half_length"] + cue["cop_half_width"]))
             ankle_name = "ankle_l" if side == "left" else "ankle_r"
             cue["joint_confidence"] = joint_conf_lookup.get(ankle_name, float(np.mean(joint_confidence)) if joint_confidence.size > 0 else 0.0)
             height_score = np.clip(1.0 - max(height, 0.0) / 0.16, 0.0, 1.0)
@@ -573,7 +624,7 @@ def qpid(
                 if foot_cues[side]["score"] < 0.75:
                     contact_state[side] = False
 
-        support_force_split = np.zeros(6, dtype=float)
+        support_wrench_split = np.zeros(12, dtype=float)
         active_support_sides = [side for side in ["left", "right"] if contact_state[side]]
         if support_force_local[2] > 0.0 and len(active_support_sides) > 0:
             com_plane = com_position - (float(np.dot(com_position, up)) - float(floor_height)) * up
@@ -595,10 +646,10 @@ def qpid(
                 if side_tangential_norm > side_tangential_limit > 0.0:
                     side_force_local[:2] *= side_tangential_limit / side_tangential_norm
                 side_force_world = ground_basis.T @ side_force_local
-                if side == "left":
-                    support_force_split[:3] = side_force_world
-                else:
-                    support_force_split[3:6] = side_force_world
+                cue = foot_cues[side]
+                side_moment_world = np.zeros(3, dtype=float)
+                wrench_slice = slice(0, 6) if side == "left" else slice(6, 12)
+                support_wrench_split[wrench_slice] = np.concatenate([side_force_world, side_moment_world])
 
         model.setPositions(q_hat)
         model.setVelocities(dq_hat)
@@ -623,10 +674,12 @@ def qpid(
             w_dq[:6] *= 2.0
             w_ddq[:6] *= 1.5
 
-        J_force = np.zeros((n_dof, 6), dtype=float)
+        J_wrench = np.zeros((n_dof, 12), dtype=float)
         for foot_idx, side in enumerate(["left", "right"]):
-            J_side = foot_cues[side]["anchor_jacobian"][:, active_dofs]
-            J_force[:, 3 * foot_idx : 3 * foot_idx + 3] = J_side.T
+            J_linear = foot_cues[side]["anchor_jacobian"][:, active_dofs]
+            J_angular = foot_cues[side]["anchor_angular_jacobian"][:, active_dofs]
+            J_wrench[:, 6 * foot_idx : 6 * foot_idx + 3] = J_linear.T
+            J_wrench[:, 6 * foot_idx + 3 : 6 * foot_idx + 6] = J_angular.T
 
         S_T = np.zeros((n_dof, n_act), dtype=float)
         for i, dof in enumerate(active_act_dofs):
@@ -673,11 +726,11 @@ def qpid(
         if dyn_key not in DYN_QP_CACHE:
             ddq_var = cp.Variable(n_dof)
             tau_var = cp.Variable(n_act)
-            force_var = cp.Variable(6)
+            wrench_var = cp.Variable(12)
             root_var = cp.Variable(6)
             M_param = cp.Parameter((n_dof, n_dof))
             h_param = cp.Parameter(n_dof)
-            J_force_param = cp.Parameter((n_dof, 6))
+            J_wrench_param = cp.Parameter((n_dof, 12))
             ddq_lower_param = cp.Parameter(n_dof)
             ddq_upper_param = cp.Parameter(n_dof)
             A_q_param = cp.Parameter((n_dof, n_dof))
@@ -687,16 +740,18 @@ def qpid(
             A_ddq_param = cp.Parameter((n_dof, n_dof))
             b_ddq_param = cp.Parameter(n_dof)
             b_tau_s_param = cp.Parameter(n_act)
-            b_force_s_param = cp.Parameter(6)
+            b_wrench_s_param = cp.Parameter(12)
             b_root_s_param = cp.Parameter(6)
-            A_force_net_param = cp.Parameter((3, 6))
-            b_force_net_param = cp.Parameter(3)
-            A_force_split_param = cp.Parameter((6, 6))
-            b_force_split_param = cp.Parameter(6)
+            A_wrench_net_param = cp.Parameter((3, 12))
+            b_wrench_net_param = cp.Parameter(3)
+            A_wrench_split_param = cp.Parameter((12, 12))
+            b_wrench_split_param = cp.Parameter(12)
             tau_smooth_const = np.diag(np.ones(n_act, dtype=float) * 0.05)
             tau_reg_const = np.diag(np.ones(n_act, dtype=float) * 0.004)
-            force_smooth_const = np.diag(np.ones(6, dtype=float) * 0.06)
-            force_reg_const = np.diag(np.ones(6, dtype=float) * 0.004)
+            wrench_smooth_weights = np.array([0.06, 0.06, 0.06, 0.12, 0.12, 0.04] * 2, dtype=float)
+            wrench_reg_weights = np.array([0.004, 0.004, 0.004, 0.012, 0.012, 0.004] * 2, dtype=float)
+            wrench_smooth_const = np.diag(wrench_smooth_weights)
+            wrench_reg_const = np.diag(wrench_reg_weights)
             root_smooth_const = np.diag(np.array([0.10, 0.10, 0.10, 0.05, 0.05, 0.05], dtype=float))
             root_const = np.diag(np.array([0.75, 0.75, 0.75, 0.30, 0.30, 0.30], dtype=float))
             objective = cp.sum_squares(A_q_param @ ddq_var - b_q_param)
@@ -704,14 +759,14 @@ def qpid(
             objective += cp.sum_squares(A_ddq_param @ ddq_var - b_ddq_param)
             objective += cp.sum_squares(tau_smooth_const @ tau_var - b_tau_s_param)
             objective += cp.sum_squares(tau_reg_const @ tau_var)
-            objective += cp.sum_squares(force_smooth_const @ force_var - b_force_s_param)
-            objective += cp.sum_squares(force_reg_const @ force_var)
-            objective += cp.sum_squares(A_force_net_param @ force_var - b_force_net_param)
-            objective += cp.sum_squares(A_force_split_param @ force_var - b_force_split_param)
+            objective += cp.sum_squares(wrench_smooth_const @ wrench_var - b_wrench_s_param)
+            objective += cp.sum_squares(wrench_reg_const @ wrench_var)
+            objective += cp.sum_squares(A_wrench_net_param @ wrench_var - b_wrench_net_param)
+            objective += cp.sum_squares(A_wrench_split_param @ wrench_var - b_wrench_split_param)
             objective += cp.sum_squares(root_smooth_const @ root_var - b_root_s_param)
             objective += cp.sum_squares(root_const @ root_var)
             constraints = [
-                M_param @ ddq_var + h_param == S_T @ tau_var + J_force_param @ force_var + S_root @ root_var,
+                M_param @ ddq_var + h_param == S_T @ tau_var + J_wrench_param @ wrench_var + S_root @ root_var,
                 ddq_var >= ddq_lower_param,
                 ddq_var <= ddq_upper_param,
             ]
@@ -725,41 +780,58 @@ def qpid(
                 meas_b_param = None
 
             side_params = {}
-            for side, force_slice in [("left", slice(0, 3)), ("right", slice(3, 6))]:
+            for side, wrench_slice in [("left", slice(0, 6)), ("right", slice(6, 12))]:
                 if dyn_key[3] if side == "left" else dyn_key[4]:
                     A_acc_param = cp.Parameter((3, n_dof))
                     b_acc_param = cp.Parameter(3)
                     A_vel_param = cp.Parameter((3, n_dof))
                     b_vel_param = cp.Parameter(3)
+                    A_ang_acc_param = cp.Parameter((3, n_dof))
+                    b_ang_acc_param = cp.Parameter(3)
+                    A_ang_vel_param = cp.Parameter((3, n_dof))
+                    b_ang_vel_param = cp.Parameter(3)
                     objective += cp.sum_squares(A_acc_param @ ddq_var - b_acc_param)
                     objective += cp.sum_squares(A_vel_param @ ddq_var - b_vel_param)
-                    local_force = ground_basis @ force_var[force_slice]
+                    objective += cp.sum_squares(A_ang_acc_param @ ddq_var - b_ang_acc_param)
+                    objective += cp.sum_squares(A_ang_vel_param @ ddq_var - b_ang_vel_param)
+                    local_force = ground_basis @ wrench_var[wrench_slice.start : wrench_slice.start + 3]
+                    local_moment = ground_basis @ wrench_var[wrench_slice.start + 3 : wrench_slice.stop]
                     constraints += [
                         local_force[2] >= 0.0,
                         local_force[0] <= float(mu) * local_force[2],
                         -local_force[0] <= float(mu) * local_force[2],
                         local_force[1] <= float(mu) * local_force[2],
                         -local_force[1] <= float(mu) * local_force[2],
+                        local_moment[0] <= FOOT_COP_HALF_WIDTH * local_force[2],
+                        -local_moment[0] <= FOOT_COP_HALF_WIDTH * local_force[2],
+                        local_moment[1] <= FOOT_COP_HALF_LENGTH * local_force[2],
+                        -local_moment[1] <= FOOT_COP_HALF_LENGTH * local_force[2],
+                        local_moment[2] <= FOOT_TORSION_RADIUS * local_force[2],
+                        -local_moment[2] <= FOOT_TORSION_RADIUS * local_force[2],
                     ]
                     side_params[side] = {
                         "A_acc": A_acc_param,
                         "b_acc": b_acc_param,
                         "A_vel": A_vel_param,
                         "b_vel": b_vel_param,
+                        "A_ang_acc": A_ang_acc_param,
+                        "b_ang_acc": b_ang_acc_param,
+                        "A_ang_vel": A_ang_vel_param,
+                        "b_ang_vel": b_ang_vel_param,
                     }
                 else:
-                    constraints += [force_var[force_slice] == 0.0]
+                    constraints += [wrench_var[wrench_slice] == 0.0]
                     side_params[side] = None
 
             DYN_QP_CACHE[dyn_key] = {
                 "problem": cp.Problem(cp.Minimize(objective), constraints),
                 "ddq": ddq_var,
                 "tau": tau_var,
-                "force": force_var,
+                "wrench": wrench_var,
                 "root": root_var,
                 "M": M_param,
                 "h": h_param,
-                "J_force": J_force_param,
+                "J_wrench": J_wrench_param,
                 "ddq_lower": ddq_lower_param,
                 "ddq_upper": ddq_upper_param,
                 "A_q": A_q_param,
@@ -769,12 +841,12 @@ def qpid(
                 "A_ddq": A_ddq_param,
                 "b_ddq": b_ddq_param,
                 "b_tau_s": b_tau_s_param,
-                "b_force_s": b_force_s_param,
+                "b_wrench_s": b_wrench_s_param,
                 "b_root_s": b_root_s_param,
-                "A_force_net": A_force_net_param,
-                "b_force_net": b_force_net_param,
-                "A_force_split": A_force_split_param,
-                "b_force_split": b_force_split_param,
+                "A_wrench_net": A_wrench_net_param,
+                "b_wrench_net": b_wrench_net_param,
+                "A_wrench_split": A_wrench_split_param,
+                "b_wrench_split": b_wrench_split_param,
                 "J_meas": J_meas_param,
                 "meas_b": meas_b_param,
                 "side_params": side_params,
@@ -783,7 +855,7 @@ def qpid(
         problem = DYN_QP_CACHE[dyn_key]
         problem["M"].value = M + PARAM_DENSE_EPS
         problem["h"].value = h
-        problem["J_force"].value = J_force + PARAM_DENSE_EPS
+        problem["J_wrench"].value = J_wrench + PARAM_DENSE_EPS
         problem["ddq_lower"].value = ddq_lower
         problem["ddq_upper"].value = ddq_upper
         problem["A_q"].value = np.diag(w_q * (0.5 * dt_sim * dt_sim))
@@ -797,39 +869,46 @@ def qpid(
             problem["b_tau_s"].value = 0.05 * tau_prev_active
         else:
             problem["b_tau_s"].value = np.zeros(0, dtype=float)
-        force_prev = np.concatenate([state["foot_forces"]["left"], state["foot_forces"]["right"]])
-        problem["b_force_s"].value = 0.06 * force_prev
+        wrench_prev = np.concatenate([state["foot_wrenches"]["left"], state["foot_wrenches"]["right"]])
+        problem["b_wrench_s"].value = np.array([0.06, 0.06, 0.06, 0.12, 0.12, 0.04] * 2, dtype=float) * wrench_prev
         problem["b_root_s"].value = np.array([0.10, 0.10, 0.10, 0.05, 0.05, 0.05], dtype=float) * state["root_residual"]
         net_force_w = np.array([0.008, 0.008, 0.028], dtype=float) * (0.3 + min(support_ratio, 1.5))
-        split_force_w = np.ones(6, dtype=float) * 0.0
-        split_force_w[:3] = 0.006 * (0.3 + foot_cues["left"]["score"]) * float(contact_state["left"])
-        split_force_w[3:6] = 0.006 * (0.3 + foot_cues["right"]["score"]) * float(contact_state["right"])
-        problem["A_force_net"].value = np.diag(net_force_w) @ np.array(
+        split_wrench_w = np.zeros(12, dtype=float)
+        split_wrench_w[:6] = np.array([0.006, 0.006, 0.006, 0.0, 0.0, 0.0], dtype=float) * (0.3 + foot_cues["left"]["score"]) * float(contact_state["left"])
+        split_wrench_w[6:12] = np.array([0.006, 0.006, 0.006, 0.0, 0.0, 0.0], dtype=float) * (0.3 + foot_cues["right"]["score"]) * float(contact_state["right"])
+        problem["A_wrench_net"].value = np.diag(net_force_w) @ np.array(
             [
-                [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
             ],
             dtype=float,
         )
-        problem["b_force_net"].value = net_force_w * support_force_target
-        problem["A_force_split"].value = np.diag(split_force_w)
-        problem["b_force_split"].value = split_force_w * support_force_split
+        problem["b_wrench_net"].value = net_force_w * support_force_target
+        problem["A_wrench_split"].value = np.diag(split_wrench_w)
+        problem["b_wrench_split"].value = split_wrench_w * support_wrench_split
         if problem["J_meas"] is not None:
             problem["J_meas"].value = np.diag(meas_w) @ (0.5 * dt_sim * dt_sim * (J_meas + PARAM_DENSE_EPS))
             problem["meas_b"].value = meas_w * meas_b
 
-        for side, force_slice in [("left", slice(0, 3)), ("right", slice(3, 6))]:
+        for side in ["left", "right"]:
             side_params = problem["side_params"][side]
             if side_params is None:
                 continue
             J_side = foot_cues[side]["anchor_jacobian"][:, active_dofs]
+            J_ang = foot_cues[side]["anchor_angular_jacobian"][:, active_dofs]
             w_acc = np.array([0.05, 0.05, 0.18], dtype=float) * (0.3 + foot_cues[side]["confidence"])
             w_vel = np.array([0.015, 0.015, 0.05], dtype=float) * (0.3 + foot_cues[side]["confidence"])
+            w_ang_acc = np.array([0.06, 0.06, 0.04], dtype=float) * (0.3 + foot_cues[side]["confidence"])
+            w_ang_vel = np.array([0.04, 0.04, 0.03], dtype=float) * (0.3 + foot_cues[side]["confidence"])
             side_params["A_acc"].value = np.diag(w_acc) @ (J_side + PARAM_DENSE_EPS)
             side_params["b_acc"].value = -w_acc * foot_cues[side]["anchor_bias"]
             side_params["A_vel"].value = np.diag(w_vel) @ (dt_sim * (J_side + PARAM_DENSE_EPS))
             side_params["b_vel"].value = -w_vel * (J_side @ dq_prev)
+            side_params["A_ang_acc"].value = np.diag(w_ang_acc) @ (J_ang + PARAM_DENSE_EPS)
+            side_params["b_ang_acc"].value = -w_ang_acc * foot_cues[side]["anchor_angular_bias"]
+            side_params["A_ang_vel"].value = np.diag(w_ang_vel) @ (dt_sim * (J_ang + PARAM_DENSE_EPS))
+            side_params["b_ang_vel"].value = -w_ang_vel * (J_ang @ dq_prev[active_dofs])
 
         try:
             problem["problem"].solve(
@@ -857,9 +936,9 @@ def qpid(
 
         ddq_active = None if problem["ddq"].value is None else np.array(problem["ddq"].value, dtype=float).reshape(-1)
         tau_active = None if problem["tau"].value is None else np.array(problem["tau"].value, dtype=float).reshape(-1)
-        force_proj = None if problem["force"].value is None else np.array(problem["force"].value, dtype=float).reshape(-1)
+        wrench_proj = None if problem["wrench"].value is None else np.array(problem["wrench"].value, dtype=float).reshape(-1)
         root_residual = None if problem["root"].value is None else np.array(problem["root"].value, dtype=float).reshape(-1)
-        if ddq_active is None or tau_active is None or force_proj is None or root_residual is None:
+        if ddq_active is None or tau_active is None or wrench_proj is None or root_residual is None:
             return None
 
         ddq_full = np.zeros(n_dof_full, dtype=float)
@@ -877,9 +956,13 @@ def qpid(
             tau_out[dof_idx - 6] = tau_active[i]
             tau_full[dof_idx] = tau_active[i]
 
+        foot_wrenches = {
+            "left": wrench_proj[:6].copy(),
+            "right": wrench_proj[6:12].copy(),
+        }
         foot_forces = {
-            "left": force_proj[:3].copy(),
-            "right": force_proj[3:6].copy(),
+            "left": foot_wrenches["left"][:3].copy(),
+            "right": foot_wrenches["right"][:3].copy(),
         }
 
         model.setPositions(q_full)
@@ -893,11 +976,20 @@ def qpid(
             if not contact_state[side]:
                 continue
             cue = foot_cues[side]
-            point_force = 0.5 * foot_forces[side]
             contact_info.append((cue["heel_body"], cue["heel_offset"], float(floor_height)))
             contact_info.append((cue["toe_body"], cue["toe_offset"], float(floor_height)))
-            fc_out.append(point_force)
-            fc_out.append(point_force)
+            local_force = cue["foot_basis"] @ foot_forces[side]
+            local_moment = cue["foot_basis"] @ foot_wrenches[side][3:6]
+            heel_force = 0.5 * local_force
+            toe_force = 0.5 * local_force
+            if local_force[2] > 1e-6:
+                cop_x = float(np.clip(-local_moment[1] / local_force[2], -cue["cop_half_length"], cue["cop_half_length"]))
+                toe_share = np.clip(0.5 + cop_x / max(2.0 * cue["cop_half_length"], 1e-6), 0.0, 1.0)
+                heel_share = 1.0 - toe_share
+                heel_force = heel_share * local_force
+                toe_force = toe_share * local_force
+            fc_out.append(cue["foot_basis"].T @ heel_force)
+            fc_out.append(cue["foot_basis"].T @ toe_force)
         if len(fc_out) == 0:
             fc_out = np.zeros(0, dtype=float)
         else:
@@ -906,6 +998,7 @@ def qpid(
         contact_generalized = np.zeros(n_dof_full, dtype=float)
         for side in ["left", "right"]:
             contact_generalized += foot_cues[side]["anchor_jacobian"].T @ foot_forces[side]
+            contact_generalized += foot_cues[side]["anchor_angular_jacobian"].T @ foot_wrenches[side][3:6]
         measurement_delta = x_step - np.array(model.getJointWorldPositions(measurement_joints), dtype=float).reshape(-1, 3)
         measurement_delta = measurement_delta[joint_weights > 0.0]
         dynamics_residual = M_full @ ddq_full + h_full - tau_full - contact_generalized
@@ -920,6 +1013,10 @@ def qpid(
             "foot_forces": {
                 "left": foot_forces["left"].copy(),
                 "right": foot_forces["right"].copy(),
+            },
+            "foot_wrenches": {
+                "left": foot_wrenches["left"].copy(),
+                "right": foot_wrenches["right"].copy(),
             },
             "contact_state": {
                 "left": bool(contact_state["left"]),
@@ -947,6 +1044,7 @@ def qpid(
             "tau_full": tau_full,
             "root_residual": root_residual,
             "foot_forces": foot_forces,
+            "foot_wrenches": foot_wrenches,
             "contact_state": contact_state,
             "contact_info": contact_info,
             "fc": fc_out,

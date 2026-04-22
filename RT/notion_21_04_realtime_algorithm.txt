@@ -1,0 +1,321 @@
+Algoritmo real-time di inverse dynamics
+
+Panoramica
+
+L'algoritmo real-time attuale e' implementato in /Users/enricomartini/Desktop/opensim-batch-dynamics/RT/rt_library.py dentro la funzione qpid(). La struttura e' weakly-coupled e causale: prima stima la cinematica robusta al frame corrente, poi risolve un QP dinamico/contact che usa quella cinematica come prior soft. L'obiettivo e' seguire misure multimodali rumorose in tempo reale senza dipendere da output offline a runtime, ma restando il piu' possibile vicino alla logica biomeccanica della pipeline offline.
+
+Obiettivo
+
+Ad ogni frame il solver produce:
+- posa generalizzata q_t
+- velocita' generalizzata dq_t
+- accelerazione generalizzata ddq_t
+- torque articolari tau_t
+- wrench di contatto ai due piedi
+- residual wrench del root
+- stato di contatto left/right
+
+Notazione
+
+Sia n il numero totale di gradi di liberta' e n_a = n - 6 il numero di gradi di liberta' attuati. Le prime 6 coordinate corrispondono al floating base del pelvis/root.
+
+Stato persistente al frame precedente:
+- q_{t-1}
+- dq_{t-1}
+- ddq_{t-1}
+- tau_{t-1}
+- r_{t-1}
+- w_{t-1}^{L}, w_{t-1}^{R}
+- c_{t-1}^{L}, c_{t-1}^{R}
+
+Misure al frame corrente:
+- x_t = posizioni 3D globali dei joint osservati
+- joint_weights = confidenze per joint e coordinata
+- opzionalmente q_meas, q_weights, dq_meas, dq_weights
+
+Stato interno persistente
+
+Lo stato viene mantenuto da initialize_rt_state(...). Contiene:
+- q, dq, ddq
+- tau, tau_full
+- root_residual
+- foot_forces, foot_wrenches
+- contact_state
+- floor_height
+- step_index
+
+Questa memoria rende il solver strettamente causale: al frame t usa solo osservazioni correnti e stato fino al frame t-1.
+
+Struttura generale a due stadi
+
+Stage 1:
+- riceve x_t e lo stato precedente
+- stima una cinematica robusta e plausibile
+- produce q_hat_t, dq_hat_t, ddq_hat_t
+- produce pesi robusti e affidabilita' per misura, joint e DOF
+- produce cue cinematici per il contatto
+
+Stage 2:
+- prende q_hat_t, dq_hat_t, ddq_hat_t come prior soft
+- risolve un QP dinamico con contatti e attrito
+- stima ddq_t, tau_t, wrench ai piedi e residual wrench del root
+- decide il contatto left/right in modo causale usando i cue dello Stage 1
+
+La weak coupling concreta dell'implementazione e':
+- q_t = q_hat_t
+- dq_t = dq_hat_t
+- ddq_t viene dallo Stage 2
+
+Questo e' importante: lo Stage 2 non rimpiazza la posa cinematica con una posa dinamica completamente diversa. Spiega dinamicamente la posa dello Stage 1.
+
+Stage 1: predizione causale
+
+Lo Stage 1 parte da una predizione discreta ottenuta dallo stato precedente. Si usa un modello kinematico a accelerazione costante sul singolo step.
+
+Stage 1: gestione delle misure
+
+L'input x_t puo' arrivare come array o come dizionario. Se alcune coordinate sono NaN o a bassa confidenza, i relativi pesi vengono posti a zero o ridotti. Questo evita di trasformare misure mancanti o corrotte in vincoli duri.
+
+Stage 1: robust inverse kinematics
+
+La variabile principale e' q_hat. Viene inizializzata con la predizione causale e poi corretta iterativamente.
+
+Passi interni:
+1. si linearizza la cinematica dei joint osservati attorno a q_hat
+2. si corregge esplicitamente la traslazione del root usando il residuo medio task-space
+3. si aggiornano i pesi robusti delle misure in base all'innovation
+4. si risolve un QP di inverse kinematics con vincoli su posizione e velocita' incrementale
+5. si aggiorna q_hat e si ripete per poche iterazioni
+
+Perche' il root recentering e' importante
+
+Con 12 keypoint globali puliti, il failure mode piu' grave e' il drift del pelvis/root. Per evitarlo, il solver calcola il residuo task-space medio e lo usa direttamente per correggere i tre DOF di traslazione del root prima del solve QP locale. Questa scelta rende il tracking globale molto piu' stabile.
+
+QP dello Stage 1
+
+La correzione incrementale Delta q viene risolta come least-squares bilaterale, non come servo-PD. Se q_meas e' disponibile, entra come ulteriore prior soft.
+
+Vincoli dello Stage 1
+
+I vincoli imposti al QP di Stage 1 sono:
+- limiti articolari: q_lower <= q_hat + Delta q <= q_upper
+- limite di velocita' incrementale per frame: -dt * dq_cap <= Delta q_cumulative + Delta q <= dt * dq_cap
+
+Pesi robusti nello Stage 1
+
+Le misure vengono down-weighted in modo continuo usando la norma del residuo 3D di ogni joint osservato. Quindi un outlier non viene trattato come un hard failure: pesa semplicemente meno nel solve successivo.
+
+Affidabilita' per DOF
+
+Dopo il QP, il solver costruisce una dof_reliability usando l'energia del jacobiano pesato. In pratica misura quanto le misure correnti informino ciascun DOF. Questa quantita' viene poi usata per fondere osservazione e predizione nella stima delle velocita'.
+
+Stima di dq_hat e ddq_hat
+
+La velocita' non e' solo una differenza finita rumorosa. Viene blendata con la predizione in funzione della reliability. Se esiste una misura diretta dq_meas, viene integrata con un blending addizionale.
+
+Output dello Stage 1
+
+Lo Stage 1 produce:
+- q_hat
+- dq_hat
+- ddq_hat
+- measurement_weights
+- joint_confidence
+- dof_reliability
+
+Stage 1: cue cinematici per il contatto
+
+Con q_hat, dq_hat e ddq_hat il solver calcola una serie di cue per ogni piede:
+- posizione di heel e toe
+- velocita' di heel e toe
+- altezza rispetto al pavimento
+- velocita' verticale del punto piu' basso
+- frame locale del piede
+- anchor point del piede
+- lunghezza e larghezza effettive della regione di CoP
+
+Stima del pavimento
+
+Il floor non e' fisso. Viene aggiornato causalmente dai punti piu' bassi osservati dei piedi. Se compare un nuovo punto piu' basso, il floor scende relativamente in fretta; se i punti diventano piu' alti, il floor sale lentamente. Questo evita jitter nella stima del contatto.
+
+Forza di supporto dal COM
+
+Lo Stage 1 costruisce anche una prior netta di forza di supporto usando massa, gravita' e accelerazione del centro di massa. Questa forza viene espressa in una base locale del terreno, saturata nel tempo e clampata nel cono di attrito. Il rapporto fra componente verticale e peso corporeo definisce support_ratio, che e' un indicatore causale di quanta forza di supporto il corpo stia plausibilmente scaricando al suolo.
+
+Contatto con isteresi
+
+Per ogni piede il solver combina:
+- confidenza della caviglia
+- altezza dal suolo
+- velocita' verticale
+- stato di contatto precedente
+- support_ratio globale
+
+Da questa combinazione costruisce uno score. L'attivazione e la disattivazione usano due soglie diverse, quindi c'e' isteresi:
+- soglia piu' alta per entrare in contatto
+- soglia piu' bassa per restarci
+
+Ci sono anche fallback causali:
+- se il corpo sta chiaramente scaricando forza a terra ma nessun piede e' attivo, ne viene attivato almeno uno
+- se il supporto e' molto basso, i contatti deboli vengono spenti
+
+Stage 2: variabili di decisione
+
+Lo Stage 2 risolve un problema quadratico nelle variabili:
+- ddq_t
+- tau_t
+- w_t^L, w_t^R con un wrench 6D per piede
+- r_t residual wrench del root
+
+L'uso di un wrench 6D per piede e' importante: il solver non usa piu' point contacts come variabile primaria. Le forze puntuali heel/toe vengono ricostruite solo a posteriori per compatibilita'.
+
+Vincolo di dinamica rigida
+
+Lo Stage 2 impone la dinamica rigida del multibody con torque attuati, wrench di contatto e residual wrench del root. Il residual wrench non e' un errore indesiderato: e' una valvola di sicurezza fisicamente interpretabile che evita di forzare contatti o torque impossibili quando cinematica e dinamica non sono perfettamente consistenti.
+
+Prior soft nello Stage 2
+
+Lo Stage 2 usa q_hat, dq_hat e ddq_hat come prior soft. Non li impone come hard constraints.
+
+In pratica penalizza:
+- la deviazione della posa discreta da q_hat
+- la deviazione della velocita' discreta da dq_hat
+- la deviazione dell'accelerazione da ddq_hat
+
+Inoltre regolarizza:
+- variazione temporale dei torque
+- norma dei torque
+- variazione temporale dei wrench
+- norma dei wrench
+- variazione del root residual
+- norma del root residual
+
+Measurement fitting nello Stage 2
+
+Se alcune misure task-space sono disponibili, lo Stage 2 aggiunge anche un termine lineare su ddq che cerca di migliorare la coerenza della posa integrata con le osservazioni correnti. Anche qui non si usa un PD monolitico: e' sempre una penalizzazione bilaterale di least-squares.
+
+Vincoli sui wrench dei piedi
+
+Per ogni piede in contatto, nel frame locale del piede, vengono imposti:
+- forza normale non negativa
+- cono di attrito linearizzato
+- limiti sul centro di pressione tramite i momenti Mx e My
+- limite di torsione tramite Mz
+
+Se un piede non e' in contatto, il suo wrench viene posto a zero.
+
+Prior di supporto e split left/right
+
+La risultante di supporto ricavata dal COM non viene imposta rigidamente. Entra come prior soft:
+- una prior sulla forza netta totale
+- una prior sulla ripartizione left/right
+
+La ripartizione dipende da:
+- distanza planare fra COM e anchor del piede
+- score di contatto del piede
+- stato di contatto precedente
+
+In questo modo lo split del carico tra i due piedi e' causale, smooth e guidato dalla cinematica.
+
+Output finale dello Stage 2
+
+La soluzione del QP produce:
+- ddq_full
+- tau_full
+- foot_wrenches left/right
+- foot_forces left/right
+- root_residual
+
+Poi il solver costruisce anche q_dyn e dq_dyn per diagnosticare l'integrazione puramente dinamica, ma lo stato realtime finale mantiene:
+- q = q_hat
+- dq = dq_hat
+- ddq = ddq_full
+
+Compatibilita' heel/toe
+
+Anche se il contatto primario e' un wrench 6D per piede, il codice redistribuisce la forza del piede tra heel e toe per costruire fc e contact_info, cosi' il resto della pipeline puo' ancora usare un formato compatibile col vecchio schema point-contact.
+
+Residual dinamico finale
+
+Alla fine il solver ricostruisce il residuo dinamico globale:
+- matrice di massa per accelerazione
+- piu' termini di Coriolis e gravita'
+- meno torque generalizzati
+- meno contributi generalizzati dei wrench ai piedi
+
+La norma L2 di questo residuo viene salvata come dynamics_residual_norm.
+
+Come viene usato da real_time_test.py
+
+Il file /Users/enricomartini/Desktop/opensim-batch-dynamics/RT/real_time_test.py e' il driver della pipeline realtime.
+
+Funzionamento:
+1. legge il CSV offline
+2. carica il modello OpenSim e applica le scale del soggetto
+3. estrae q, dq, ddq, tau, GRF e contatti offline
+4. costruisce uno skeleton_gt come ground truth cinematica
+5. ad ogni frame estrae le 12 joint world positions indicate in BSM_JOINT_NAMES
+6. opzionalmente aggiunge rumore e dropout
+7. chiama qpid(...)
+8. salva gli output realtime e calcola le metriche
+9. opzionalmente esporta un CSV realtime completo con --output-csv
+
+Riassunto concettuale
+
+L'algoritmo real-time fa due cose diverse ma coordinate:
+- prima ricostruisce la posa piu' plausibile e robusta data l'osservazione corrente e la storia recente
+- poi trova la spiegazione dinamica piu' plausibile di quella posa in termini di accelerazioni, torque, contatti e wrench ai piedi
+
+In questo senso e' molto piu' stabile della vecchia formulazione monolitica, che metteva nello stesso solve tracking task-space, scelta del contatto, dinamica rigida, attrito e torque estimation.
+
+Formula 1
+q_{pred,t} = q_{t-1} + dt \, dq_{t-1} + \frac{1}{2} dt^2 \, ddq_{t-1}
+
+Formula 2
+dq_{pred,t} = dq_{t-1} + dt \, ddq_{t-1}
+
+Formula 3
+w_i^{robust} = \frac{1}{1 + \left(\frac{\|r_i\|_2}{0.05}\right)^2}
+
+Formula 4
+\min_{\Delta q}
+\; \|W_{meas} (J \Delta q - (x_t - x(q)))\|^2
++ \|W_{step} \Delta q\|^2
++ \|W_{prior} (\Delta q - (q_{pred,t} - q))\|^2
+
+Formula 5
+dq_{\hat{t}} = \rho \odot \frac{q_{\hat{t}} - q_{t-1}}{dt} + (1-\rho) \odot dq_{pred,t}
+
+Formula 6
+ddq_{\hat{t}} = \frac{dq_{\hat{t}} - dq_{t-1}}{dt}
+
+Formula 7
+f_{support}^{*} = m \, (a_{COM} - g)
+
+Formula 8
+M(q_{\hat{t}}) \, ddq_t + h(q_{\hat{t}}, dq_{\hat{t}})
+= S^T \tau_t + J_w(q_{\hat{t}})^T w_t + r_t
+
+Formula 9
+q_t = q_{t-1} + dt \, dq_{t-1} + \frac{1}{2} dt^2 \, ddq_t
+
+Formula 10
+dq_t = dq_{t-1} + dt \, ddq_t
+
+Formula 11
+\min_{ddq,\tau,w,r}
+\; \|W_q (q_t - q_{\hat{t}})\|^2
++ \|W_{dq} (dq_t - dq_{\hat{t}})\|^2
++ \|W_{ddq} (ddq_t - ddq_{\hat{t}})\|^2
++ \|W_{\tau,s} (\tau_t - \tau_{t-1})\|^2
++ \|W_{\tau} \tau_t\|^2
++ \|W_{w,s} (w_t - w_{t-1})\|^2
++ \|W_{w} w_t\|^2
++ \|W_{r,s} (r_t - r_{t-1})\|^2
++ \|W_r r_t\|^2
+
+Formula 12
+f_z \ge 0,\qquad |f_x| \le \mu f_z,\qquad |f_y| \le \mu f_z
+
+Formula 13
+|M_x| \le b \, f_z,\qquad |M_y| \le a \, f_z,\qquad |M_z| \le \rho \, f_z

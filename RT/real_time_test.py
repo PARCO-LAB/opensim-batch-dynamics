@@ -1,4 +1,5 @@
 import argparse
+import time
 from pathlib import Path
 
 import nimblephysics as nimble
@@ -32,6 +33,18 @@ BSM_JOINT_NAMES = [
     "ankle_l",
 ]
 
+METRIC_EXCLUDE_PREFIXES = (
+    "ankle_angle_",
+    "subtalar_angle_",
+    "head_",
+    "wrist_",
+    "pro_sup_",
+)
+
+
+def include_in_precision_metrics(dof_name: str) -> bool:
+    return not any(dof_name.startswith(prefix) for prefix in METRIC_EXCLUDE_PREFIXES)
+
 
 if __name__ == "__main__":
     repo_root = Path(__file__).resolve().parents[1]
@@ -44,6 +57,12 @@ if __name__ == "__main__":
     parser.add_argument("--drop-joint-prob", type=float, default=0.0)
     parser.add_argument("--mu", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--output-csv",
+        type=Path,
+        default=None,
+        help="Optional path where the realtime reconstructed sequence is written as CSV",
+    )
     args = parser.parse_args()
 
     frame_table = pd.read_csv(args.csv.resolve())
@@ -130,6 +149,9 @@ if __name__ == "__main__":
     right_contact_rt = []
     mpjpe_rt = []
     dyn_residual_rt = []
+    solve_time_rt = []
+    left_wrench_rt = []
+    right_wrench_rt = []
 
     for frame_idx in range(1, len(frame_table)):
         dt = float(time_ref[frame_idx] - time_ref[frame_idx - 1])
@@ -145,6 +167,7 @@ if __name__ == "__main__":
             drop_mask = rng.random(x_t.shape[0]) < float(args.drop_joint_prob)
             x_t[drop_mask, :] = np.nan
 
+        t0 = time.perf_counter()
         result = qpid(
             skeleton=skeleton,
             x_t=x_t.reshape(-1),
@@ -153,6 +176,7 @@ if __name__ == "__main__":
             measurement_joints=joints,
             state=rt_state,
         )
+        solve_time_rt.append(time.perf_counter() - t0)
         if result is None:
             raise RuntimeError(f"qpid failed at frame {frame_idx}")
 
@@ -163,6 +187,8 @@ if __name__ == "__main__":
         tau_rt.append(result["tau_full"])
         left_force_rt.append(result["foot_forces"]["left"])
         right_force_rt.append(result["foot_forces"]["right"])
+        left_wrench_rt.append(result["foot_wrenches"]["left"])
+        right_wrench_rt.append(result["foot_wrenches"]["right"])
         left_contact_rt.append(bool(result["contact_state"]["left"]))
         right_contact_rt.append(bool(result["contact_state"]["right"]))
         dyn_residual_rt.append(float(result["dynamics_residual_norm"]))
@@ -178,32 +204,111 @@ if __name__ == "__main__":
     right_force_rt = np.array(right_force_rt, dtype=float)
     left_contact_rt = np.array(left_contact_rt, dtype=bool)
     right_contact_rt = np.array(right_contact_rt, dtype=bool)
+    solve_time_rt = np.array(solve_time_rt, dtype=float)
+    left_wrench_rt = np.array(left_wrench_rt, dtype=float)
+    right_wrench_rt = np.array(right_wrench_rt, dtype=float)
 
+    frame_values = frame_table["frame"].to_numpy(dtype=float) if "frame" in frame_table.columns else np.arange(len(frame_table), dtype=float)
     q_ref = q_ref[1 : 1 + len(q_rt)]
     dq_ref = dq_ref[1 : 1 + len(dq_rt)]
     ddq_ref = ddq_ref[1 : 1 + len(ddq_rt)]
     tau_ref = tau_ref[1 : 1 + len(tau_rt)]
+    time_ref = time_ref[1 : 1 + len(q_rt)]
+    frame_values = frame_values[1 : 1 + len(q_rt)]
     left_force_ref = left_force_ref[1 : 1 + len(left_force_rt)]
     right_force_ref = right_force_ref[1 : 1 + len(right_force_rt)]
     left_contact_ref = left_contact_ref[1 : 1 + len(left_contact_rt)]
     right_contact_ref = right_contact_ref[1 : 1 + len(right_contact_rt)]
+    metric_mask = np.array([include_in_precision_metrics(name) for name in dof_names], dtype=bool)
+    metric_dof_names = [name for name, keep in zip(dof_names, metric_mask) if keep]
+    metric_q_rt = q_rt[:, metric_mask]
+    metric_q_ref = q_ref[:, metric_mask]
+    metric_dq_rt = dq_rt[:, metric_mask]
+    metric_dq_ref = dq_ref[:, metric_mask]
+    metric_ddq_rt = ddq_rt[:, metric_mask]
+    metric_ddq_ref = ddq_ref[:, metric_mask]
+    metric_tau_rt = tau_rt[:, metric_mask]
+    metric_tau_ref = tau_ref[:, metric_mask]
+    metric_act_mask = metric_mask[6:] if len(metric_mask) > 6 else np.zeros(0, dtype=bool)
+    metric_tau_act_rt = tau_rt[:, 6:][:, metric_act_mask] if len(metric_mask) > 6 else metric_tau_rt
+    metric_tau_act_ref = tau_ref[:, 6:][:, metric_act_mask] if len(metric_mask) > 6 else metric_tau_ref
+
+    if args.output_csv is not None:
+        output_csv = args.output_csv.resolve()
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+        rt_columns = {
+            "frame": frame_values,
+            "time": time_ref,
+        }
+
+        for metadata_col in ["subject_mass_kg", "subject_height_m"]:
+            if metadata_col in frame_table.columns:
+                rt_columns[metadata_col] = frame_table[metadata_col].iloc[1 : 1 + len(q_rt)].to_numpy(dtype=float)
+
+        scale_cols = [col for col in frame_table.columns if "_scale_" in col]
+        for scale_col in scale_cols:
+            rt_columns[scale_col] = frame_table[scale_col].iloc[1 : 1 + len(q_rt)].to_numpy(dtype=float)
+
+        for idx, dof_name in enumerate(dof_names):
+            rt_columns[dof_name] = q_rt[:, idx]
+            rt_columns[dof_name + "_vel"] = dq_rt[:, idx]
+            rt_columns[dof_name + "_acc"] = ddq_rt[:, idx]
+            rt_columns[dof_name + "_tau"] = tau_rt[:, idx]
+
+        rt_columns["left_grf_x"] = left_force_rt[:, 0]
+        rt_columns["left_grf_y"] = left_force_rt[:, 1]
+        rt_columns["left_grf_z"] = left_force_rt[:, 2]
+        rt_columns["right_grf_x"] = right_force_rt[:, 0]
+        rt_columns["right_grf_y"] = right_force_rt[:, 1]
+        rt_columns["right_grf_z"] = right_force_rt[:, 2]
+        rt_columns["grf_total_x"] = left_force_rt[:, 0] + right_force_rt[:, 0]
+        rt_columns["grf_total_y"] = left_force_rt[:, 1] + right_force_rt[:, 1]
+        rt_columns["grf_total_z"] = left_force_rt[:, 2] + right_force_rt[:, 2]
+        rt_columns["left_contact"] = left_contact_rt.astype(float)
+        rt_columns["right_contact"] = right_contact_rt.astype(float)
+
+        rt_columns["left_wrench_fx"] = left_wrench_rt[:, 0]
+        rt_columns["left_wrench_fy"] = left_wrench_rt[:, 1]
+        rt_columns["left_wrench_fz"] = left_wrench_rt[:, 2]
+        rt_columns["left_wrench_mx"] = left_wrench_rt[:, 3]
+        rt_columns["left_wrench_my"] = left_wrench_rt[:, 4]
+        rt_columns["left_wrench_mz"] = left_wrench_rt[:, 5]
+        rt_columns["right_wrench_fx"] = right_wrench_rt[:, 0]
+        rt_columns["right_wrench_fy"] = right_wrench_rt[:, 1]
+        rt_columns["right_wrench_fz"] = right_wrench_rt[:, 2]
+        rt_columns["right_wrench_mx"] = right_wrench_rt[:, 3]
+        rt_columns["right_wrench_my"] = right_wrench_rt[:, 4]
+        rt_columns["right_wrench_mz"] = right_wrench_rt[:, 5]
+
+        rt_columns["mpjpe_m"] = np.array(mpjpe_rt, dtype=float)
+        rt_columns["dynamics_residual_norm"] = np.array(dyn_residual_rt, dtype=float)
+        rt_columns["solve_time_ms"] = 1000.0 * solve_time_rt
+        rt_columns["input_noise_std_m"] = np.full(len(q_rt), float(args.noise_std), dtype=float)
+        rt_columns["input_drop_joint_prob"] = np.full(len(q_rt), float(args.drop_joint_prob), dtype=float)
+        rt_columns["input_mu"] = np.full(len(q_rt), float(args.mu), dtype=float)
+
+        rt_table = pd.DataFrame(rt_columns)
+        rt_table.to_csv(output_csv, index=False)
 
     print(f"frames: {len(q_rt)}")
     print(f"noise_std_m: {args.noise_std:.6f}")
     print(f"drop_joint_prob: {args.drop_joint_prob:.6f}")
     print(f"mpjpe_m: mean={np.mean(mpjpe_rt):.6f} max={np.max(mpjpe_rt):.6f}")
     print(f"dyn_residual_norm: mean={np.mean(dyn_residual_rt):.6f} max={np.max(dyn_residual_rt):.6f}")
+    print(f"solve_time_ms: mean={1000.0 * np.mean(solve_time_rt):.6f} p95={1000.0 * np.percentile(solve_time_rt, 95.0):.6f}")
+    print(f"precision_metric_dofs: {len(metric_dof_names)}/{len(dof_names)} (excluding ankle/head/wrist-related angles)")
     print()
-    print(f"q_rmse: {rmse(q_rt, q_ref):.6f}")
-    print(f"q_mae: {mae(q_rt, q_ref):.6f}")
-    print(f"dq_rmse: {rmse(dq_rt, dq_ref):.6f}")
-    print(f"dq_mae: {mae(dq_rt, dq_ref):.6f}")
-    print(f"ddq_rmse: {rmse(ddq_rt, ddq_ref):.6f}")
-    print(f"ddq_mae: {mae(ddq_rt, ddq_ref):.6f}")
-    print(f"tau_full_rmse: {rmse(tau_rt, tau_ref):.6f}")
-    print(f"tau_full_mae: {mae(tau_rt, tau_ref):.6f}")
-    print(f"tau_actuated_rmse: {rmse(tau_rt[:, 6:], tau_ref[:, 6:]):.6f}")
-    print(f"tau_actuated_mae: {mae(tau_rt[:, 6:], tau_ref[:, 6:]):.6f}")
+    print(f"q_rmse: {rmse(metric_q_rt, metric_q_ref):.6f}")
+    print(f"q_mae: {mae(metric_q_rt, metric_q_ref):.6f}")
+    print(f"dq_rmse: {rmse(metric_dq_rt, metric_dq_ref):.6f}")
+    print(f"dq_mae: {mae(metric_dq_rt, metric_dq_ref):.6f}")
+    print(f"ddq_rmse: {rmse(metric_ddq_rt, metric_ddq_ref):.6f}")
+    print(f"ddq_mae: {mae(metric_ddq_rt, metric_ddq_ref):.6f}")
+    print(f"tau_full_rmse: {rmse(metric_tau_rt, metric_tau_ref):.6f}")
+    print(f"tau_full_mae: {mae(metric_tau_rt, metric_tau_ref):.6f}")
+    print(f"tau_actuated_rmse: {rmse(metric_tau_act_rt, metric_tau_act_ref):.6f}")
+    print(f"tau_actuated_mae: {mae(metric_tau_act_rt, metric_tau_act_ref):.6f}")
     print(f"left_grf_rmse: {rmse(left_force_rt, left_force_ref):.6f}")
     print(f"right_grf_rmse: {rmse(right_force_rt, right_force_ref):.6f}")
 
@@ -226,11 +331,11 @@ if __name__ == "__main__":
     print()
 
     print("worst_q_rmse:")
-    for name, value in top_k_rmse(q_rt, q_ref, dof_names, k=8):
+    for name, value in top_k_rmse(metric_q_rt, metric_q_ref, metric_dof_names, k=8):
         print(f"  {name}: {value:.6f}")
 
     print("worst_tau_rmse:")
-    for name, value in top_k_rmse(tau_rt, tau_ref, dof_names, k=8):
+    for name, value in top_k_rmse(metric_tau_rt, metric_tau_ref, metric_dof_names, k=8):
         print(f"  {name}: {value:.6f}")
 
     print("left_grf_axis_rmse:")
@@ -240,3 +345,7 @@ if __name__ == "__main__":
     print("right_grf_axis_rmse:")
     for name, value in per_column_rmse(right_force_rt, right_force_ref, ["fx", "fy", "fz"]):
         print(f"  {name}: {value:.6f}")
+
+    if args.output_csv is not None:
+        print()
+        print(f"realtime_csv: {args.output_csv.resolve()}")
