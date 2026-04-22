@@ -181,6 +181,10 @@ This avoids losing the history of what was tried and why.
 | `2026-04-22` | Soft torque plausibility priors in Stage 2 | `BMLhandball`, `TotalCapture`, `CNRS` | rejected | increased `tau_actuated_rmse` too much on nominal and dynamic-outlier cases |
 | `2026-04-22` | Shoulder-girdle orientation priors + quasi-static asymmetric contact heuristics | `BMLhandball`, `TotalCapture`, `CNRS`, `220926_yogi...` | rejected | `CNRS` got worse, and the yoga case produced a severe right-contact precision/recall regression |
 | `2026-04-22` | Ambiguity-gated stabilization on pelvis/trunk/shoulder/scapula subspace | `BMLhandball`, `TotalCapture`, `CNRS`, `220926_yogi...` | rejected | too broad; no gain on yoga, no gain on `CNRS`, slight nominal regression |
+| `2026-04-22` | Shoulder/scapula multi-frame gating with side-specific prior modulation | `BMLhandball`, `TotalCapture`, `CNRS`, `220926_yogi...` | rejected | clean gate failed; `BMLhandball` stayed neutral, but `TotalCapture` slightly worsened, `CNRS` worsened, and yoga right-contact F1 stayed poor; noisy/dropout not run |
+| `2026-04-22` | Shoulder confidence used only to gate shoulder-line contribution into pelvis/trunk priors | `BMLhandball`, `TotalCapture`, `CNRS`, `220926_yogi...` | rejected | clean gate failed; `BMLhandball` stayed neutral and `TotalCapture` slightly improved, but `CNRS` q RMSE worsened materially and yoga still did not improve; noisy/dropout not run |
+| `2026-04-22` | Contact pruning from previous wrench consistency, narrow weak-foot suppression | `BMLhandball`, `TotalCapture`, `CNRS`, `220926_yogi...` | rejected | clean gate failed because yoga did not improve at all; nominal and outlier cases stayed effectively unchanged, so noisy/dropout not run |
+| `2026-04-22` | Contact pruning from previous wrench consistency with multi-frame support-dominance memory | `BMLhandball`, `TotalCapture`, `220926_yogi...` | rejected | still no change on yoga right-contact F1, while nominal cases stayed neutral; branch reverted because it added state complexity without measurable gain |
 
 ## Robustness Validation
 
@@ -681,6 +685,16 @@ Conclusion:
   - contact persistence tied to previous support wrench consistency
   - explicit yoga/static benchmark gating before acceptance
 
+Update after the latest two narrower attempts:
+
+- even reliability-gated shoulder/scapula priors are still too risky if they directly change Stage 1 priors or trunk gains
+- using shoulder confidence only to gate shoulder-derived trunk cues also did not pass, because:
+  - `CNRS` remained unstable or regressed
+  - yoga/static support did not improve
+- practical conclusion:
+  - the next accepted gain is unlikely to come from "more shoulder prior"
+  - the next step should move to contact/wrench consistency or to explicit diagnostics of how shoulder asymmetry contaminates the trunk estimate before applying any new prior
+
 Latest rejected branch after that:
 
 - ambiguity-gated stabilization of pelvis/trunk/shoulder/scapula
@@ -749,3 +763,51 @@ Practical next experiment:
    - `CNRS`
    - `220926_yogi...`
    - then full AMASS if accepted
+
+Status update after running exactly that experiment:
+
+- two concrete variants were tried:
+  1. side-specific multi-frame shoulder/scapula prior modulation
+  2. shoulder-confidence gating only on shoulder-derived pelvis/trunk cues
+- both were rejected
+
+Measured outcomes against the accepted baseline:
+
+| Variant | BMLhandball | TotalCapture | CNRS | 220926_yogi... | Decision |
+| --- | --- | --- | --- | --- | --- |
+| side-specific multi-frame shoulder/scapula prior modulation | `tau_actuated_rmse 136.839130` vs `136.855040` | `125.258114` vs `125.239115` | `tau_actuated_rmse 3788.277315` vs `3784.076182` | `right_contact_f1 0.2367` | rejected |
+| shoulder-confidence gating only on shoulder-derived pelvis/trunk cues | `tau_actuated_rmse 136.855040` vs `136.855040` | `125.009504` vs `125.239115` | `q_rmse 0.938297` vs `0.678330`; `tau_actuated_rmse 3783.260191` vs `3784.076182` | `right_contact_f1 0.2367` | rejected |
+
+Practical conclusion:
+
+- `Priority 1` has now been exercised in broad, medium, and narrow forms
+- no version passed the acceptance gate cleanly
+- the next implementation should now shift to `Priority 2` and `Priority 3` in a more diagnostic-first way
+
+Revised immediate order:
+
+1. CNRS diagnostic split
+   - log or inspect whether one shoulder side dominates the Stage 1 residuals
+   - only then decide if a new trunk-isolation prior is justified
+2. contact diagnostics for yoga/static cases
+   - inspect whether the false-positive foot is already low in height but kept alive by score hysteresis, support split, or post-threshold clamping
+   - only then decide whether pruning should act on:
+     - contact score
+     - contact probability
+     - support-force split
+3. only after that, revisit shoulder priors
+   - but they must be passive diagnostics first, not active stabilizers
+
+Latest contact-pruning conclusion:
+
+- two narrow `Priority 2` variants have now been tried
+- neither changed yoga at all:
+  - `right_contact_f1` stayed at `0.2367`
+- both also left `BMLhandball` and `TotalCapture` essentially unchanged
+- practical reading:
+  - the yoga failure is probably not caused by the final pruning stage alone
+  - the false-positive foot is likely being re-activated upstream by:
+    - the raw contact score
+    - the `support_ratio >= 0.25` re-activation branch
+    - or the support-force split itself
+- therefore the next useful move is diagnostic-first, not another blind pruning tweak

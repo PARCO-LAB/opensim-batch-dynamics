@@ -612,6 +612,7 @@ def qpid(
             trunk_target = sh_target_center - hip_target_center
             trunk_curr = sh_curr_center - hip_curr_center
             target_conf = float(np.mean(joint_weights[[hip_l_idx, hip_r_idx, sh_l_idx, sh_r_idx], :]))
+            hip_conf = float(np.mean(joint_weights[[hip_l_idx, hip_r_idx], :]))
 
             pelvis_target_lr_h = pelvis_target_lr - np.dot(pelvis_target_lr, up_stage1) * up_stage1
             pelvis_curr_lr_h = pelvis_curr_lr - np.dot(pelvis_curr_lr, up_stage1) * up_stage1
@@ -642,7 +643,12 @@ def qpid(
             pitch_err = 0.0
             bend_err = 0.0
             twist_err = 0.0
-            if trunk_target_norm > 1e-6 and trunk_curr_norm > 1e-6 and pelvis_target_h_norm > 1e-6 and pelvis_curr_h_norm > 1e-6:
+            if (
+                trunk_target_norm > 1e-6
+                and trunk_curr_norm > 1e-6
+                and pelvis_target_h_norm > 1e-6
+                and pelvis_curr_h_norm > 1e-6
+            ):
                 trunk_target_unit = trunk_target / trunk_target_norm
                 trunk_curr_unit = trunk_curr / trunk_curr_norm
                 forward_target = np.cross(up_stage1, pelvis_target_lr_h)
@@ -996,6 +1002,31 @@ def qpid(
                 ):
                     contact_prob[weak] = min(contact_prob[weak], 0.35)
                     if foot_cues[weak]["vertical_velocity"] > -0.05:
+                        contact_state[weak] = False
+        if quasi_static_support >= 0.82 and support_ratio >= 0.10:
+            left_load = foot_cues["left"]["prev_load_ratio"]
+            right_load = foot_cues["right"]["prev_load_ratio"]
+            load_gap = abs(left_load - right_load)
+            if load_gap >= 0.18:
+                dominant = "left" if left_load > right_load else "right"
+                weak = "right" if dominant == "left" else "left"
+                dominant_load = foot_cues[dominant]["prev_load_ratio"]
+                weak_load = foot_cues[weak]["prev_load_ratio"]
+                weak_height = foot_cues[weak]["height"]
+                weak_vz = foot_cues[weak]["vertical_velocity"]
+                weak_score = foot_cues[weak]["score"]
+                dominant_score = foot_cues[dominant]["score"]
+                weak_clearance = weak_height >= 0.020
+                weak_not_loading = weak_load <= 0.035
+                weak_not_descending = weak_vz >= -0.08
+                weak_is_weaker = weak_score <= dominant_score - 0.08 or weak_score <= 0.58
+                dominant_supported = dominant_load >= 0.10 and foot_cues[dominant]["height"] <= 0.10
+                if dominant_supported and weak_not_loading and weak_not_descending and weak_is_weaker and weak_clearance:
+                    contact_prob[weak] = min(contact_prob[weak], 0.18)
+                    contact_state[weak] = False
+                elif dominant_supported and weak_not_loading and weak_vz >= -0.02 and weak_height >= 0.010:
+                    contact_prob[weak] = min(contact_prob[weak], 0.28)
+                    if weak_score < 0.72:
                         contact_state[weak] = False
         for side in ["left", "right"]:
             if contact_state[side]:
