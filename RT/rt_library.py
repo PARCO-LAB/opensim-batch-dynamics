@@ -11,11 +11,24 @@ STAGE1_MAX_OSQP_ITERS = 3000
 STAGE2_EPS_ABS = 2e-4
 STAGE2_EPS_REL = 2e-4
 STAGE2_MAX_OSQP_ITERS = 5000
+STAGE1_GEOM_ROWS = 36
 CONTACT_ON_SCORE = 0.52
 CONTACT_OFF_SCORE = 0.34
 FOOT_COP_HALF_LENGTH = 0.11
 FOOT_COP_HALF_WIDTH = 0.045
 FOOT_TORSION_RADIUS = 0.07
+KIN_BETA_POS = 0.18
+KIN_BETA_ROOT_ROT = 0.10
+KIN_BETA_JOINT = 0.06
+KIN_GAMMA_POS = 0.020
+KIN_GAMMA_ROOT_ROT = 0.010
+KIN_GAMMA_JOINT = 0.006
+ORI_PELVIS_YAW_GAIN = 0.08
+ORI_PELVIS_ROLL_GAIN = 0.06
+ORI_PELVIS_TILT_GAIN = 0.04
+ORI_TRUNK_EXT_GAIN = 0.12
+ORI_TRUNK_BEND_GAIN = 0.10
+ORI_TRUNK_TWIST_GAIN = 0.08
 FOOT_BODIES = {
     "left": ("calcn_l", "toes_l"),
     "right": ("calcn_r", "toes_r"),
@@ -40,6 +53,7 @@ def initialize_rt_state(
     foot_forces=None,
     foot_wrenches=None,
     contact_state=None,
+    contact_prob=None,
     floor_height=np.nan,
 ):
     model = skeleton._nimble if hasattr(skeleton, "_nimble") else skeleton
@@ -49,6 +63,9 @@ def initialize_rt_state(
         "q": np.array(model.getPositions(), dtype=float) if q is None else np.array(q, dtype=float).copy(),
         "dq": np.array(model.getVelocities(), dtype=float) if dq is None else np.array(dq, dtype=float).copy(),
         "ddq": np.zeros(n_dof, dtype=float) if ddq is None else np.array(ddq, dtype=float).copy(),
+        "q_kin": np.array(model.getPositions(), dtype=float) if q is None else np.array(q, dtype=float).copy(),
+        "dq_kin": np.array(model.getVelocities(), dtype=float) if dq is None else np.array(dq, dtype=float).copy(),
+        "ddq_kin": np.zeros(n_dof, dtype=float) if ddq is None else np.array(ddq, dtype=float).copy(),
         "tau": np.zeros(n_act, dtype=float) if tau is None else np.array(tau, dtype=float).copy(),
         "tau_full": np.zeros(n_dof, dtype=float) if tau_full is None else np.array(tau_full, dtype=float).copy(),
         "root_residual": np.zeros(6, dtype=float) if root_residual is None else np.array(root_residual, dtype=float).copy(),
@@ -63,6 +80,10 @@ def initialize_rt_state(
         "contact_state": {
             "left": False,
             "right": False,
+        },
+        "contact_prob": {
+            "left": 0.0,
+            "right": 0.0,
         },
         "floor_height": float(floor_height),
         "step_index": 0,
@@ -79,6 +100,10 @@ def initialize_rt_state(
         for side in state["contact_state"]:
             if side in contact_state:
                 state["contact_state"][side] = bool(contact_state[side])
+    if contact_prob is not None:
+        for side in state["contact_prob"]:
+            if side in contact_prob:
+                state["contact_prob"][side] = float(np.clip(contact_prob[side], 0.0, 1.0))
     return state
 
 
@@ -157,6 +182,7 @@ def qpid(
     steps=1,
     measurement_joints=None,
     state=None,
+    use_stage1_kin_filter=True,
 ):
     model = skeleton._nimble if hasattr(skeleton, "_nimble") else skeleton
 
@@ -171,6 +197,16 @@ def qpid(
 
     n_dof_full = model.getNumDofs()
     n_act_full = n_dof_full - 6
+    dof_names_full = [model.getDofByIndex(i).getName() for i in range(n_dof_full)]
+    pelvis_orient_mask = np.array(
+        [name in ("pelvis_tilt", "pelvis_list", "pelvis_rotation") for name in dof_names_full],
+        dtype=bool,
+    )
+    trunk_mask = np.array([name.startswith("lumbar_") or name.startswith("thorax_") for name in dof_names_full], dtype=bool)
+    scapula_mask = np.array([name.startswith("scapula_") for name in dof_names_full], dtype=bool)
+    shoulder_mask = np.array([name.startswith("shoulder_") for name in dof_names_full], dtype=bool)
+    weak_obs_mask = pelvis_orient_mask | trunk_mask | scapula_mask | shoulder_mask
+    dof_index = {name: i for i, name in enumerate(dof_names_full)}
     if state is None:
         state = initialize_rt_state(
             skeleton,
@@ -196,6 +232,9 @@ def qpid(
             "q": np.array(state["q"], dtype=float).copy(),
             "dq": np.array(state["dq"], dtype=float).copy(),
             "ddq": np.array(state["ddq"], dtype=float).copy(),
+            "q_kin": np.array(state.get("q_kin", state["q"]), dtype=float).copy(),
+            "dq_kin": np.array(state.get("dq_kin", state["dq"]), dtype=float).copy(),
+            "ddq_kin": np.array(state.get("ddq_kin", state["ddq"]), dtype=float).copy(),
             "tau": np.array(state["tau"], dtype=float).copy(),
             "tau_full": np.array(state["tau_full"], dtype=float).copy(),
             "root_residual": np.array(state["root_residual"], dtype=float).copy(),
@@ -210,6 +249,10 @@ def qpid(
             "contact_state": {
                 "left": bool(state["contact_state"]["left"]),
                 "right": bool(state["contact_state"]["right"]),
+            },
+            "contact_prob": {
+                "left": float(state.get("contact_prob", {}).get("left", 1.0 if state["contact_state"]["left"] else 0.0)),
+                "right": float(state.get("contact_prob", {}).get("right", 1.0 if state["contact_state"]["right"] else 0.0)),
             },
             "floor_height": float(state["floor_height"]),
             "step_index": int(state["step_index"]),
@@ -236,6 +279,7 @@ def qpid(
         q_weights = x_t.get("q_weights")
         dq_meas = x_t.get("dq_meas", x_t.get("dq"))
         dq_weights = x_t.get("dq_weights")
+        use_stage1_kin_filter = bool(x_t.get("use_stage1_kin_filter", use_stage1_kin_filter))
     else:
         x_obs = np.array(x_t, dtype=float)
         joint_weights = np.ones((len(measurement_joints), 3), dtype=float)
@@ -251,6 +295,7 @@ def qpid(
 
     joint_weights = np.where(np.isfinite(x_obs), joint_weights, 0.0)
     joint_weights = np.clip(joint_weights, 0.0, None)
+    joint_name_to_idx = {joint.getName(): i for i, joint in enumerate(measurement_joints)}
 
     if q_meas is not None:
         q_meas = np.array(q_meas, dtype=float).reshape(-1)
@@ -277,6 +322,7 @@ def qpid(
         alpha = float(step_idx + 1) / max(int(steps), 1)
         x_step = x_start + alpha * (x_obs - x_start)
         x_step = np.where(joint_weights > 0.0, x_step, np.nan)
+        up_stage1 = np.array([0.0, 0.0, 1.0], dtype=float)
 
         q_prev = np.array(state["q"], dtype=float)
         dq_prev = np.array(state["dq"], dtype=float)
@@ -298,6 +344,14 @@ def qpid(
             step_w = np.ones(n_dof_full, dtype=float) * 0.02
             step_w[:3] = 0.006
             step_w[3:6] = 0.01
+            prior_w[pelvis_orient_mask] *= 3.0
+            prior_w[trunk_mask] *= 2.8
+            prior_w[scapula_mask] *= 3.4
+            prior_w[shoulder_mask] *= 1.8
+            step_w[pelvis_orient_mask] *= 2.5
+            step_w[trunk_mask] *= 2.8
+            step_w[scapula_mask] *= 3.2
+            step_w[shoulder_mask] *= 1.7
             if q_weights is not None:
                 prior_w += 0.15 * q_weights
 
@@ -321,6 +375,74 @@ def qpid(
                 innovation = np.linalg.norm(np.where(measurement_weights > 0.0, residual, 0.0), axis=1)
                 robust = 1.0 / (1.0 + (innovation / 0.05) ** 2)
                 measurement_weights = joint_weights * robust.reshape(-1, 1)
+                geom_rows = []
+                geom_targets = []
+                geom_weights = []
+                hip_l_idx = joint_name_to_idx.get("hip_l")
+                hip_r_idx = joint_name_to_idx.get("hip_r")
+                sh_l_idx = joint_name_to_idx.get("GlenoHumeral_l")
+                sh_r_idx = joint_name_to_idx.get("GlenoHumeral_r")
+                el_l_idx = joint_name_to_idx.get("elbow_l")
+                el_r_idx = joint_name_to_idx.get("elbow_r")
+                wr_l_idx = joint_name_to_idx.get("wrist_l")
+                wr_r_idx = joint_name_to_idx.get("wrist_r")
+                knee_l_idx = joint_name_to_idx.get("walker_knee_l")
+                knee_r_idx = joint_name_to_idx.get("walker_knee_r")
+                ank_l_idx = joint_name_to_idx.get("ankle_l")
+                ank_r_idx = joint_name_to_idx.get("ankle_r")
+                if hip_l_idx is not None and hip_r_idx is not None:
+                    if np.all(measurement_weights[[hip_l_idx, hip_r_idx], :] > 0.0):
+                        J_hip = J_full[3 * hip_r_idx : 3 * hip_r_idx + 3, :] - J_full[3 * hip_l_idx : 3 * hip_l_idx + 3, :]
+                        hip_target = x_step[hip_r_idx] - x_step[hip_l_idx]
+                        hip_current = x_current[hip_r_idx] - x_current[hip_l_idx]
+                        geom_rows.append(J_hip)
+                        geom_targets.append(hip_target - hip_current)
+                        geom_weights.append(np.ones(3, dtype=float) * 18.0 * float(np.mean(measurement_weights[[hip_l_idx, hip_r_idx], :])))
+                if sh_l_idx is not None and sh_r_idx is not None:
+                    if np.all(measurement_weights[[sh_l_idx, sh_r_idx], :] > 0.0):
+                        J_sh = J_full[3 * sh_r_idx : 3 * sh_r_idx + 3, :] - J_full[3 * sh_l_idx : 3 * sh_l_idx + 3, :]
+                        sh_target = x_step[sh_r_idx] - x_step[sh_l_idx]
+                        sh_current = x_current[sh_r_idx] - x_current[sh_l_idx]
+                        geom_rows.append(J_sh)
+                        geom_targets.append(sh_target - sh_current)
+                        geom_weights.append(np.ones(3, dtype=float) * 16.0 * float(np.mean(measurement_weights[[sh_l_idx, sh_r_idx], :])))
+                if hip_l_idx is not None and hip_r_idx is not None and sh_l_idx is not None and sh_r_idx is not None:
+                    if np.all(measurement_weights[[hip_l_idx, hip_r_idx, sh_l_idx, sh_r_idx], :] > 0.0):
+                        J_trunk = 0.5 * (J_full[3 * sh_l_idx : 3 * sh_l_idx + 3, :] + J_full[3 * sh_r_idx : 3 * sh_r_idx + 3, :])
+                        J_trunk -= 0.5 * (J_full[3 * hip_l_idx : 3 * hip_l_idx + 3, :] + J_full[3 * hip_r_idx : 3 * hip_r_idx + 3, :])
+                        trunk_target = 0.5 * (x_step[sh_l_idx] + x_step[sh_r_idx]) - 0.5 * (x_step[hip_l_idx] + x_step[hip_r_idx])
+                        trunk_current = 0.5 * (x_current[sh_l_idx] + x_current[sh_r_idx]) - 0.5 * (x_current[hip_l_idx] + x_current[hip_r_idx])
+                        geom_rows.append(J_trunk)
+                        geom_targets.append(trunk_target - trunk_current)
+                        geom_weights.append(np.array([12.0, 12.0, 18.0], dtype=float) * float(np.mean(measurement_weights[[hip_l_idx, hip_r_idx, sh_l_idx, sh_r_idx], :])))
+                if knee_l_idx is not None and knee_r_idx is not None:
+                    if np.all(measurement_weights[[knee_l_idx, knee_r_idx], :] > 0.0):
+                        J_knee = J_full[3 * knee_r_idx : 3 * knee_r_idx + 3, :] - J_full[3 * knee_l_idx : 3 * knee_l_idx + 3, :]
+                        knee_target = x_step[knee_r_idx] - x_step[knee_l_idx]
+                        knee_current = x_current[knee_r_idx] - x_current[knee_l_idx]
+                        geom_rows.append(J_knee)
+                        geom_targets.append(knee_target - knee_current)
+                        geom_weights.append(np.ones(3, dtype=float) * 10.0 * float(np.mean(measurement_weights[[knee_l_idx, knee_r_idx], :])))
+                for a_idx, b_idx, base_w in [
+                    (sh_l_idx, el_l_idx, 14.0),
+                    (sh_r_idx, el_r_idx, 14.0),
+                    (el_l_idx, wr_l_idx, 10.0),
+                    (el_r_idx, wr_r_idx, 10.0),
+                    (hip_l_idx, knee_l_idx, 13.0),
+                    (hip_r_idx, knee_r_idx, 13.0),
+                    (knee_l_idx, ank_l_idx, 10.0),
+                    (knee_r_idx, ank_r_idx, 10.0),
+                ]:
+                    if a_idx is None or b_idx is None:
+                        continue
+                    if not np.all(measurement_weights[[a_idx, b_idx], :] > 0.0):
+                        continue
+                    J_seg = J_full[3 * b_idx : 3 * b_idx + 3, :] - J_full[3 * a_idx : 3 * a_idx + 3, :]
+                    seg_target = x_step[b_idx] - x_step[a_idx]
+                    seg_current = x_current[b_idx] - x_current[a_idx]
+                    geom_rows.append(J_seg)
+                    geom_targets.append(seg_target - seg_current)
+                    geom_weights.append(np.ones(3, dtype=float) * base_w * float(np.mean(measurement_weights[[a_idx, b_idx], :])))
                 valid = measurement_weights.reshape(-1) > 0.0
                 if not np.any(valid):
                     break
@@ -328,33 +450,35 @@ def qpid(
                     dof_reliability = np.sum((measurement_weights.reshape(-1)[valid].reshape(-1, 1) * J_full[valid, :]) ** 2, axis=0)
                     break
 
-                valid_key = np.packbits(valid.astype(np.uint8)).tobytes()
                 has_q_sensor = bool(q_meas is not None and q_weights is not None)
-                cache_key = (n_dof_full, valid_key, has_q_sensor)
+                cache_key = (n_dof_full, len(measurement_joints), has_q_sensor)
                 if cache_key not in QPIK_CACHE:
                     dq_var = cp.Variable(n_dof_full)
                     q_param = cp.Parameter(n_dof_full)
-                    qik_A_meas_param = cp.Parameter((int(np.sum(valid)), n_dof_full))
-                    qik_b_meas_param = cp.Parameter(int(np.sum(valid)))
+                    meas_rows = 3 * len(measurement_joints)
+                    qik_A_meas_param = cp.Parameter((meas_rows, n_dof_full))
+                    qik_b_meas_param = cp.Parameter(meas_rows)
+                    qik_A_geom_param = cp.Parameter((STAGE1_GEOM_ROWS, n_dof_full))
+                    qik_b_geom_param = cp.Parameter(STAGE1_GEOM_ROWS)
                     dq_accum_param = cp.Parameter(n_dof_full)
                     dq_l_param = cp.Parameter(n_dof_full)
                     dq_u_param = cp.Parameter(n_dof_full)
                     q_l_param = cp.Parameter(n_dof_full)
                     q_u_param = cp.Parameter(n_dof_full)
+                    qik_A_prior_param = cp.Parameter((n_dof_full, n_dof_full))
                     qik_b_prior_param = cp.Parameter(n_dof_full)
                     objective = cp.sum_squares(qik_A_meas_param @ dq_var - qik_b_meas_param)
-                    objective += cp.sum_squares(np.diag(step_w) @ dq_var)
+                    objective += cp.sum_squares(qik_A_geom_param @ dq_var - qik_b_geom_param)
+                    objective += cp.sum_squares(cp.multiply(step_w, dq_var))
                     if has_q_sensor:
-                        qik_A_prior_param = cp.Parameter((n_dof_full, n_dof_full))
                         qik_A_sensor_param = cp.Parameter((n_dof_full, n_dof_full))
                         qik_b_sensor_param = cp.Parameter(n_dof_full)
                         objective += cp.sum_squares(qik_A_prior_param @ dq_var - qik_b_prior_param)
                         objective += cp.sum_squares(qik_A_sensor_param @ dq_var - qik_b_sensor_param)
                     else:
-                        qik_A_prior_param = None
                         qik_A_sensor_param = None
                         qik_b_sensor_param = None
-                        objective += cp.sum_squares(np.diag(prior_w) @ dq_var - qik_b_prior_param)
+                        objective += cp.sum_squares(qik_A_prior_param @ dq_var - qik_b_prior_param)
                     constraints = [
                         q_param + dq_var >= q_l_param,
                         q_param + dq_var <= q_u_param,
@@ -367,6 +491,8 @@ def qpid(
                         "q": q_param,
                         "A_meas": qik_A_meas_param,
                         "b_meas": qik_b_meas_param,
+                        "A_geom": qik_A_geom_param,
+                        "b_geom": qik_b_geom_param,
                         "dq_accum": dq_accum_param,
                         "dq_l": dq_l_param,
                         "dq_u": dq_u_param,
@@ -380,19 +506,35 @@ def qpid(
 
                 problem = QPIK_CACHE[cache_key]
                 problem["q"].value = q_hat
-                meas_w = 30.0 * np.maximum(measurement_weights.reshape(-1)[valid], 1e-6)
-                problem["A_meas"].value = np.diag(meas_w) @ (J_full[valid, :] + PARAM_DENSE_EPS)
-                problem["b_meas"].value = meas_w * (x_step.reshape(-1)[valid] - x_current.reshape(-1)[valid])
+                meas_w = 30.0 * np.maximum(measurement_weights.reshape(-1), 0.0)
+                meas_residual_full = x_step.reshape(-1) - x_current.reshape(-1)
+                meas_residual_full = np.where(np.isfinite(meas_residual_full), meas_residual_full, 0.0)
+                problem["A_meas"].value = np.diag(meas_w) @ (J_full + PARAM_DENSE_EPS)
+                problem["b_meas"].value = meas_w * meas_residual_full
+                geom_A_full = np.zeros((STAGE1_GEOM_ROWS, n_dof_full), dtype=float)
+                geom_b_full = np.zeros(STAGE1_GEOM_ROWS, dtype=float)
+                geom_offset = 0
+                for row_block, target_block, weight_block in zip(geom_rows, geom_targets, geom_weights):
+                    rows_here = row_block.shape[0]
+                    end = min(geom_offset + rows_here, STAGE1_GEOM_ROWS)
+                    take = end - geom_offset
+                    if take <= 0:
+                        break
+                    geom_A_full[geom_offset:end, :] = weight_block[:take].reshape(-1, 1) * row_block[:take, :]
+                    geom_b_full[geom_offset:end] = weight_block[:take] * target_block[:take]
+                    geom_offset = end
+                problem["A_geom"].value = geom_A_full + PARAM_DENSE_EPS
+                problem["b_geom"].value = geom_b_full
                 problem["dq_accum"].value = dq_cumulative
                 problem["dq_l"].value = -dq_step_cap
                 problem["dq_u"].value = dq_step_cap
                 problem["q_l"].value = q_lower
                 problem["q_u"].value = q_upper
+                problem["A_prior"].value = np.diag(prior_w)
                 problem["b_prior"].value = prior_w * (q_pred - q_hat)
                 if problem["A_sensor"] is not None:
                     q_sensor = np.where(np.isfinite(q_meas), q_meas, q_pred)
                     q_sensor_w = 1.5 * np.where(np.isfinite(q_meas), q_weights, 0.0)
-                    problem["A_prior"].value = np.diag(prior_w)
                     problem["A_sensor"].value = np.diag(q_sensor_w)
                     problem["b_sensor"].value = q_sensor_w * (q_sensor - q_hat)
 
@@ -437,16 +579,209 @@ def qpid(
         else:
             dof_reliability[:] = 0.0
 
+        hip_l_idx = joint_name_to_idx.get("hip_l")
+        hip_r_idx = joint_name_to_idx.get("hip_r")
+        sh_l_idx = joint_name_to_idx.get("GlenoHumeral_l")
+        sh_r_idx = joint_name_to_idx.get("GlenoHumeral_r")
+        if (
+            hip_l_idx is not None
+            and hip_r_idx is not None
+            and sh_l_idx is not None
+            and sh_r_idx is not None
+            and np.all(joint_weights[[hip_l_idx, hip_r_idx, sh_l_idx, sh_r_idx], :] > 0.0)
+        ):
+            model.setPositions(q_hat)
+            model.setVelocities(dq_pred)
+            x_geom_current = np.array(model.getJointWorldPositions(measurement_joints), dtype=float).reshape(-1, 3)
+            hip_target_l = x_step[hip_l_idx]
+            hip_target_r = x_step[hip_r_idx]
+            sh_target_l = x_step[sh_l_idx]
+            sh_target_r = x_step[sh_r_idx]
+            hip_curr_l = x_geom_current[hip_l_idx]
+            hip_curr_r = x_geom_current[hip_r_idx]
+            sh_curr_l = x_geom_current[sh_l_idx]
+            sh_curr_r = x_geom_current[sh_r_idx]
+            hip_target_center = 0.5 * (hip_target_l + hip_target_r)
+            hip_curr_center = 0.5 * (hip_curr_l + hip_curr_r)
+            sh_target_center = 0.5 * (sh_target_l + sh_target_r)
+            sh_curr_center = 0.5 * (sh_curr_l + sh_curr_r)
+            pelvis_target_lr = hip_target_r - hip_target_l
+            pelvis_curr_lr = hip_curr_r - hip_curr_l
+            shoulder_target_lr = sh_target_r - sh_target_l
+            shoulder_curr_lr = sh_curr_r - sh_curr_l
+            trunk_target = sh_target_center - hip_target_center
+            trunk_curr = sh_curr_center - hip_curr_center
+            target_conf = float(np.mean(joint_weights[[hip_l_idx, hip_r_idx, sh_l_idx, sh_r_idx], :]))
+
+            pelvis_target_lr_h = pelvis_target_lr - np.dot(pelvis_target_lr, up_stage1) * up_stage1
+            pelvis_curr_lr_h = pelvis_curr_lr - np.dot(pelvis_curr_lr, up_stage1) * up_stage1
+            shoulder_target_lr_h = shoulder_target_lr - np.dot(shoulder_target_lr, up_stage1) * up_stage1
+            shoulder_curr_lr_h = shoulder_curr_lr - np.dot(shoulder_curr_lr, up_stage1) * up_stage1
+            pelvis_target_h_norm = float(np.linalg.norm(pelvis_target_lr_h))
+            pelvis_curr_h_norm = float(np.linalg.norm(pelvis_curr_lr_h))
+            shoulder_target_h_norm = float(np.linalg.norm(shoulder_target_lr_h))
+            shoulder_curr_h_norm = float(np.linalg.norm(shoulder_curr_lr_h))
+            trunk_target_norm = float(np.linalg.norm(trunk_target))
+            trunk_curr_norm = float(np.linalg.norm(trunk_curr))
+
+            yaw_err = 0.0
+            if pelvis_target_h_norm > 1e-6 and pelvis_curr_h_norm > 1e-6:
+                pelvis_target_lr_h /= pelvis_target_h_norm
+                pelvis_curr_lr_h /= pelvis_curr_h_norm
+                yaw_err = float(
+                        np.arctan2(
+                        np.dot(np.cross(pelvis_curr_lr_h, pelvis_target_lr_h), up_stage1),
+                        np.clip(np.dot(pelvis_curr_lr_h, pelvis_target_lr_h), -1.0, 1.0),
+                    )
+                )
+
+            roll_target = float(np.arctan2(np.dot(pelvis_target_lr, up_stage1), max(pelvis_target_h_norm, 1e-6)))
+            roll_curr = float(np.arctan2(np.dot(pelvis_curr_lr, up_stage1), max(pelvis_curr_h_norm, 1e-6)))
+            roll_err = roll_target - roll_curr
+
+            pitch_err = 0.0
+            bend_err = 0.0
+            twist_err = 0.0
+            if trunk_target_norm > 1e-6 and trunk_curr_norm > 1e-6 and pelvis_target_h_norm > 1e-6 and pelvis_curr_h_norm > 1e-6:
+                trunk_target_unit = trunk_target / trunk_target_norm
+                trunk_curr_unit = trunk_curr / trunk_curr_norm
+                forward_target = np.cross(up_stage1, pelvis_target_lr_h)
+                forward_curr = np.cross(up_stage1, pelvis_curr_lr_h)
+                forward_target /= max(np.linalg.norm(forward_target), 1e-6)
+                forward_curr /= max(np.linalg.norm(forward_curr), 1e-6)
+                pitch_target = float(np.arctan2(np.dot(trunk_target_unit, forward_target), np.dot(trunk_target_unit, up_stage1)))
+                pitch_curr = float(np.arctan2(np.dot(trunk_curr_unit, forward_curr), np.dot(trunk_curr_unit, up_stage1)))
+                pitch_err = pitch_target - pitch_curr
+                bend_target = float(np.arctan2(np.dot(trunk_target_unit, pelvis_target_lr_h), np.dot(trunk_target_unit, up_stage1)))
+                bend_curr = float(np.arctan2(np.dot(trunk_curr_unit, pelvis_curr_lr_h), np.dot(trunk_curr_unit, up_stage1)))
+                bend_err = bend_target - bend_curr
+                if shoulder_target_h_norm > 1e-6 and shoulder_curr_h_norm > 1e-6:
+                    shoulder_target_lr_h /= shoulder_target_h_norm
+                    shoulder_curr_lr_h /= shoulder_curr_h_norm
+                    target_twist = float(
+                        np.arctan2(
+                            np.dot(np.cross(pelvis_target_lr_h, shoulder_target_lr_h), up_stage1),
+                            np.clip(np.dot(pelvis_target_lr_h, shoulder_target_lr_h), -1.0, 1.0),
+                        )
+                    )
+                    curr_twist = float(
+                        np.arctan2(
+                            np.dot(np.cross(pelvis_curr_lr_h, shoulder_curr_lr_h), up_stage1),
+                            np.clip(np.dot(pelvis_curr_lr_h, shoulder_curr_lr_h), -1.0, 1.0),
+                        )
+                    )
+                    twist_err = target_twist - curr_twist
+
+            weak_geom_scale = float(np.clip(target_conf, 0.0, 1.0))
+            pelvis_rel = float(np.mean(dof_reliability[[dof_index[name] for name in ("pelvis_tilt", "pelvis_list", "pelvis_rotation") if name in dof_index]]) if any(name in dof_index for name in ("pelvis_tilt", "pelvis_list", "pelvis_rotation")) else 0.0)
+            trunk_names = [name for name in ("lumbar_extension", "lumbar_bending", "lumbar_twist", "thorax_extension", "thorax_bending", "thorax_twist") if name in dof_index]
+            trunk_rel = float(np.mean(dof_reliability[[dof_index[name] for name in trunk_names]]) if len(trunk_names) > 0 else 0.0)
+            pelvis_gain = weak_geom_scale * np.clip(1.0 - pelvis_rel, 0.0, 1.0)
+            trunk_gain = weak_geom_scale * np.clip(1.0 - trunk_rel, 0.0, 1.0)
+
+            if "pelvis_rotation" in dof_index:
+                q_hat[dof_index["pelvis_rotation"]] += ORI_PELVIS_YAW_GAIN * pelvis_gain * np.clip(yaw_err, -0.50, 0.50)
+            if "pelvis_list" in dof_index:
+                q_hat[dof_index["pelvis_list"]] += ORI_PELVIS_ROLL_GAIN * pelvis_gain * np.clip(roll_err, -0.35, 0.35)
+            if "pelvis_tilt" in dof_index:
+                q_hat[dof_index["pelvis_tilt"]] += ORI_PELVIS_TILT_GAIN * pelvis_gain * np.clip(pitch_err, -0.35, 0.35)
+            if "lumbar_extension" in dof_index:
+                q_hat[dof_index["lumbar_extension"]] += 0.65 * ORI_TRUNK_EXT_GAIN * trunk_gain * np.clip(pitch_err, -0.45, 0.45)
+            if "thorax_extension" in dof_index:
+                q_hat[dof_index["thorax_extension"]] += 0.35 * ORI_TRUNK_EXT_GAIN * trunk_gain * np.clip(pitch_err, -0.45, 0.45)
+            if "lumbar_bending" in dof_index:
+                q_hat[dof_index["lumbar_bending"]] += 0.60 * ORI_TRUNK_BEND_GAIN * trunk_gain * np.clip(bend_err, -0.35, 0.35)
+            if "thorax_bending" in dof_index:
+                q_hat[dof_index["thorax_bending"]] += 0.40 * ORI_TRUNK_BEND_GAIN * trunk_gain * np.clip(bend_err, -0.35, 0.35)
+            if "lumbar_twist" in dof_index:
+                q_hat[dof_index["lumbar_twist"]] += 0.55 * ORI_TRUNK_TWIST_GAIN * trunk_gain * np.clip(twist_err, -0.45, 0.45)
+            if "thorax_twist" in dof_index:
+                q_hat[dof_index["thorax_twist"]] += 0.45 * ORI_TRUNK_TWIST_GAIN * trunk_gain * np.clip(twist_err, -0.45, 0.45)
+            q_hat = np.clip(q_hat, q_lower, q_upper)
         dq_hat = dof_reliability * ((q_hat - q_prev) / max(dt_sim, 1e-3)) + (1.0 - dof_reliability) * dq_pred
         if dq_meas is not None and dq_weights is not None:
             dq_sensor = np.where(np.isfinite(dq_meas), dq_meas, dq_hat)
             blend = np.clip(dq_weights / np.maximum(dq_weights + 1.0, EPS), 0.0, 1.0)
             dq_hat = blend * dq_sensor + (1.0 - blend) * dq_hat
+        q_kin_prev = np.array(state.get("q_kin", q_prev), dtype=float)
+        dq_kin_prev = np.array(state.get("dq_kin", dq_prev), dtype=float)
+        ddq_kin_prev = np.array(state.get("ddq_kin", ddq_prev_full), dtype=float)
+        weak_low_rel = np.clip((0.60 - dof_reliability) / 0.60, 0.0, 1.0)
+        if np.any(pelvis_orient_mask):
+            gain = 0.35 * weak_low_rel[pelvis_orient_mask]
+            q_hat[pelvis_orient_mask] = (1.0 - gain) * q_hat[pelvis_orient_mask] + gain * q_pred[pelvis_orient_mask]
+            dq_hat[pelvis_orient_mask] = (1.0 - gain) * dq_hat[pelvis_orient_mask] + gain * dq_pred[pelvis_orient_mask]
+        if np.any(trunk_mask):
+            gain = 0.45 * weak_low_rel[trunk_mask]
+            q_hat[trunk_mask] = (1.0 - gain) * q_hat[trunk_mask] + gain * q_kin_prev[trunk_mask]
+            dq_hat[trunk_mask] = (1.0 - gain) * dq_hat[trunk_mask] + gain * dq_kin_prev[trunk_mask]
+        if np.any(scapula_mask):
+            gain = 0.60 * weak_low_rel[scapula_mask]
+            q_hat[scapula_mask] = (1.0 - gain) * q_hat[scapula_mask] + gain * q_kin_prev[scapula_mask]
+            dq_hat[scapula_mask] = (1.0 - gain) * dq_hat[scapula_mask] + gain * dq_kin_prev[scapula_mask]
+        if np.any(shoulder_mask):
+            gain = 0.35 * weak_low_rel[shoulder_mask]
+            q_hat[shoulder_mask] = (1.0 - gain) * q_hat[shoulder_mask] + gain * q_kin_prev[shoulder_mask]
+            dq_hat[shoulder_mask] = (1.0 - gain) * dq_hat[shoulder_mask] + gain * dq_kin_prev[shoulder_mask]
+        q_hat = np.clip(q_hat, q_lower, q_upper)
         ddq_hat = (dq_hat - dq_prev) / max(dt_sim, 1e-3)
 
-        model.setPositions(q_hat)
-        model.setVelocities(dq_hat)
-        model.setAccelerations(ddq_hat)
+        if use_stage1_kin_filter:
+            q_kin_pred = q_kin_prev + dt_sim * dq_kin_prev + 0.5 * dt_sim * dt_sim * ddq_kin_prev
+            dq_kin_pred = dq_kin_prev + dt_sim * ddq_kin_prev
+            q_residual = q_hat - q_kin_pred
+            kin_rel = np.clip(dof_reliability, 0.0, 1.0)
+            beta_vec = KIN_BETA_JOINT + 0.08 * kin_rel
+            gamma_vec = KIN_GAMMA_JOINT + 0.012 * kin_rel
+            beta_vec[:3] = KIN_BETA_POS + 0.05 * kin_rel[:3]
+            gamma_vec[:3] = KIN_GAMMA_POS + 0.010 * kin_rel[:3]
+            beta_vec[3:6] = KIN_BETA_ROOT_ROT + 0.05 * kin_rel[3:6]
+            gamma_vec[3:6] = KIN_GAMMA_ROOT_ROT + 0.008 * kin_rel[3:6]
+            beta_vec[pelvis_orient_mask] *= 0.65
+            gamma_vec[pelvis_orient_mask] *= 0.55
+            beta_vec[trunk_mask] *= 0.42
+            gamma_vec[trunk_mask] *= 0.34
+            beta_vec[scapula_mask] *= 0.35
+            gamma_vec[scapula_mask] *= 0.28
+            beta_vec[shoulder_mask] *= 0.70
+            gamma_vec[shoulder_mask] *= 0.60
+            beta_vec = np.clip(beta_vec, 0.0, 0.45)
+            gamma_vec = np.clip(gamma_vec, 0.0, 0.08)
+            q_kin = q_hat.copy()
+            dq_kin = dq_kin_pred + (beta_vec / max(dt_sim, 1e-3)) * q_residual
+            ddq_kin = ddq_kin_prev + (2.0 * gamma_vec / max(dt_sim * dt_sim, 1e-6)) * q_residual
+            dq_kin = 0.65 * dq_kin + 0.35 * dq_hat
+            ddq_kin = 0.70 * ddq_kin + 0.30 * ddq_hat
+            if np.any(pelvis_orient_mask):
+                gain = 0.28 * weak_low_rel[pelvis_orient_mask]
+                dq_kin[pelvis_orient_mask] = (1.0 - gain) * dq_kin[pelvis_orient_mask] + gain * dq_kin_prev[pelvis_orient_mask]
+                ddq_kin[pelvis_orient_mask] = (1.0 - gain) * ddq_kin[pelvis_orient_mask] + gain * ddq_kin_prev[pelvis_orient_mask]
+            if np.any(trunk_mask):
+                gain = 0.45 * weak_low_rel[trunk_mask]
+                dq_kin[trunk_mask] = (1.0 - gain) * dq_kin[trunk_mask] + gain * dq_kin_prev[trunk_mask]
+                ddq_kin[trunk_mask] = (1.0 - gain) * ddq_kin[trunk_mask] + gain * ddq_kin_prev[trunk_mask]
+            if np.any(scapula_mask):
+                gain = 0.50 * weak_low_rel[scapula_mask]
+                dq_kin[scapula_mask] = (1.0 - gain) * dq_kin[scapula_mask] + gain * dq_kin_prev[scapula_mask]
+                ddq_kin[scapula_mask] = (1.0 - gain) * ddq_kin[scapula_mask] + gain * ddq_kin_prev[scapula_mask]
+            if np.any(shoulder_mask):
+                gain = 0.25 * weak_low_rel[shoulder_mask]
+                dq_kin[shoulder_mask] = (1.0 - gain) * dq_kin[shoulder_mask] + gain * dq_kin_prev[shoulder_mask]
+                ddq_kin[shoulder_mask] = (1.0 - gain) * ddq_kin[shoulder_mask] + gain * ddq_kin_prev[shoulder_mask]
+            dq_kin = np.clip(dq_kin, -dq_cap, dq_cap)
+            ddq_filter_cap = np.ones(n_dof_full, dtype=float) * 80.0
+            ddq_filter_cap[:3] = 35.0
+            ddq_filter_cap[3:6] = 30.0
+            ddq_kin = np.clip(ddq_kin, -ddq_filter_cap, ddq_filter_cap)
+            ddq_stage1 = 0.70 * ddq_kin + 0.30 * ddq_hat
+        else:
+            q_kin = q_hat.copy()
+            dq_kin = dq_hat.copy()
+            ddq_kin = ddq_hat.copy()
+            ddq_stage1 = ddq_hat
+        model.setPositions(q_kin)
+        model.setVelocities(dq_kin)
+        model.setAccelerations(ddq_stage1)
 
         gravity = np.array(model.getGravity(), dtype=float).reshape(3)
         mass_kg = float(model.getMass())
@@ -487,6 +822,9 @@ def qpid(
             support_force_local[:] = 0.0
         support_force_target = ground_basis.T @ support_force_local
         support_ratio = float(support_force_local[2] / max(body_weight, EPS))
+        com_velocity_plane = com_velocity - float(np.dot(com_velocity, up)) * up
+        com_speed_plane = float(np.linalg.norm(com_velocity_plane))
+        quasi_static_support = float(np.clip(1.0 - com_speed_plane / 0.40, 0.0, 1.0))
 
         joint_confidence = np.mean(measurement_weights, axis=1)
         joint_conf_lookup = {}
@@ -509,10 +847,10 @@ def qpid(
 
             heel_jacobian = np.array(model.getLinearJacobian(heel_body, heel_offset), dtype=float)
             toe_jacobian = np.array(model.getLinearJacobian(toe_body, toe_offset), dtype=float)
-            heel_velocity = heel_jacobian @ dq_hat
-            toe_velocity = toe_jacobian @ dq_hat
-            heel_bias = np.array(model.getLinearJacobianDeriv(heel_body, heel_offset), dtype=float) @ dq_hat
-            toe_bias = np.array(model.getLinearJacobianDeriv(toe_body, toe_offset), dtype=float) @ dq_hat
+            heel_velocity = heel_jacobian @ dq_kin
+            toe_velocity = toe_jacobian @ dq_kin
+            heel_bias = np.array(model.getLinearJacobianDeriv(heel_body, heel_offset), dtype=float) @ dq_kin
+            toe_bias = np.array(model.getLinearJacobianDeriv(toe_body, toe_offset), dtype=float) @ dq_kin
 
             raw_heights.append(float(np.dot(heel_position, up)))
             raw_heights.append(float(np.dot(toe_position, up)))
@@ -560,8 +898,8 @@ def qpid(
             cue["anchor_jacobian"] = 0.5 * (cue["heel_jacobian"] + cue["toe_jacobian"])
             cue["anchor_bias"] = 0.5 * (cue["heel_bias"] + cue["toe_bias"])
             cue["anchor_angular_jacobian"] = np.array(model.getAngularJacobian(cue["heel_body"]), dtype=float)
-            cue["anchor_angular_bias"] = np.array(model.getAngularJacobianDeriv(cue["heel_body"]), dtype=float) @ dq_hat
-            cue["anchor_angular_velocity"] = cue["anchor_angular_jacobian"] @ dq_hat
+            cue["anchor_angular_bias"] = np.array(model.getAngularJacobianDeriv(cue["heel_body"]), dtype=float) @ dq_kin
+            cue["anchor_angular_velocity"] = cue["anchor_angular_jacobian"] @ dq_kin
             foot_forward = cue["toe_position"] - cue["heel_position"]
             foot_forward -= float(np.dot(foot_forward, up)) * up
             foot_forward_norm = float(np.linalg.norm(foot_forward))
@@ -582,6 +920,8 @@ def qpid(
             cue["torsion_limit"] = float(0.5 * (cue["cop_half_length"] + cue["cop_half_width"]))
             ankle_name = "ankle_l" if side == "left" else "ankle_r"
             cue["joint_confidence"] = joint_conf_lookup.get(ankle_name, float(np.mean(joint_confidence)) if joint_confidence.size > 0 else 0.0)
+            prev_vertical_load = float(np.dot(state["foot_forces"][side], up)) / max(body_weight, EPS)
+            cue["prev_load_ratio"] = float(np.clip(prev_vertical_load, 0.0, 1.5))
             height_score = np.clip(1.0 - max(height, 0.0) / 0.16, 0.0, 1.0)
             velocity_score = np.clip(1.0 - abs(vertical_velocity) / 1.4, 0.0, 1.0)
             support_bonus = np.clip(support_ratio / 0.45, 0.0, 1.0)
@@ -597,6 +937,17 @@ def qpid(
                 )
             )
             cue["score"] = cue["confidence"]
+            prev_prob = float(state.get("contact_prob", {}).get(side, 1.0 if state["contact_state"][side] else 0.0))
+            prob = (
+                0.50 * cue["score"]
+                + 0.20 * height_score
+                + 0.10 * velocity_score
+                + 0.12 * prev_prob
+                + 0.08 * support_bonus
+            )
+            if state["contact_state"][side]:
+                prob += 0.05
+            cue["contact_prob"] = float(np.clip(prob, 0.0, 1.0))
             if state["contact_state"][side]:
                 cue["contact"] = bool(cue["score"] >= CONTACT_OFF_SCORE and height <= 0.18)
             else:
@@ -605,6 +956,10 @@ def qpid(
         contact_state = {
             "left": bool(foot_cues["left"]["contact"]),
             "right": bool(foot_cues["right"]["contact"]),
+        }
+        contact_prob = {
+            "left": float(foot_cues["left"]["contact_prob"]),
+            "right": float(foot_cues["right"]["contact_prob"]),
         }
         if support_ratio >= 0.08 and not (contact_state["left"] or contact_state["right"]):
             best_side = min(
@@ -615,17 +970,41 @@ def qpid(
                 ),
             )
             contact_state[best_side] = True
+            contact_prob[best_side] = max(contact_prob[best_side], 0.30)
         if support_ratio >= 0.25:
             for side in ["left", "right"]:
                 if foot_cues[side]["score"] >= 0.40 and foot_cues[side]["height"] <= 0.18:
                     contact_state[side] = True
+                    contact_prob[side] = max(contact_prob[side], 0.40)
         if support_ratio <= 0.02:
             for side in ["left", "right"]:
                 if foot_cues[side]["score"] < 0.75:
                     contact_state[side] = False
+                    contact_prob[side] = min(contact_prob[side], 0.10)
+        if quasi_static_support >= 0.70:
+            left_load = foot_cues["left"]["prev_load_ratio"]
+            right_load = foot_cues["right"]["prev_load_ratio"]
+            load_gap = abs(left_load - right_load)
+            if load_gap >= 0.12:
+                dominant = "left" if left_load > right_load else "right"
+                weak = "right" if dominant == "left" else "left"
+                if (
+                    foot_cues[dominant]["height"] <= 0.12
+                    and foot_cues[weak]["height"] >= foot_cues[dominant]["height"] + 0.01
+                    and foot_cues[weak]["score"] < 0.75
+                    and foot_cues[weak]["prev_load_ratio"] < 0.08
+                ):
+                    contact_prob[weak] = min(contact_prob[weak], 0.35)
+                    if foot_cues[weak]["vertical_velocity"] > -0.05:
+                        contact_state[weak] = False
+        for side in ["left", "right"]:
+            if contact_state[side]:
+                contact_prob[side] = max(contact_prob[side], 0.55)
+            else:
+                contact_prob[side] = min(contact_prob[side], 0.45)
 
         support_wrench_split = np.zeros(12, dtype=float)
-        active_support_sides = [side for side in ["left", "right"] if contact_state[side]]
+        active_support_sides = [side for side in ["left", "right"] if contact_prob[side] > 0.05]
         if support_force_local[2] > 0.0 and len(active_support_sides) > 0:
             com_plane = com_position - (float(np.dot(com_position, up)) - float(floor_height)) * up
             weights = []
@@ -635,7 +1014,7 @@ def qpid(
                 planar_delta = anchor_plane - com_plane
                 planar_delta -= float(np.dot(planar_delta, up)) * up
                 distance = float(np.linalg.norm(planar_delta))
-                weight = (0.20 + cue["score"] + 0.15 * float(state["contact_state"][side])) / max(distance + 0.05, 1e-3)
+                weight = contact_prob[side] * (0.20 + cue["score"] + 0.15 * float(state["contact_state"][side])) / max(distance + 0.05, 1e-3)
                 weights.append(weight)
             weights = np.array(weights, dtype=float)
             weights /= max(float(np.sum(weights)), EPS)
@@ -651,8 +1030,8 @@ def qpid(
                 wrench_slice = slice(0, 6) if side == "left" else slice(6, 12)
                 support_wrench_split[wrench_slice] = np.concatenate([side_force_world, side_moment_world])
 
-        model.setPositions(q_hat)
-        model.setVelocities(dq_hat)
+        model.setPositions(q_kin)
+        model.setVelocities(dq_kin)
 
         M_full = np.array(model.getMassMatrix(), dtype=float)
         h_full = np.array(model.getCoriolisAndGravityForces(), dtype=float).reshape(-1)
@@ -661,14 +1040,21 @@ def qpid(
 
         n_dof = len(active_dofs)
         n_act = len(active_act_dofs)
-        q_target = q_hat[active_dofs]
-        dq_target = np.clip(dq_hat[active_dofs], -dq_cap[active_dofs], dq_cap[active_dofs])
-        ddq_target = 0.60 * ddq_hat[active_dofs] + 0.40 * state["ddq"][active_dofs]
+        q_target = q_kin[active_dofs]
+        dq_target = np.clip(dq_kin[active_dofs], -dq_cap[active_dofs], dq_cap[active_dofs])
+        if use_stage1_kin_filter:
+            ddq_target = (
+                0.45 * ddq_kin[active_dofs]
+                + 0.25 * ddq_hat[active_dofs]
+                + 0.30 * np.array(state.get("ddq_kin", state["ddq"]), dtype=float)[active_dofs]
+            )
+        else:
+            ddq_target = 0.60 * ddq_hat[active_dofs] + 0.40 * state["ddq"][active_dofs]
         rel = dof_reliability[active_dofs]
 
-        w_q = 35.0 * (0.2 + rel)
-        w_dq = 4.0 * (0.2 + rel)
-        w_ddq = 1.00 * (0.15 + rel)
+        w_q = 40.0 * (0.6 + 0.8 * rel)
+        w_dq = 8.0 * (0.4 + 0.6 * rel)
+        w_ddq = 1.8 * (0.35 + 0.65 * rel)
         if n_dof >= 6:
             w_q[:6] *= 4.0
             w_dq[:6] *= 2.0
@@ -680,15 +1066,38 @@ def qpid(
             J_angular = foot_cues[side]["anchor_angular_jacobian"][:, active_dofs]
             J_wrench[:, 6 * foot_idx : 6 * foot_idx + 3] = J_linear.T
             J_wrench[:, 6 * foot_idx + 3 : 6 * foot_idx + 6] = J_angular.T
-
-        S_T = np.zeros((n_dof, n_act), dtype=float)
-        for i, dof in enumerate(active_act_dofs):
-            S_T[np.where(active_dofs == dof)[0][0], i] = 1.0
-
-        S_root = np.zeros((n_dof, 6), dtype=float)
-        for i, dof in enumerate(active_dofs):
-            if dof < 6:
-                S_root[i, dof] = 1.0
+        active_root_rows = np.where(active_dofs < 6)[0]
+        active_act_rows = np.where(active_dofs >= 6)[0]
+        n_root = len(active_root_rows)
+        root_select = np.zeros((n_root, 6), dtype=float)
+        for row_idx, active_row in enumerate(active_root_rows):
+            root_select[row_idx, active_dofs[active_row]] = 1.0
+        M_root = M[active_root_rows, :] if n_root > 0 else np.zeros((0, n_dof), dtype=float)
+        h_root = h[active_root_rows] if n_root > 0 else np.zeros(0, dtype=float)
+        J_root = J_wrench[active_root_rows, :] if n_root > 0 else np.zeros((0, 12), dtype=float)
+        M_act = M[active_act_rows, :] if n_act > 0 else np.zeros((0, n_dof), dtype=float)
+        h_act = h[active_act_rows] if n_act > 0 else np.zeros(0, dtype=float)
+        J_act = J_wrench[active_act_rows, :] if n_act > 0 else np.zeros((0, 12), dtype=float)
+        active_dof_names = [model.getDofByIndex(int(dof)).getName() for dof in active_dofs]
+        active_act_dof_names = [model.getDofByIndex(int(dof)).getName() for dof in active_act_dofs]
+        tau_abs_limits = np.ones(n_act, dtype=float) * 2500.0
+        tau_rate_limits = np.ones(n_act, dtype=float) * 1200.0
+        for i, name in enumerate(active_act_dof_names):
+            if "hip_" in name or "knee_" in name:
+                tau_abs_limits[i] = 5000.0
+                tau_rate_limits[i] = 2200.0
+            elif "lumbar_" in name or "thorax_" in name:
+                tau_abs_limits[i] = 2500.0
+                tau_rate_limits[i] = 1200.0
+            elif "shoulder_" in name or "scapula_" in name:
+                tau_abs_limits[i] = 1600.0
+                tau_rate_limits[i] = 800.0
+            elif "elbow_" in name:
+                tau_abs_limits[i] = 900.0
+                tau_rate_limits[i] = 500.0
+            elif "ankle_" in name or "subtalar_" in name or "mtp_" in name:
+                tau_abs_limits[i] = 1400.0
+                tau_rate_limits[i] = 700.0
 
         q_margin = 1e-3
         ddq_pos_upper = 2.0 * (q_upper[active_dofs] - q_margin - q_prev[active_dofs] - dt_sim * dq_prev[active_dofs]) / max(dt_sim * dt_sim, EPS)
@@ -716,21 +1125,21 @@ def qpid(
             J_meas_full = np.array(model.getJointWorldPositionsJacobianWrtJointPositions(measurement_joints), dtype=float)[:, active_dofs]
             J_meas = J_meas_full[valid, :]
             meas_b = x_step.reshape(-1)[valid] - x_hat[valid] - J_meas @ (
-                q_prev[active_dofs] + dt_sim * dq_prev[active_dofs] - q_hat[active_dofs]
+                q_prev[active_dofs] + dt_sim * dq_prev[active_dofs] - q_kin[active_dofs]
             )
             meas_w = 40.0 * np.maximum(measurement_weights.reshape(-1)[valid], 1e-6)
 
-        valid_key = np.packbits(valid.astype(np.uint8)).tobytes()
-        basis_key = np.round(ground_basis.reshape(-1), 8).tobytes()
-        dyn_key = (n_dof, n_act, valid_key, contact_state["left"], contact_state["right"], round(float(mu), 6), basis_key)
+        dyn_key = (n_dof, n_act, n_root, len(measurement_joints), round(float(mu), 6))
         if dyn_key not in DYN_QP_CACHE:
             ddq_var = cp.Variable(n_dof)
-            tau_var = cp.Variable(n_act)
             wrench_var = cp.Variable(12)
             root_var = cp.Variable(6)
-            M_param = cp.Parameter((n_dof, n_dof))
-            h_param = cp.Parameter(n_dof)
-            J_wrench_param = cp.Parameter((n_dof, 12))
+            M_root_param = cp.Parameter((n_root, n_dof))
+            h_root_param = cp.Parameter(n_root)
+            J_root_param = cp.Parameter((n_root, 12))
+            M_act_param = cp.Parameter((n_act, n_dof))
+            h_act_param = cp.Parameter(n_act)
+            J_act_param = cp.Parameter((n_act, 12))
             ddq_lower_param = cp.Parameter(n_dof)
             ddq_upper_param = cp.Parameter(n_dof)
             A_q_param = cp.Parameter((n_dof, n_dof))
@@ -739,99 +1148,107 @@ def qpid(
             b_dq_param = cp.Parameter(n_dof)
             A_ddq_param = cp.Parameter((n_dof, n_dof))
             b_ddq_param = cp.Parameter(n_dof)
-            b_tau_s_param = cp.Parameter(n_act)
-            b_wrench_s_param = cp.Parameter(12)
-            b_root_s_param = cp.Parameter(6)
+            A_ddq_s_param = cp.Parameter((n_dof, n_dof))
+            b_ddq_s_param = cp.Parameter(n_dof)
+            tau_prev_param = cp.Parameter(n_act)
+            wrench_prev_param = cp.Parameter(12)
+            root_prev_param = cp.Parameter(6)
             A_wrench_net_param = cp.Parameter((3, 12))
             b_wrench_net_param = cp.Parameter(3)
             A_wrench_split_param = cp.Parameter((12, 12))
             b_wrench_split_param = cp.Parameter(12)
-            tau_smooth_const = np.diag(np.ones(n_act, dtype=float) * 0.05)
-            tau_reg_const = np.diag(np.ones(n_act, dtype=float) * 0.004)
-            wrench_smooth_weights = np.array([0.06, 0.06, 0.06, 0.12, 0.12, 0.04] * 2, dtype=float)
-            wrench_reg_weights = np.array([0.004, 0.004, 0.004, 0.012, 0.012, 0.004] * 2, dtype=float)
+            tau_smooth_const = np.diag(np.ones(n_act, dtype=float) * 0.14)
+            tau_reg_const = np.diag(np.ones(n_act, dtype=float) * 0.008)
+            wrench_smooth_weights = np.array([0.08, 0.08, 0.10, 0.16, 0.16, 0.08] * 2, dtype=float)
+            wrench_reg_weights = np.array([0.006, 0.006, 0.008, 0.016, 0.016, 0.008] * 2, dtype=float)
             wrench_smooth_const = np.diag(wrench_smooth_weights)
             wrench_reg_const = np.diag(wrench_reg_weights)
-            root_smooth_const = np.diag(np.array([0.10, 0.10, 0.10, 0.05, 0.05, 0.05], dtype=float))
-            root_const = np.diag(np.array([0.75, 0.75, 0.75, 0.30, 0.30, 0.30], dtype=float))
+            root_smooth_const = np.diag(np.array([0.08, 0.08, 0.08, 0.05, 0.05, 0.05], dtype=float))
+            root_const = np.diag(np.array([0.95, 0.95, 0.95, 0.45, 0.45, 0.45], dtype=float))
+            tau_aff = M_act_param @ ddq_var + h_act_param - J_act_param @ wrench_var
             objective = cp.sum_squares(A_q_param @ ddq_var - b_q_param)
             objective += cp.sum_squares(A_dq_param @ ddq_var - b_dq_param)
             objective += cp.sum_squares(A_ddq_param @ ddq_var - b_ddq_param)
-            objective += cp.sum_squares(tau_smooth_const @ tau_var - b_tau_s_param)
-            objective += cp.sum_squares(tau_reg_const @ tau_var)
-            objective += cp.sum_squares(wrench_smooth_const @ wrench_var - b_wrench_s_param)
+            objective += cp.sum_squares(A_ddq_s_param @ ddq_var - b_ddq_s_param)
+            objective += cp.sum_squares(tau_smooth_const @ tau_aff - tau_smooth_const @ tau_prev_param)
+            objective += cp.sum_squares(tau_reg_const @ tau_aff)
+            objective += cp.sum_squares(wrench_smooth_const @ wrench_var - wrench_smooth_const @ wrench_prev_param)
             objective += cp.sum_squares(wrench_reg_const @ wrench_var)
+            wrench_net_expr = np.array(
+                [
+                    [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                ],
+                dtype=float,
+            ) @ wrench_var
             objective += cp.sum_squares(A_wrench_net_param @ wrench_var - b_wrench_net_param)
             objective += cp.sum_squares(A_wrench_split_param @ wrench_var - b_wrench_split_param)
-            objective += cp.sum_squares(root_smooth_const @ root_var - b_root_s_param)
+            objective += cp.sum_squares(root_smooth_const @ root_var - root_smooth_const @ root_prev_param)
             objective += cp.sum_squares(root_const @ root_var)
-            constraints = [
-                M_param @ ddq_var + h_param == S_T @ tau_var + J_wrench_param @ wrench_var + S_root @ root_var,
-                ddq_var >= ddq_lower_param,
-                ddq_var <= ddq_upper_param,
-            ]
+            constraints = [ddq_var >= ddq_lower_param, ddq_var <= ddq_upper_param]
+            if n_root > 0:
+                constraints += [M_root_param @ ddq_var + h_root_param == J_root_param @ wrench_var + root_select @ root_var]
 
-            if int(np.sum(valid)) > 0:
-                J_meas_param = cp.Parameter((int(np.sum(valid)), n_dof))
-                meas_b_param = cp.Parameter(int(np.sum(valid)))
-                objective += cp.sum_squares(J_meas_param @ ddq_var - meas_b_param)
-            else:
-                J_meas_param = None
-                meas_b_param = None
+            meas_rows = 3 * len(measurement_joints)
+            J_meas_param = cp.Parameter((meas_rows, n_dof))
+            meas_b_param = cp.Parameter(meas_rows)
+            objective += cp.sum_squares(J_meas_param @ ddq_var - meas_b_param)
 
             side_params = {}
             for side, wrench_slice in [("left", slice(0, 6)), ("right", slice(6, 12))]:
-                if dyn_key[3] if side == "left" else dyn_key[4]:
-                    A_acc_param = cp.Parameter((3, n_dof))
-                    b_acc_param = cp.Parameter(3)
-                    A_vel_param = cp.Parameter((3, n_dof))
-                    b_vel_param = cp.Parameter(3)
-                    A_ang_acc_param = cp.Parameter((3, n_dof))
-                    b_ang_acc_param = cp.Parameter(3)
-                    A_ang_vel_param = cp.Parameter((3, n_dof))
-                    b_ang_vel_param = cp.Parameter(3)
-                    objective += cp.sum_squares(A_acc_param @ ddq_var - b_acc_param)
-                    objective += cp.sum_squares(A_vel_param @ ddq_var - b_vel_param)
-                    objective += cp.sum_squares(A_ang_acc_param @ ddq_var - b_ang_acc_param)
-                    objective += cp.sum_squares(A_ang_vel_param @ ddq_var - b_ang_vel_param)
-                    local_force = ground_basis @ wrench_var[wrench_slice.start : wrench_slice.start + 3]
-                    local_moment = ground_basis @ wrench_var[wrench_slice.start + 3 : wrench_slice.stop]
-                    constraints += [
-                        local_force[2] >= 0.0,
-                        local_force[0] <= float(mu) * local_force[2],
-                        -local_force[0] <= float(mu) * local_force[2],
-                        local_force[1] <= float(mu) * local_force[2],
-                        -local_force[1] <= float(mu) * local_force[2],
-                        local_moment[0] <= FOOT_COP_HALF_WIDTH * local_force[2],
-                        -local_moment[0] <= FOOT_COP_HALF_WIDTH * local_force[2],
-                        local_moment[1] <= FOOT_COP_HALF_LENGTH * local_force[2],
-                        -local_moment[1] <= FOOT_COP_HALF_LENGTH * local_force[2],
-                        local_moment[2] <= FOOT_TORSION_RADIUS * local_force[2],
-                        -local_moment[2] <= FOOT_TORSION_RADIUS * local_force[2],
-                    ]
-                    side_params[side] = {
-                        "A_acc": A_acc_param,
-                        "b_acc": b_acc_param,
-                        "A_vel": A_vel_param,
-                        "b_vel": b_vel_param,
-                        "A_ang_acc": A_ang_acc_param,
-                        "b_ang_acc": b_ang_acc_param,
-                        "A_ang_vel": A_ang_vel_param,
-                        "b_ang_vel": b_ang_vel_param,
-                    }
-                else:
-                    constraints += [wrench_var[wrench_slice] == 0.0]
-                    side_params[side] = None
+                A_acc_param = cp.Parameter((3, n_dof))
+                b_acc_param = cp.Parameter(3)
+                A_vel_param = cp.Parameter((3, n_dof))
+                b_vel_param = cp.Parameter(3)
+                A_ang_acc_param = cp.Parameter((3, n_dof))
+                b_ang_acc_param = cp.Parameter(3)
+                A_ang_vel_param = cp.Parameter((3, n_dof))
+                b_ang_vel_param = cp.Parameter(3)
+                fz_upper_param = cp.Parameter(nonneg=True)
+                objective += cp.sum_squares(A_acc_param @ ddq_var - b_acc_param)
+                objective += cp.sum_squares(A_vel_param @ ddq_var - b_vel_param)
+                objective += cp.sum_squares(A_ang_acc_param @ ddq_var - b_ang_acc_param)
+                objective += cp.sum_squares(A_ang_vel_param @ ddq_var - b_ang_vel_param)
+                local_force = wrench_var[wrench_slice.start : wrench_slice.start + 3]
+                local_moment = wrench_var[wrench_slice.start + 3 : wrench_slice.stop]
+                constraints += [
+                    local_force[2] >= 0.0,
+                    local_force[2] <= fz_upper_param + 1e-6,
+                    local_force[0] <= float(mu) * local_force[2],
+                    -local_force[0] <= float(mu) * local_force[2],
+                    local_force[1] <= float(mu) * local_force[2],
+                    -local_force[1] <= float(mu) * local_force[2],
+                    local_moment[0] <= FOOT_COP_HALF_WIDTH * local_force[2],
+                    -local_moment[0] <= FOOT_COP_HALF_WIDTH * local_force[2],
+                    local_moment[1] <= FOOT_COP_HALF_LENGTH * local_force[2],
+                    -local_moment[1] <= FOOT_COP_HALF_LENGTH * local_force[2],
+                    local_moment[2] <= FOOT_TORSION_RADIUS * local_force[2],
+                    -local_moment[2] <= FOOT_TORSION_RADIUS * local_force[2],
+                ]
+                side_params[side] = {
+                    "A_acc": A_acc_param,
+                    "b_acc": b_acc_param,
+                    "A_vel": A_vel_param,
+                    "b_vel": b_vel_param,
+                    "A_ang_acc": A_ang_acc_param,
+                    "b_ang_acc": b_ang_acc_param,
+                    "A_ang_vel": A_ang_vel_param,
+                    "b_ang_vel": b_ang_vel_param,
+                    "fz_upper": fz_upper_param,
+                }
 
             DYN_QP_CACHE[dyn_key] = {
                 "problem": cp.Problem(cp.Minimize(objective), constraints),
                 "ddq": ddq_var,
-                "tau": tau_var,
                 "wrench": wrench_var,
                 "root": root_var,
-                "M": M_param,
-                "h": h_param,
-                "J_wrench": J_wrench_param,
+                "M_root": M_root_param,
+                "h_root": h_root_param,
+                "J_root": J_root_param,
+                "M_act": M_act_param,
+                "h_act": h_act_param,
+                "J_act": J_act_param,
                 "ddq_lower": ddq_lower_param,
                 "ddq_upper": ddq_upper_param,
                 "A_q": A_q_param,
@@ -840,9 +1257,11 @@ def qpid(
                 "b_dq": b_dq_param,
                 "A_ddq": A_ddq_param,
                 "b_ddq": b_ddq_param,
-                "b_tau_s": b_tau_s_param,
-                "b_wrench_s": b_wrench_s_param,
-                "b_root_s": b_root_s_param,
+                "A_ddq_s": A_ddq_s_param,
+                "b_ddq_s": b_ddq_s_param,
+                "tau_prev": tau_prev_param,
+                "wrench_prev": wrench_prev_param,
+                "root_prev": root_prev_param,
                 "A_wrench_net": A_wrench_net_param,
                 "b_wrench_net": b_wrench_net_param,
                 "A_wrench_split": A_wrench_split_param,
@@ -853,9 +1272,12 @@ def qpid(
             }
 
         problem = DYN_QP_CACHE[dyn_key]
-        problem["M"].value = M + PARAM_DENSE_EPS
-        problem["h"].value = h
-        problem["J_wrench"].value = J_wrench + PARAM_DENSE_EPS
+        problem["M_root"].value = M_root + PARAM_DENSE_EPS
+        problem["h_root"].value = h_root
+        problem["J_root"].value = J_root + PARAM_DENSE_EPS
+        problem["M_act"].value = M_act + PARAM_DENSE_EPS
+        problem["h_act"].value = h_act
+        problem["J_act"].value = J_act + PARAM_DENSE_EPS
         problem["ddq_lower"].value = ddq_lower
         problem["ddq_upper"].value = ddq_upper
         problem["A_q"].value = np.diag(w_q * (0.5 * dt_sim * dt_sim))
@@ -864,18 +1286,27 @@ def qpid(
         problem["b_dq"].value = w_dq * (dq_target - dq_prev[active_dofs])
         problem["A_ddq"].value = np.diag(w_ddq)
         problem["b_ddq"].value = w_ddq * ddq_target
+        ddq_prev_target = np.array(state.get("ddq_kin", state["ddq"]), dtype=float)[active_dofs]
+        ddq_smooth_w = 0.35 * (1.3 - 0.7 * rel)
+        ddq_smooth_w[: min(6, n_dof)] *= 0.8
+        problem["A_ddq_s"].value = np.diag(ddq_smooth_w)
+        problem["b_ddq_s"].value = ddq_smooth_w * ddq_prev_target
         if n_act > 0:
             tau_prev_active = state["tau"][active_act_dofs - 6]
-            problem["b_tau_s"].value = 0.05 * tau_prev_active
+            problem["tau_prev"].value = tau_prev_active
         else:
-            problem["b_tau_s"].value = np.zeros(0, dtype=float)
+            problem["tau_prev"].value = np.zeros(0, dtype=float)
         wrench_prev = np.concatenate([state["foot_wrenches"]["left"], state["foot_wrenches"]["right"]])
-        problem["b_wrench_s"].value = np.array([0.06, 0.06, 0.06, 0.12, 0.12, 0.04] * 2, dtype=float) * wrench_prev
-        problem["b_root_s"].value = np.array([0.10, 0.10, 0.10, 0.05, 0.05, 0.05], dtype=float) * state["root_residual"]
-        net_force_w = np.array([0.008, 0.008, 0.028], dtype=float) * (0.3 + min(support_ratio, 1.5))
+        problem["wrench_prev"].value = wrench_prev
+        problem["root_prev"].value = state["root_residual"]
+        net_force_w = np.array([0.006, 0.006, 0.024], dtype=float) * (0.2 + min(support_ratio, 1.5))
         split_wrench_w = np.zeros(12, dtype=float)
-        split_wrench_w[:6] = np.array([0.006, 0.006, 0.006, 0.0, 0.0, 0.0], dtype=float) * (0.3 + foot_cues["left"]["score"]) * float(contact_state["left"])
-        split_wrench_w[6:12] = np.array([0.006, 0.006, 0.006, 0.0, 0.0, 0.0], dtype=float) * (0.3 + foot_cues["right"]["score"]) * float(contact_state["right"])
+        split_wrench_w[:6] = np.array([0.010, 0.010, 0.012, 0.012, 0.012, 0.008], dtype=float) * contact_prob["left"] * (0.2 + foot_cues["left"]["score"])
+        split_wrench_w[6:12] = np.array([0.010, 0.010, 0.012, 0.012, 0.012, 0.008], dtype=float) * contact_prob["right"] * (0.2 + foot_cues["right"]["score"])
+        for side in ["left", "right"]:
+            wrench_slice = slice(0, 6) if side == "left" else slice(6, 12)
+            prev_moment = state["foot_wrenches"][side][3:6]
+            support_wrench_split[wrench_slice.start + 3 : wrench_slice.stop] = 0.8 * prev_moment
         problem["A_wrench_net"].value = np.diag(net_force_w) @ np.array(
             [
                 [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -887,28 +1318,36 @@ def qpid(
         problem["b_wrench_net"].value = net_force_w * support_force_target
         problem["A_wrench_split"].value = np.diag(split_wrench_w)
         problem["b_wrench_split"].value = split_wrench_w * support_wrench_split
-        if problem["J_meas"] is not None:
-            problem["J_meas"].value = np.diag(meas_w) @ (0.5 * dt_sim * dt_sim * (J_meas + PARAM_DENSE_EPS))
-            problem["meas_b"].value = meas_w * meas_b
+        J_meas_full = np.zeros((3 * len(measurement_joints), n_dof), dtype=float)
+        meas_b_full = np.zeros(3 * len(measurement_joints), dtype=float)
+        if np.any(valid):
+            J_meas_full[valid, :] = J_meas
+            meas_b_full[valid] = meas_b
+        meas_w_full = np.zeros(3 * len(measurement_joints), dtype=float)
+        if np.any(valid):
+            meas_w_full[valid] = meas_w
+        problem["J_meas"].value = np.diag(0.5 * dt_sim * dt_sim * meas_w_full) @ (J_meas_full + PARAM_DENSE_EPS)
+        problem["meas_b"].value = meas_w_full * meas_b_full
 
         for side in ["left", "right"]:
             side_params = problem["side_params"][side]
-            if side_params is None:
-                continue
             J_side = foot_cues[side]["anchor_jacobian"][:, active_dofs]
             J_ang = foot_cues[side]["anchor_angular_jacobian"][:, active_dofs]
-            w_acc = np.array([0.05, 0.05, 0.18], dtype=float) * (0.3 + foot_cues[side]["confidence"])
-            w_vel = np.array([0.015, 0.015, 0.05], dtype=float) * (0.3 + foot_cues[side]["confidence"])
-            w_ang_acc = np.array([0.06, 0.06, 0.04], dtype=float) * (0.3 + foot_cues[side]["confidence"])
-            w_ang_vel = np.array([0.04, 0.04, 0.03], dtype=float) * (0.3 + foot_cues[side]["confidence"])
-            side_params["A_acc"].value = np.diag(w_acc) @ (J_side + PARAM_DENSE_EPS)
-            side_params["b_acc"].value = -w_acc * foot_cues[side]["anchor_bias"]
-            side_params["A_vel"].value = np.diag(w_vel) @ (dt_sim * (J_side + PARAM_DENSE_EPS))
-            side_params["b_vel"].value = -w_vel * (J_side @ dq_prev)
-            side_params["A_ang_acc"].value = np.diag(w_ang_acc) @ (J_ang + PARAM_DENSE_EPS)
-            side_params["b_ang_acc"].value = -w_ang_acc * foot_cues[side]["anchor_angular_bias"]
-            side_params["A_ang_vel"].value = np.diag(w_ang_vel) @ (dt_sim * (J_ang + PARAM_DENSE_EPS))
-            side_params["b_ang_vel"].value = -w_ang_vel * (J_ang @ dq_prev[active_dofs])
+            prob = contact_prob[side]
+            active_scale = 1.0 if prob > 0.05 else 0.0
+            w_acc = np.array([0.04, 0.04, 0.16], dtype=float) * (0.15 + prob)
+            w_vel = np.array([0.015, 0.015, 0.06], dtype=float) * (0.15 + prob)
+            w_ang_acc = np.array([0.06, 0.06, 0.05], dtype=float) * (0.15 + prob)
+            w_ang_vel = np.array([0.05, 0.05, 0.04], dtype=float) * (0.15 + prob)
+            side_params["A_acc"].value = np.diag(active_scale * w_acc) @ (J_side + PARAM_DENSE_EPS)
+            side_params["b_acc"].value = -(active_scale * w_acc) * foot_cues[side]["anchor_bias"]
+            side_params["A_vel"].value = np.diag(active_scale * w_vel) @ (dt_sim * (J_side + PARAM_DENSE_EPS))
+            side_params["b_vel"].value = -(active_scale * w_vel) * (J_side @ dq_kin[active_dofs])
+            side_params["A_ang_acc"].value = np.diag(active_scale * w_ang_acc) @ (J_ang + PARAM_DENSE_EPS)
+            side_params["b_ang_acc"].value = -(active_scale * w_ang_acc) * foot_cues[side]["anchor_angular_bias"]
+            side_params["A_ang_vel"].value = np.diag(active_scale * w_ang_vel) @ (dt_sim * (J_ang + PARAM_DENSE_EPS))
+            side_params["b_ang_vel"].value = -(active_scale * w_ang_vel) * (J_ang @ dq_kin[active_dofs])
+            side_params["fz_upper"].value = active_scale * max(0.35 * body_weight, (1.5 + 8.0 * prob) * body_weight)
 
         try:
             problem["problem"].solve(
@@ -935,10 +1374,9 @@ def qpid(
                 return None
 
         ddq_active = None if problem["ddq"].value is None else np.array(problem["ddq"].value, dtype=float).reshape(-1)
-        tau_active = None if problem["tau"].value is None else np.array(problem["tau"].value, dtype=float).reshape(-1)
         wrench_proj = None if problem["wrench"].value is None else np.array(problem["wrench"].value, dtype=float).reshape(-1)
         root_residual = None if problem["root"].value is None else np.array(problem["root"].value, dtype=float).reshape(-1)
-        if ddq_active is None or tau_active is None or wrench_proj is None or root_residual is None:
+        if ddq_active is None or wrench_proj is None or root_residual is None:
             return None
 
         ddq_full = np.zeros(n_dof_full, dtype=float)
@@ -947,8 +1385,10 @@ def qpid(
         q_dyn = q_prev + dt_sim * dq_prev + 0.5 * dt_sim * dt_sim * ddq_full
         q_dyn = np.clip(q_dyn, q_lower, q_upper)
         q_full = q_hat.copy()
-        dq_full = dq_hat.copy()
+        q_full = q_kin.copy()
+        dq_full = dq_kin.copy()
 
+        tau_active = M_act @ ddq_active + h_act - J_act @ wrench_proj
         tau_out = np.zeros(n_act_full, dtype=float)
         tau_full = np.zeros(n_dof_full, dtype=float)
         tau_full[:6] = root_residual
@@ -1007,6 +1447,9 @@ def qpid(
             "q": q_full.copy(),
             "dq": dq_full.copy(),
             "ddq": ddq_full.copy(),
+            "q_kin": q_kin.copy(),
+            "dq_kin": dq_kin.copy(),
+            "ddq_kin": ddq_kin.copy(),
             "tau": tau_out.copy(),
             "tau_full": tau_full.copy(),
             "root_residual": root_residual.copy(),
@@ -1022,6 +1465,10 @@ def qpid(
                 "left": bool(contact_state["left"]),
                 "right": bool(contact_state["right"]),
             },
+            "contact_prob": {
+                "left": float(contact_prob["left"]),
+                "right": float(contact_prob["right"]),
+            },
             "floor_height": float(floor_height),
             "step_index": state["step_index"] + 1,
         }
@@ -1035,6 +1482,9 @@ def qpid(
             "q_hat": q_hat,
             "dq_hat": dq_hat,
             "ddq_hat": ddq_hat,
+            "q_kin": q_kin,
+            "dq_kin": dq_kin,
+            "ddq_kin": ddq_kin,
             "measurement_weights": measurement_weights,
             "joint_confidence": joint_confidence,
             "dof_reliability": dof_reliability,
@@ -1046,6 +1496,7 @@ def qpid(
             "foot_forces": foot_forces,
             "foot_wrenches": foot_wrenches,
             "contact_state": contact_state,
+            "contact_prob": contact_prob,
             "contact_info": contact_info,
             "fc": fc_out,
             "delta": measurement_delta,

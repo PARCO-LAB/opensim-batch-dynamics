@@ -2,421 +2,750 @@
 
 ## Goal
 
-The current formulation is already good as a causal kinematic tracker, but `tau` is still too noisy to be used directly. The next work should focus on making torque estimation stable across the full AMASS batch, especially on hard sequences such as:
+The main goal is no longer just to track pose well. The current system already tracks the 12 global keypoints well on many sequences. The remaining goal is to make:
 
-- `TotalCapture/rom1_stageii.csv`
-- `CNRS/SW_B_3_stageii.csv`
-- `220926_yogi_body_hands_..._stageii.csv`
-- `Transitions/airkick_stand_stageii.csv`
-
-The main objective is not just reducing kinematic error. It is to make `tau`, `ddq`, GRF, and contact transitions physically smoother and more usable frame-to-frame.
-
-## Current Situation
-
-From [RT/RESULTS.md](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/RESULTS.md):
-
-- baseline sequence has very small MPJPE
-- contact classification is now strong
-- `tau_actuated_rmse` is still around `300+` on the baseline
-- `ddq_rmse` is still very large
-
-From [RT/AMASS_GENERALIZATION.md](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/AMASS_GENERALIZATION.md):
-
-- weighted mean `tau_actuated_rmse` improved a lot, but it is still `566.99`
-- some sequences remain badly conditioned dynamically even when MPJPE is good
-- worst outlier is still `TotalCapture/rom1_stageii.csv`, where kinematics are acceptable but dynamic quantities blow up
-
-This means the main remaining problem is no longer pose tracking. It is the dynamic consistency path from `q_hat, dq_hat` to `ddq, wrench, tau`.
-
-## Why `tau` Is Still Noisy
-
-### 1. `ddq_hat` is still obtained from a one-step velocity difference
-
-In [RT/rt_library.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/rt_library.py:440), `dq_hat` is computed from a one-step blend between finite-difference velocity and prediction. Then in [RT/rt_library.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/rt_library.py:445), `ddq_hat` is just:
-
-```python
-ddq_hat = (dq_hat - dq_prev) / dt
-```
-
-This is still a very high-gain operation. Even when `q_hat` is excellent, small frame-to-frame changes produce large acceleration spikes. Those spikes immediately contaminate:
-
-- the Stage 2 `ddq_target` in [RT/rt_library.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/rt_library.py:666)
-- the COM acceleration prior in [RT/rt_library.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/rt_library.py:467)
-- the final inverse dynamics balance
-
-This is probably the single biggest remaining source of dirty `tau`.
-
-### 2. Stage 2 solves for `tau` directly, instead of deriving it from a stabilized dynamic state
-
-The current QP optimizes `ddq`, `tau`, wrench, and root residual at the same time in [RT/rt_library.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/rt_library.py:727). The torque terms are only lightly regularized:
-
-- `tau_smooth_const = 0.05 * I` in [RT/rt_library.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/rt_library.py:749)
-- `tau_reg_const = 0.004 * I` in [RT/rt_library.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/rt_library.py:750)
-
-And the smoothness target is just the previous torque in [RT/rt_library.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/rt_library.py:842):
-
-```python
-b_tau_s = 0.05 * tau_prev
-```
-
-So the solver still has a lot of freedom to move `tau` frame-by-frame in order to absorb modeling error, contact mismatch, or acceleration noise.
-
-### 3. `q` and `dq` are taken from Stage 1, but `ddq` comes from Stage 2
-
-At the end of `qpid()`, the exported state is:
-
-- `q = q_hat`
-- `dq = dq_hat`
-- `ddq = ddq_full`
-
-see [RT/rt_library.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/rt_library.py:939).
-
-This is a reasonable weakly-coupled design, but it creates a structural mismatch:
-
-- pose and velocity come from the kinematic stage
-- acceleration comes from the dynamic stage
-
-If Stage 2 needs to move `ddq` to satisfy contact and dynamics, `tau` may become the variable that absorbs inconsistency between the Stage 1 kinematics and the Stage 2 dynamic explanation.
-
-### 4. Contact is still binary
-
-Even though contact classification is much better, the final activation is still boolean in [RT/rt_library.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/rt_library.py:605). That means the QP still switches between:
-
-- wrench free
-- wrench exactly zero
-
-This creates mode-switch discontinuities. Even if the switch is physically correct, the effect on `ddq`, wrench, and `tau` can still be abrupt.
-
-### 5. The support-force prior is driven by raw COM acceleration
-
-The support-force prior is built from:
-
-```python
-support_force_target = mass * (com_acceleration - gravity)
-```
-
-in [RT/rt_library.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/rt_library.py:470).
-
-That is physically meaningful, but only if `com_acceleration` is already stable. Right now it still comes from the same `ddq_hat` chain that is noisy, so the force prior can inject avoidable jitter into:
-
-- vertical GRF
-- tangential GRF
-- wrench split
-- final `tau`
-
-### 6. There are no explicit torque bounds or torque-rate bounds
-
-The QP only regularizes torque norm and torque change. It does not constrain:
-
-- `|tau|`
-- `|tau_t - tau_{t-1}|`
-
-That is why some difficult sequences still show implausible torque bursts even when the solve remains feasible.
-
-## Priority Order
-
-The next experiments should be done in this order:
-
-1. Stabilize `ddq` before it reaches Stage 2
-2. Stop solving raw `tau` directly if possible
-3. Make contact and wrench transitions softer
-4. Add hard physical bounds on torque and torque rate
-5. Rebalance root residual vs contact wrench vs torque
-
-## Recommended Modifications
-
-## Step 1: Add a causal kinematic derivative filter
-
-This should be the next change to implement first.
-
-### What to change
-
-Replace the current one-step derivative logic with a causal filtered state for:
-
-- `q_filt`
-- `dq_filt`
-- `ddq_filt`
-
-Options:
-
-- `alpha-beta-gamma` filter
-- causal Savitzky-Golay over a short window
-- fixed-lag causal least-squares derivative fit
-
-The simplest good option is an `alpha-beta-gamma` filter per DOF, driven by `q_hat`.
-
-### Why it matters
-
-Right now, even tiny pose jitter becomes large acceleration noise. If `ddq_target` becomes smoother, then:
-
-- torque becomes smoother
-- COM acceleration prior becomes smoother
-- contact wrench no longer needs to chase high-frequency artifacts
-
-### Implementation direction
-
-Add to the persistent state:
-
-- `q_kin`
-- `dq_kin`
-- `ddq_kin`
-
-Then Stage 1 should output:
-
-- raw `q_hat`
-- filtered `q_kin, dq_kin, ddq_kin`
-
-Stage 2 should use `q_kin, dq_kin, ddq_kin` as priors instead of the current raw `q_hat, dq_hat, ddq_hat`.
-
-### Expected impact
-
-This is the most likely single change to reduce `tau` noise without damaging tracking.
-
-## Step 2: Remove `tau` as a primary optimization variable
-
-This is the most important structural experiment after Step 1.
-
-### What to change
-
-Instead of optimizing `tau` directly inside the Stage 2 QP, solve Stage 2 for:
-
-- `ddq`
-- foot wrench
-- root residual
-
-Then recover torque algebraically from rigid-body dynamics:
-
-`tau = S ( M ddq + h - J_w^T w - r )`
-
-where `S` extracts the actuated coordinates.
-
-### Why it matters
-
-Right now `tau` is a free variable, so it can absorb dynamic inconsistency and solver noise. If `tau` is instead computed from a stabilized dynamic solution, it becomes a consequence of the solve rather than an additional degree of freedom.
-
-This is much closer to the offline pipeline:
-
-- estimate kinematics
-- estimate contact
-- run inverse dynamics
-
-### Variants to try
-
-Variant A:
-- QP solves only `ddq`, wrench, `r`
-- `tau` computed afterward
-
-Variant B:
-- QP still has `tau`, but add a hard equality tying it to dynamics projection
-- this is less attractive than Variant A
-
-### Expected impact
-
-This should reduce frame-to-frame torque chatter and make the result easier to interpret.
-
-## Step 3: Add explicit jerk regularization
-
-### What to change
-
-Add a state variable for previous acceleration and previous wrench, then penalize:
-
-- `ddq_t - ddq_{t-1}`
-- `w_t - w_{t-1}`
-- `r_t - r_{t-1}`
-
-Some of this already exists for wrench and root residual, but not strongly enough and not with a clear focus on acceleration smoothness.
-
-### Why it matters
-
-Torque is highly sensitive to acceleration. If `ddq` is smooth, `tau` becomes much smoother.
-
-### Implementation direction
-
-Add a term stronger than the current `ddq` target penalty, for example:
-
-`|| W_jerk (ddq_t - ddq_{t-1}) ||^2`
-
-This should likely matter more than increasing the direct `tau` regularization alone.
-
-## Step 4: Use soft contact activation instead of binary on/off contact
-
-### What to change
-
-Keep the current contact score, but do not convert it immediately to a boolean that hard-switches wrench constraints. Instead build a continuous `contact_prob` in `[0, 1]` and use it to scale:
-
-- contact acceleration penalties
-- contact velocity penalties
-- wrench priors
-- force normal lower bound activation
-- torsion / CoP penalties
-
-### Why it matters
-
-A foot near lift-off or near touchdown should not jump between:
-
-- full contact model
-- no contact model
-
-That jump still creates impulses in dynamic quantities even if pose tracking is stable.
-
-### Expected impact
-
-This should reduce spikes in:
-
+- `tau`
 - `ddq`
 - GRF
-- `tau`
+- contact transitions
 
-especially on fast transitions and asymmetrical support.
+stable enough to be biomechanically usable, not only numerically feasible.
 
-## Step 5: Filter the COM support-force prior
+In practice, the bottleneck is now:
+
+`Stage 1 kinematics -> Stage 2 dynamic explanation -> usable tau`
+
+## Current Status
+
+The implementation has already moved well beyond the original monolithic formulation.
+
+### Implemented
+
+In [RT/rt_library.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/rt_library.py), the following changes are now implemented:
+
+1. Stage 1 causal kinematic filter
+   - persistent `q_kin`, `dq_kin`, `ddq_kin`
+   - optional `alpha-beta-gamma` style filtering of kinematic derivatives
+   - this is now the default path in `qpid()`
+
+2. Stage 2 without `tau` as a primary decision variable
+   - the QP solves for:
+     - `ddq`
+     - foot wrench
+     - root residual
+   - `tau` is reconstructed afterward from the actuated rows of rigid-body dynamics
+
+3. Explicit `ddq` smoothing
+   - Stage 2 now penalizes `ddq_t - ddq_{t-1}` directly
+   - this was introduced because raw acceleration noise was still the main driver of dirty torque
+
+4. Soft contact support
+   - there is now a `contact_prob` in addition to binary `contact_state`
+   - contact priors, wrench split, and contact penalties are scaled continuously
+
+5. Filtered support-force prior
+   - the support prior is now driven by the filtered kinematic state rather than only by the raw one-step derivative path
+
+6. Stronger dynamic regularization
+   - stronger torque smoothness penalties
+   - stronger `ddq` smoothness penalties
+   - stronger wrench smoothness and moment regularization
+   - stronger priors on weakly observed DOFs
+
+7. Tau diagnostics
+   - [RT/real_time_test.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/real_time_test.py) now reports:
+     - `tau_actuated_jerk_rmse`
+     - `tau_actuated_jerk_l2_mean`
+
+8. Reliability-aware priors for weakly observed DOFs
+   - stronger Stage 1 priors and smoothing for:
+     - `pelvis_*` orientation
+     - `lumbar_*`, `thorax_*`
+     - `scapula_*`
+     - `shoulder_*`
+   - weakly observed DOFs are now pulled more strongly toward prediction / previous filtered state
+
+9. Geometric Stage 1 priors from observed segment structure
+   - geometric residuals are now added for:
+     - hip span
+     - shoulder span
+     - trunk axis from hip center to shoulder center
+     - knee span
+     - upper-arm, forearm, thigh, and shank segment vectors
+   - these are used as additional soft geometric constraints inside the Stage 1 QP
+
+### Tried But Rejected
+
+These were also tried and should not be reintroduced blindly:
+
+1. Hard torque bounds and hard torque-rate bounds inside the QP
+   - result: the QP became infeasible on multiple AMASS sequences
+   - especially bad on `CNRS/SW_B_3_stageii.csv`
+   - conclusion: hard bounds were too brittle at the current conditioning level
+
+2. Over-aggressive Stage 1 filtering used directly as the only state
+   - result: it helped on outliers but introduced lag and could hurt the baseline
+   - conclusion: filtering is useful, but only as part of a balanced weakly-coupled design
+
+## What Improved
+
+On the tuning subset, the current implementation improved the difficult dynamic cases substantially.
+
+### Representative improvements
+
+Using the current default configuration:
+
+- `BMLhandball`, `159` frames:
+  - `tau_actuated_rmse = 299.90`
+  - `tau_actuated_jerk_rmse = 127.12`
+
+- `TotalCapture/rom1`, `159` frames:
+  - `tau_actuated_rmse = 228.77`
+  - `tau_actuated_jerk_rmse = 88.21`
+
+This is materially better than the old behavior on the strong outlier case.
+
+## Benchmark Tracking
+
+The table below tracks the current tuning subset and compares the state before the latest Stage 1 weak-observation priors against the current implementation.
+
+All runs below use:
+
+- current metric mask excluding ankle/head/wrist-related angles
+- `--max-frames 160` for the longer sequences
+- `--max-frames 80` for `CNRS`
+
+| File | Frames | Previous q RMSE | Current q RMSE | Previous tau actuated RMSE | Current tau actuated RMSE | Previous tau jerk RMSE | Current tau jerk RMSE | Previous MPJPE mean | Current MPJPE mean |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `BMLhandball/Trial_upper_left_012_poses.csv` | `159` | `0.195393` | `0.138785` | `299.897926` | `136.909908` | `127.120888` | `1.906794` | `0.000022` | `0.000752` |
+| `TotalCapture/rom1_stageii.csv` | `159` | `0.261543` | `0.140915` | `228.770875` | `127.066740` | `88.209739` | `5.825987` | `0.000064` | `0.001045` |
+| `HUMAN4D/INF_Running_S2_01_stageii.csv` | `159` | `0.041421` | `0.041441` | `143.639930` | `143.640501` | `1.156806` | `1.157043` | `0.000034` | `0.000127` |
+| `CNRS/SW_B_3_stageii.csv` | `79` | `0.938780` | `0.688289` | `4080.297783` | `3793.441515` | `3953.117671` | `3715.624975` | `0.396519` | `0.412225` |
+
+### Improvement summary
+
+This second table is the one to keep updating after each meaningful algorithmic change. It makes the direction of the change explicit instead of requiring manual subtraction.
+
+Negative deltas are better for:
+
+- `q RMSE`
+- `tau actuated RMSE`
+- `tau jerk RMSE`
+- `MPJPE`
+
+| File | q RMSE delta | tau actuated RMSE delta | tau jerk RMSE delta | MPJPE delta | Status |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `BMLhandball/Trial_upper_left_012_poses.csv` | `-0.056608` | `-162.988018` | `-125.214094` | `+0.000730` | strong improvement; tiny MPJPE cost acceptable |
+| `TotalCapture/rom1_stageii.csv` | `-0.120628` | `-101.704135` | `-82.383752` | `+0.000981` | strong improvement; large torque stabilization |
+| `HUMAN4D/INF_Running_S2_01_stageii.csv` | `+0.000020` | `+0.000571` | `+0.000237` | `+0.000093` | neutral; essentially unchanged |
+| `CNRS/SW_B_3_stageii.csv` | `-0.250491` | `-286.856268` | `-237.492696` | `+0.015706` | partial improvement only; still failing |
+
+## Metric Mask
+
+Precision metrics in [RT/real_time_test.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/real_time_test.py) and [scripts/realtime_vs_offline_pdf.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/realtime_vs_offline_pdf.py) already exclude ankle/head/wrist-related angles.
+
+Current excluded DOF prefixes:
+
+| Category | Excluded prefixes |
+| --- | --- |
+| ankle | `ankle_angle_`, `subtalar_angle_` |
+| head | `head_` |
+| wrist / forearm | `wrist_`, `pro_sup_` |
+
+Current behavior:
+
+- metric mask built by `include_in_precision_metrics(...)`
+- applied to `q`, `dq`, `ddq`, `tau`, worst-DOF ranking, aggregate precision metrics
+- not applied to full signal plots, which still show all DOFs
+
+### Test tracking protocol
+
+Every time a new change is tested, this section should be updated in two places:
+
+1. overwrite the `Current ...` columns in the first table with the latest accepted implementation
+2. append one line to the experiment log below with:
+   - date
+   - short name of the change
+   - which files were tested
+   - whether the change was accepted or rejected
+
+This avoids losing the history of what was tried and why.
+
+### Experiment log
+
+| Date | Change | Files checked | Outcome | Notes |
+| --- | --- | --- | --- | --- |
+| `2026-04-22` | Stage 1 weak-observation priors + geometric segment priors | `BMLhandball`, `TotalCapture`, `HUMAN4D`, `CNRS` | accepted | strong gain on torque stability for nominal and dynamic-outlier sequences; `CNRS` still poor |
+| `2026-04-22` | Fixed-shape DPP cache for Stage 1/Stage 2 under dropout | `BMLhandball`, `TotalCapture`, `HUMAN4D` | accepted | dropout runtime dropped from roughly `170-215 ms/frame` to roughly `10-20 ms/frame` with no material accuracy regression |
+| `2026-04-22` | Weak pelvis/trunk orientation priors from hip/shoulder/trunk geometry | `BMLhandball`, `TotalCapture`, `CNRS` + `BMLhandball` noisy/dropout | accepted | small but real gain on `TotalCapture`, neutral-to-small regression on `BMLhandball`, almost neutral on `CNRS`; acceptable as a weak prior |
+| `2026-04-22` | Soft torque plausibility priors in Stage 2 | `BMLhandball`, `TotalCapture`, `CNRS` | rejected | increased `tau_actuated_rmse` too much on nominal and dynamic-outlier cases |
+| `2026-04-22` | Shoulder-girdle orientation priors + quasi-static asymmetric contact heuristics | `BMLhandball`, `TotalCapture`, `CNRS`, `220926_yogi...` | rejected | `CNRS` got worse, and the yoga case produced a severe right-contact precision/recall regression |
+| `2026-04-22` | Ambiguity-gated stabilization on pelvis/trunk/shoulder/scapula subspace | `BMLhandball`, `TotalCapture`, `CNRS`, `220926_yogi...` | rejected | too broad; no gain on yoga, no gain on `CNRS`, slight nominal regression |
+
+## Robustness Validation
+
+From now on, every accepted change must be checked in three conditions on the tuning subset:
+
+1. `clean`
+2. `case 1`: noisy keypoints
+   - current default stress test: `--noise-std 0.01`
+3. `case 2`: missing keypoints / intermittent detector failures
+   - current default stress test: `--drop-joint-prob 0.2`
+
+This is required because the intended runtime regime is closer to a human pose estimator than to perfect marker data.
+
+### Acceptance rule
+
+A change should not be accepted only because it improves the clean case. It should also remain usable under:
+
+- moderate Gaussian noise on the 12 observed keypoints
+- random keypoint dropout for some frames
+
+The practical bar is:
+
+- `BMLhandball`, `TotalCapture`, and `HUMAN4D` should remain stable under both stress tests
+- `CNRS` is still the stress-failure case, so improvements there are a bonus but not yet the main accept/reject gate
+- if a change improves clean metrics but clearly destabilizes the two robustness cases, it should be rejected or kept behind a flag
+
+### Robustness benchmark table
+
+The table below captures the current default implementation under the two synthetic pose-estimator stress tests.
+
+| File | Scenario | MPJPE mean | q RMSE | tau actuated RMSE | tau jerk RMSE | Left F1 | Right F1 | Solve time mean ms | Robustness read |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `BMLhandball/Trial_upper_left_012_poses.csv` | `case 1: noise_std=0.01` | `0.014900` | `0.218011` | `211.589420` | `93.247408` | `1.0000` | `1.0000` | `24.68` | acceptable; tracking degrades but stays usable |
+| `TotalCapture/rom1_stageii.csv` | `case 1: noise_std=0.01` | `0.020591` | `0.450714` | `193.474702` | `51.482843` | `1.0000` | `1.0000` | `24.80` | acceptable; dynamic outlier still controlled |
+| `HUMAN4D/INF_Running_S2_01_stageii.csv` | `case 1: noise_std=0.01` | `0.015089` | `0.235776` | `256.940682` | `99.813873` | `1.0000` | `1.0000` | `28.32` | acceptable; mostly graceful degradation |
+| `CNRS/SW_B_3_stageii.csv` | `case 1: noise_std=0.01` | `0.414377` | `0.820250` | `3789.005401` | `3711.958922` | `0.7049` | `0.7158` | `42.84` | failing; confirms base-case weakness |
+| `BMLhandball/Trial_upper_left_012_poses.csv` | `case 2: drop_joint_prob=0.2` | `0.000936` | `0.138238` | `135.660528` | `2.276023` | `1.0000` | `1.0000` | `170.96` | robust numerically, but solve time too high |
+| `TotalCapture/rom1_stageii.csv` | `case 2: drop_joint_prob=0.2` | `0.005547` | `0.573572` | `179.374171` | `46.654508` | `0.9937` | `0.9840` | `175.49` | robust enough, but with visible kinematic degradation |
+| `HUMAN4D/INF_Running_S2_01_stageii.csv` | `case 2: drop_joint_prob=0.2` | `0.000201` | `0.043519` | `142.400083` | `1.302509` | `1.0000` | `1.0000` | `171.54` | strong robustness; dropout handled well |
+| `CNRS/SW_B_3_stageii.csv` | `case 2: drop_joint_prob=0.2` | `0.447994` | `0.784520` | `3761.212315` | `3695.549642` | `0.8633` | `0.6889` | `213.98` | still failing; contact and torque remain unusable |
+
+### Reading the robustness table
+
+- The current implementation is reasonably robust to moderate noise on three out of four benchmark files.
+- The current implementation is also robust to random 20% keypoint dropout on three out of four benchmark files.
+- The main regression under dropout is computational:
+  - solve time jumps from roughly `25-30 ms` to roughly `170-215 ms`
+  - this is acceptable for robustness debugging, but not for the target realtime budget
+- `CNRS` still fails in both stress tests, which is consistent with the clean-case diagnosis:
+  - the root issue is weak observability / ambiguity in pelvis-trunk-shoulder kinematics
+  - noise and dropout only expose that weakness more clearly
+
+Update:
+
+- the dropout runtime issue has now been fixed by moving to fixed-shape cached QPs
+- the current practical dropout timings are now roughly:
+  - `BMLhandball`: `11.64 ms/frame`
+  - `TotalCapture`: `20.17 ms/frame`
+  - `HUMAN4D`: `9.88 ms/frame`
+- the remaining open problem is no longer computational under dropout; it is still the `CNRS`-style kinematic ambiguity
+
+## Full AMASS Baseline
+
+Full AMASS batch now evaluated on all `25` original offline CSV files in three modes:
+
+- `clean`
+- `noise --noise-std 0.01`
+- `dropout --drop-joint-prob 0.2`
+
+Source report:
+
+- [RT/RESULTS.md](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/RESULTS.md)
+- [RT/amass_batch_results.json](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/amass_batch_results.json)
+
+Weighted aggregate results:
+
+| Mode | MPJPE mean | q RMSE | tau actuated RMSE | tau jerk RMSE | Left F1 | Right F1 | Solve ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `clean` | `0.004694` | `0.536112` | `265.279520` | `94.123808` | `0.9557` | `0.9431` | `20.16` |
+| `noise` | `0.018019` | `0.629619` | `284.066170` | `152.177417` | `0.9508` | `0.9405` | `26.22` |
+| `dropout` | `0.006430` | `0.591666` | `270.101608` | `100.442736` | `0.9411` | `0.9344` | `19.14` |
+
+Interpretation:
+
+- `noise` hurts more than `dropout`
+- `dropout` no longer main compute problem
+- persistent outliers across modes:
+  - `CNRS/SW_B_3_stageii.csv`
+  - `220926_yogi...stageii.csv`
+
+### New rule for future experiments
+
+Every future entry in the experiment log should explicitly state:
+
+- clean result on the tuning subset
+- `case 1` noisy result on the tuning subset
+- `case 2` dropout result on the tuning subset
+- whether runtime under dropout stayed acceptable or not
+
+### Reading the table
+
+- `BMLhandball` improved strongly.
+- `TotalCapture` improved strongly.
+- `HUMAN4D` stayed essentially unchanged, which is acceptable because it was already good.
+- `CNRS` improved, but is still far from acceptable.
+
+This is the key practical conclusion:
+
+- the recent Stage 1 weak-observation priors and geometric priors are good and should stay
+- but they are not enough to solve the remaining `CNRS`-type failures
+
+### What is now clearly better
+
+- torque is less dominated by raw one-step acceleration noise
+- `ddq` is much better behaved on difficult sequences
+- Stage 2 behaves more like real inverse dynamics and less like a monolithic residual absorber
+- `TotalCapture`-like dynamic outliers improved significantly
+
+## What Is Still Not Good Enough
+
+The current implementation is not yet globally “solved”.
+
+### Remaining hard case
+
+`CNRS/SW_B_3_stageii.csv` is still very poor.
+
+Observed behavior on the current default:
+
+- high MPJPE
+- very poor contact recall
+- extremely large `tau_actuated_rmse`
+- torque explosion concentrated in pelvis/lumbar/hip channels
+
+This means the remaining failure mode is no longer mainly Stage 2 alone. On these sequences the issue is:
+
+- poorly observed or weakly constrained DOFs
+- kinematic ambiguity in pelvis / trunk / shoulder complex
+- contact ambiguity
+- then large dynamic compensation downstream
+
+After the latest Stage 1 geometric priors, this diagnosis still holds. The improvement on `CNRS` is real but modest, which means:
+
+- segment-structure priors help
+- but the missing ingredient is still explicit orientation reasoning for pelvis / trunk / shoulder complex
+
+### Important conclusion
+
+The current bottleneck is now:
+
+1. weakly observed DOFs in Stage 1
+2. poor kinematic conditioning on those DOFs
+3. Stage 2 then tries to explain that with large torque
+
+So the next work should not only keep tuning Stage 2. The next priority is to constrain the unobserved or weakly observed kinematic subspace better.
+
+## Updated Diagnosis
+
+The original diagnosis in this file was directionally correct:
+
+- raw `ddq_hat` was too noisy
+- solving `tau` directly was too permissive
+- binary contact switching was too sharp
+
+After implementation, the revised diagnosis is:
+
+### Solved enough to move on
+
+- raw derivative noise as the main source of torque noise
+- monolithic `tau` decision variable
+- fully binary contact as the main contact representation
+
+### Still open
+
+- underconstrained kinematics for pelvis / trunk / upper limb couplings
+- poor observability of some DOFs from only 12 global points
+- dataset-specific contact and support ambiguity
+- torque explosions when Stage 1 leaves too much freedom in weakly observed coordinates
+
+## Next Priorities
+
+The next changes should focus on constraining the hidden kinematic subspace better rather than only adding more penalties downstream.
+
+## Priority 1: Better priors for weakly observed DOFs
+
+This is now the most important next step.
+
+Status:
+
+- partially implemented
+- reliability-aware smoothing and segment-geometry priors are now in place
+- remaining work is to move from segment-vector consistency to stronger orientation-specific priors
 
 ### What to change
 
-Do not compute the support-force prior from raw instantaneous COM acceleration only. Instead compute:
+Add explicit kinematic priors for DOFs that are not directly constrained well by the 12 keypoints:
 
-- filtered COM velocity
-- filtered COM acceleration
+- scapula DOFs
+- some shoulder rotations
+- lumbar twist / bending / extension
+- pelvis orientation
+- possibly some elbow / forearm couplings when keypoints are ambiguous
 
-or derive the support prior from filtered `ddq_kin`.
+### Ways to do it
 
-### Why it matters
+1. stronger rest-pose or low-acceleration priors only on low-reliability DOFs
+2. joint-group coupling priors:
+   - scapula-shoulder
+   - thorax-lumbar-pelvis
+3. reliability-aware smoothing:
+   - if a DOF has low observability, prioritize temporal smoothness over measurement fitting
 
-The current support prior is physically meaningful but still too sensitive. This is likely one reason some sequences still show excessive vertical GRF and torque bursts.
+### Why this is next
 
-### Expected impact
+This directly attacks the current root cause of the worst remaining failures.
 
-Cleaner:
+### What remains inside this priority
 
-- vertical GRF
-- force split left/right
-- hip and pelvis torque
+The next layer to add is:
 
-## Step 6: Add torque and torque-rate bounds
+1. explicit pelvis orientation priors
+2. explicit thorax / lumbar orientation priors
+3. explicit shoulder-girdle priors tied to scapula and humerus geometry
+
+## Priority 2: Stage 1 should output reliability-weighted anisotropic derivative filters
+
+The current filter is already useful, but it is still fairly generic.
 
 ### What to change
 
-Add either:
+Make the Stage 1 derivative filter:
 
-- heuristic per-DOF torque bounds
-- or bounds derived from model / actuator metadata if available
+- stronger on low-reliability DOFs
+- weaker on highly observed DOFs
+- possibly joint-group specific
 
-Also add explicit rate bounds:
+Examples:
 
-- `tau_min <= tau_t <= tau_max`
-- `|tau_t - tau_{t-1}| <= delta_tau_max`
+- very strong filtering on scapula and lumbar twist
+- moderate filtering on pelvis orientation
+- light filtering on well-observed limbs
 
-### Why it matters
+### Why this matters
 
-Regularization alone does not prevent occasional large bursts.
+Right now some weakly observed DOFs can still generate torque noise even after the structural Stage 2 fixes.
 
-### Caveat
+## Priority 3: Add model-based priors for pelvis and trunk orientation
 
-This should not be the first change. If done too early, it may just hide the real problem by clipping output. It becomes useful after `ddq` and contact are cleaner.
+This is likely necessary for `CNRS`-type failures.
 
-## Step 7: Rebalance root residual vs torque
+This is now the next concrete priority.
 
-### What to check
+### What to change
 
-The root residual is currently regularized in [RT/rt_library.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/rt_library.py:755). It may still be cheaper in some situations for the solver to push error into `tau`, and in others to push it into `r`.
+Introduce explicit geometric priors from:
 
-### What to try
+- pelvis-hip-left/right configuration
+- thorax-shoulder-left/right configuration
+- global uprightness / gravity consistency
 
-Run an ablation:
+Examples:
 
-- stronger root residual penalty
-- weaker root residual penalty
-- anisotropic root residual penalty by axis
+- weak upright prior when support is high
+- temporal prior on pelvis orientation acceleration
+- thorax-pelvis relative orientation prior
 
-Then inspect how that changes:
+### Why this matters
 
-- pelvis torque
-- hip torque
+Large torque explosions still cluster in:
+
+- pelvis
+- lumbar
+- hip
+
+which is exactly where a poor root/trunk estimate propagates into bad inverse dynamics.
+
+### Immediate implementation direction
+
+The next code change should add orientation-style residuals in Stage 1 using observed geometry, for example:
+
+- pelvis left-right axis from `hip_l` and `hip_r`
+- trunk vertical / forward axis from hip center to shoulder center
+- shoulder-line axis from `GlenoHumeral_l` and `GlenoHumeral_r`
+
+These should be turned into soft residuals that specifically constrain:
+
+- `pelvis_tilt`, `pelvis_list`, `pelvis_rotation`
+- `lumbar_extension`, `lumbar_bending`, `lumbar_twist`
+- possibly `thorax_*`
+
+Status:
+
+- partially implemented
+- weak orientation-style priors from pelvis left-right axis, trunk axis, and shoulder-line geometry are now in place
+- they help slightly, but are still not strong enough to solve `CNRS`
+- next improvement should be better orientation priors that are:
+  - reliability-gated
+  - support-aware
+  - less dependent on a fixed world-up heuristic alone
+- a first direct attempt at shoulder-girdle priors was rejected because it worsened:
+  - `CNRS`
+  - static / yoga-like asymmetric support
+
+## Priority 4: Improve contact for non-locomotion poses
+
+The current soft contact logic works better than before, but yoga / unusual support geometries still remain difficult.
+
+### What to change
+
+Extend the contact cue logic to better support:
+
+- quasi-static asymmetric poses
+- edge-of-support cases
+- low-motion but highly loaded support phases
+
+Potential additions:
+
+- CoP plausibility from the previous wrench
+- stance persistence prior when COM is clearly above one foot
+- better handling of one-foot support with low vertical velocity
+
+### Why this matters
+
+Some remaining torque spikes are still caused by support ambiguity rather than by pure dynamic inconsistency.
+
+Status:
+
+- a first heuristic attempt was rejected
+- the failure mode was clear on the yoga benchmark:
+  - `right_contact f1` collapsed to `0.2326`
+- this means the next contact update must be:
+  - much more selective
+  - explicitly benchmarked on `220926_yogi...`
+  - preferably tied to previous wrench consistency, not only COM proximity heuristics
+
+## Priority 5: Add soft torque plausibility priors, not hard bounds
+
+Hard bounds were too brittle, but the idea itself was not wrong.
+
+### What to change
+
+Instead of hard constraints, use soft per-DOF torque plausibility priors:
+
+- larger penalties when `|tau|` exceeds a heuristic threshold
+- larger penalties when `|tau_t - tau_{t-1}|` exceeds a heuristic threshold
+
+Possible implementation:
+
+- iterative reweighting
+- Huber-style or piecewise quadratic penalties
+
+### Why this matters
+
+This could keep the solver stable while still discouraging implausible bursts.
+
+Status:
+
+- attempted once
+- rejected in the current simple form because it worsened:
+  - `BMLhandball`
+  - `TotalCapture`
+- if retried, it should be done with a more selective design, likely:
+  - only on a subset of problematic DOFs
+  - or only above an outlier detector / gating condition
+
+## Priority 6: Add batch evaluation on the tuning subset as a standard regression target
+
+This should be formalized now.
+
+### Recommended tuning subset
+
+Keep using this representative subset:
+
+- `BMLhandball/Trial_upper_left_012_poses.csv`
+- `TotalCapture/rom1_stageii.csv`
+- `CNRS/SW_B_3_stageii.csv`
+- `HUMAN4D/INF_Running_S2_01_stageii.csv`
+- `220926_yogi_body_hands_..._stageii.csv`
+
+### Why
+
+These cover:
+
+- nominal locomotion
+- strong dynamic outlier
+- strong kinematic-conditioning failure
+- running
+- unusual support geometry
+
+## Recommended Metrics Going Forward
+
+The regression target should not be only RMSE.
+
+For each sequence track at least:
+
+- `mpjpe_m`
+- `q_rmse`
+- `ddq_rmse`
 - `tau_actuated_rmse`
-- dynamics residual
+- `tau_actuated_jerk_rmse`
+- `tau_actuated_jerk_l2_mean`
+- left/right contact F1
+- dynamics residual mean
 
-### Why it matters
+## Practical Acceptance Criteria
 
-Some current outliers look like incorrect load sharing between:
+The next version should only be considered better if it satisfies both:
 
-- contact wrench
-- root residual
-- actuated torque
+### 1. It improves nominal performance
 
-## Step 8: Improve the wrench prior on foot moments
+On `BMLhandball`:
 
-### What to change
+- `tau_actuated_rmse` lower than current default
+- `tau_actuated_jerk_rmse` not worse, ideally lower
+- no material regression in MPJPE or contact F1
 
-The current split prior initializes foot moments to zero in [RT/rt_library.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/RT/rt_library.py:650). That is too weak for motions where support moment is important.
+### 2. It improves at least one hard outlier without destabilizing the rest
 
-Try:
+On `TotalCapture/rom1` and `HUMAN4D`:
 
-- CoP continuity prior
-- moment-rate regularization stronger than force-rate regularization
-- stance-phase prior on `Mx, My, Mz`
+- lower `tau_actuated_rmse`
+- lower `tau_actuated_jerk_rmse`
+- no solve failures
 
-### Why it matters
+### 3. It must not collapse on `CNRS`
 
-If support moments jump, `tau` will jump too, especially in pelvis and hips.
+Even if `CNRS` is not solved yet, the next version should:
 
-## Step 9: Add diagnostics targeted at `tau`
+- avoid infeasibility
+- reduce the worst torque explosions
+- improve contact or pelvis/trunk stability
 
-Before changing too much code, extend evaluation so we can separate the sources of torque noise.
+## Immediate Next Work
 
-### Add these metrics
+The next concrete modifications to try are:
 
-- frame-to-frame `tau` jerk:
-  `mean ||tau_t - tau_{t-1}||`
-- per-DOF torque jerk RMSE
-- spectral energy ratio above a cutoff frequency
-- correlation between `|tau_t - tau_{t-1}|` and contact state changes
-- correlation between `|tau_t - tau_{t-1}|` and `ddq` spikes
+1. pelvis / trunk orientation priors from observed keypoint geometry
+2. shoulder-girdle orientation priors
+3. contact improvements for quasi-static asymmetric support
+4. more selective torque plausibility penalties, only if reliability-gated
 
-### Why it matters
+If only one change is done next, it should be:
 
-Right now the reports focus on RMSE. That is necessary but not sufficient. A signal can have acceptable RMSE and still be unusably spiky.
+1. add explicit pelvis and trunk orientation residuals in Stage 1
+2. use them to stabilize `pelvis_*`, `lumbar_*`, and `thorax_*`
 
-## Concrete Plan
+That is now the most likely next step to reduce the remaining `CNRS`-style failures without undoing the improvements already obtained on the nominal and dynamic-outlier cases.
 
-The recommended implementation order is:
+Status update:
 
-1. Add causal filter for `q/dq/ddq`
-2. Feed filtered kinematics into Stage 2 and filtered COM prior
-3. Remove `tau` from the Stage 2 decision vector and recover it after the solve
-4. Add `ddq` jerk penalty
-5. Move contact from binary to soft activation
-6. Add torque-rate bounds
-7. Tune root residual weighting
-8. Tune wrench-moment priors
+- all four branches above have now been explicitly tried in at least one concrete form
+- only item `1` has produced an accepted change so far
+- items `2`, `3`, and `4` have all been tried and rejected in their first broad implementation
+- conclusion:
+  - remaining work is no longer "try obvious version of listed idea"
+  - remaining work is "design narrower, reliability-gated versions"
 
-## Acceptance Criteria
+Current measured snapshot after the latest accepted changes:
 
-For a change to be considered successful, it should improve not only MPJPE but especially torque usability.
+- `BMLhandball`, clean:
+  - `q_rmse = 0.135278`
+  - `tau_actuated_rmse = 136.855040`
+  - `tau_actuated_jerk_rmse = 1.915582`
+- `TotalCapture`, clean:
+  - `q_rmse = 0.143382`
+  - `tau_actuated_rmse = 125.239115`
+  - `tau_actuated_jerk_rmse = 5.687225`
+- `CNRS`, clean:
+  - `q_rmse = 0.678330`
+  - `tau_actuated_rmse = 3784.076182`
+  - `tau_actuated_jerk_rmse = 3712.989375`
+- `BMLhandball`, noise `0.01 m`:
+  - `tau_actuated_rmse = 209.723666`
+- `BMLhandball`, dropout `20%`:
+  - `tau_actuated_rmse = 135.343884`
+  - `solve_time_ms = 11.64`
 
-Minimum acceptance targets:
+Latest attempted but rejected branch:
 
-- no regression in contact F1 on the baseline sequence
-- no major regression in AMASS weighted mean MPJPE
-- lower weighted mean `tau_actuated_rmse`
-- lower `tau` jerk on baseline and AMASS batch
-- better behavior on `TotalCapture/rom1_stageii.csv`
+- shoulder-girdle priors + quasi-static asymmetric contact heuristics
 
-Recommended torque-specific targets:
+Observed regressions:
 
-- reduce baseline `tau_actuated_rmse` below `250`
-- reduce AMASS weighted mean `tau_actuated_rmse` below `450`
-- reduce worst-case outlier torque bursts, even if RMSE improvement is only moderate
+- `BMLhandball`, clean:
+  - `tau_actuated_rmse` worsened from `136.855040` to `137.183311`
+- `TotalCapture`, clean:
+  - `tau_actuated_rmse` worsened from `125.239115` to `125.320900`
+- `CNRS`, clean:
+  - `q_rmse` worsened from `0.678330` to `0.988272`
+  - `left/right contact f1` worsened to `0.8382 / 0.6742`
+- `220926_yogi...`, clean:
+  - `right_contact f1 = 0.2326`
 
-## Immediate Next Experiment
+Conclusion:
 
-If only one modification is implemented next, it should be:
+- the next version of `Immediate Next Work` should not use broad shoulder/contact heuristics
+- it should instead use:
+  - reliability-gated shoulder priors only when upper-arm geometry is strong and symmetric
+  - contact persistence tied to previous support wrench consistency
+  - explicit yoga/static benchmark gating before acceptance
 
-1. add a causal filter for `q/dq/ddq`
-2. feed the filtered `ddq` into Stage 2
-3. recompute `support_force_target` from filtered COM acceleration
+Latest rejected branch after that:
 
-If that works, the next structural change should be:
+- ambiguity-gated stabilization of pelvis/trunk/shoulder/scapula
 
-4. remove `tau` from the QP and compute it after the dynamic solve
+Observed outcome:
 
-That combination is the most likely path to turn `tau` from a mathematically feasible signal into a usable biomechanical output.
+- `BMLhandball`, clean:
+  - `tau_actuated_rmse` changed from `136.855040` to `136.761653`
+  - essentially neutral
+- `TotalCapture`, clean:
+  - `tau_actuated_rmse` changed from `125.239115` to `125.252986`
+  - essentially neutral
+- `CNRS`, clean:
+  - `tau_actuated_rmse` changed from `3784.076182` to `3785.748064`
+  - `left/right contact f1` changed to `0.7656 / 0.7174`
+  - not a meaningful gain
+- `220926_yogi...`, clean:
+  - `right_contact f1 = 0.2381`
+  - still failing badly
+
+Conclusion:
+
+- generic "ambiguity smoothing" also not enough
+- next useful work must be even more targeted:
+  - DOF-local gating
+  - support/wrench-consistency gating
+  - perhaps sequence-class-dependent heuristics
+
+## Revised Next Work
+
+The original immediate list has now been fully exercised in first-pass form. The next useful steps are narrower:
+
+1. dof-local reliability gating on `shoulder_*` and `scapula_*`
+   - activate only if both shoulder and elbow geometry are consistent for multiple consecutive frames
+2. contact pruning from previous wrench consistency
+   - use previous vertical load + current height/velocity
+   - do not use broad COM-proximity heuristics
+3. special handling for `CNRS`-like shoulder-dominated failures
+   - inspect whether one-sided shoulder observations are poisoning pelvis/trunk through shared priors
+4. optional sequence-mode classifier
+   - locomotion-like vs quasi-static asymmetric support
+   - switch only contact heuristics, not whole solver
+
+## Concrete Next Steps
+
+What I would do next, in order:
+
+| Priority | Change | Why | Acceptance gate |
+| --- | --- | --- | --- |
+| `1` | shoulder/scapula priors with multi-frame gating | broad shoulder priors failed; need activation only when upper-arm geometry stable | `CNRS` shoulder DOFs improve, `BMLhandball` and yoga do not regress |
+| `2` | contact pruning from previous wrench consistency | yoga/static failures look like false persistent support on wrong foot | `220926_yogi...` right-contact F1 improves without hurting locomotion F1 |
+| `3` | isolate pelvis/trunk priors from contaminated shoulder cues | `CNRS` suggests bad shoulder cues leak into trunk/root stabilization | lower `CNRS` `tau_actuated_rmse` and better shoulder-side worst DOFs |
+| `4` | add full-batch acceptance gate for every accepted patch | tuning subset not enough now | no accepted patch without `clean/noise/dropout` AMASS summary |
+| `5` | reduce remaining cvxpy parameter count | runtime OK now, but warning remains | warning reduced or removed without metric regression |
+
+Practical next experiment:
+
+1. build per-side shoulder confidence using:
+   - shoulder-elbow segment consistency
+   - 3-5 frame temporal stability
+2. use that confidence only to gate `shoulder_*` / `scapula_*` priors
+3. do **not** feed low-confidence shoulder cues into pelvis/trunk stabilization
+4. benchmark on:
+   - `BMLhandball`
+   - `TotalCapture`
+   - `CNRS`
+   - `220926_yogi...`
+   - then full AMASS if accepted

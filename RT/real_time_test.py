@@ -57,6 +57,9 @@ if __name__ == "__main__":
     parser.add_argument("--drop-joint-prob", type=float, default=0.0)
     parser.add_argument("--mu", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--stage1-kin-filter", dest="stage1_kin_filter", action="store_true", help="Enable causal alpha-beta-gamma filtering of q/dq/ddq before Stage 2")
+    parser.add_argument("--no-stage1-kin-filter", dest="stage1_kin_filter", action="store_false", help="Disable causal Stage 1 kinematic filtering")
+    parser.set_defaults(stage1_kin_filter=True)
     parser.add_argument(
         "--output-csv",
         type=Path,
@@ -175,6 +178,7 @@ if __name__ == "__main__":
             mu=args.mu,
             measurement_joints=joints,
             state=rt_state,
+            use_stage1_kin_filter=args.stage1_kin_filter,
         )
         solve_time_rt.append(time.perf_counter() - t0)
         if result is None:
@@ -232,6 +236,8 @@ if __name__ == "__main__":
     metric_act_mask = metric_mask[6:] if len(metric_mask) > 6 else np.zeros(0, dtype=bool)
     metric_tau_act_rt = tau_rt[:, 6:][:, metric_act_mask] if len(metric_mask) > 6 else metric_tau_rt
     metric_tau_act_ref = tau_ref[:, 6:][:, metric_act_mask] if len(metric_mask) > 6 else metric_tau_ref
+    tau_jerk_rt = np.diff(metric_tau_act_rt, axis=0) if len(metric_tau_act_rt) > 1 else np.zeros((0, metric_tau_act_rt.shape[1]), dtype=float)
+    tau_jerk_ref = np.diff(metric_tau_act_ref, axis=0) if len(metric_tau_act_ref) > 1 else np.zeros((0, metric_tau_act_ref.shape[1]), dtype=float)
 
     if args.output_csv is not None:
         output_csv = args.output_csv.resolve()
@@ -287,6 +293,7 @@ if __name__ == "__main__":
         rt_columns["input_noise_std_m"] = np.full(len(q_rt), float(args.noise_std), dtype=float)
         rt_columns["input_drop_joint_prob"] = np.full(len(q_rt), float(args.drop_joint_prob), dtype=float)
         rt_columns["input_mu"] = np.full(len(q_rt), float(args.mu), dtype=float)
+        rt_columns["input_stage1_kin_filter"] = np.full(len(q_rt), float(args.stage1_kin_filter), dtype=float)
 
         rt_table = pd.DataFrame(rt_columns)
         rt_table.to_csv(output_csv, index=False)
@@ -294,6 +301,7 @@ if __name__ == "__main__":
     print(f"frames: {len(q_rt)}")
     print(f"noise_std_m: {args.noise_std:.6f}")
     print(f"drop_joint_prob: {args.drop_joint_prob:.6f}")
+    print(f"stage1_kin_filter: {int(args.stage1_kin_filter)}")
     print(f"mpjpe_m: mean={np.mean(mpjpe_rt):.6f} max={np.max(mpjpe_rt):.6f}")
     print(f"dyn_residual_norm: mean={np.mean(dyn_residual_rt):.6f} max={np.max(dyn_residual_rt):.6f}")
     print(f"solve_time_ms: mean={1000.0 * np.mean(solve_time_rt):.6f} p95={1000.0 * np.percentile(solve_time_rt, 95.0):.6f}")
@@ -309,6 +317,9 @@ if __name__ == "__main__":
     print(f"tau_full_mae: {mae(metric_tau_rt, metric_tau_ref):.6f}")
     print(f"tau_actuated_rmse: {rmse(metric_tau_act_rt, metric_tau_act_ref):.6f}")
     print(f"tau_actuated_mae: {mae(metric_tau_act_rt, metric_tau_act_ref):.6f}")
+    if tau_jerk_rt.size > 0:
+        print(f"tau_actuated_jerk_rmse: {rmse(tau_jerk_rt, tau_jerk_ref):.6f}")
+        print(f"tau_actuated_jerk_l2_mean: {float(np.mean(np.linalg.norm(tau_jerk_rt, axis=1))):.6f}")
     print(f"left_grf_rmse: {rmse(left_force_rt, left_force_ref):.6f}")
     print(f"right_grf_rmse: {rmse(right_force_rt, right_force_ref):.6f}")
 
