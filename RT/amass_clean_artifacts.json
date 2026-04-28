@@ -1,0 +1,184 @@
+{
+  "generated_at": "2026-04-22 15:54:28",
+  "count": 25,
+  "success": 25,
+  "failed": 0,
+  "total_wall_s": 769.7384479045868,
+  "results": [
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/220926_yogi_body_hands_03596_Extended_Revolved_Side_Angle_Pose_or_Utthita_Parsvakonasana_-c_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/220926_yogi_body_hands_03596_Extended_Revolved_Side_Angle_Pose_or_Utthita_Parsvakonasana_-c_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/220926_yogi_body_hands_03596_Extended_Revolved_Side_Angle_Pose_or_Utthita_Parsvakonasana_-c_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 33.473764181137085
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/ACCAD/C14_-__run_turn_right__(90)_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/ACCAD/C14_-__run_turn_right__(90)_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/ACCAD/C14_-__run_turn_right__(90)_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 20.09084391593933
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/BMLhandball/Trial_upper_left_012_poses.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/BMLhandball/Trial_upper_left_012_poses_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/BMLhandball/Trial_upper_left_012_poses_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 29.335997104644775
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/BMLmovi/Subject_4_F_4_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/BMLmovi/Subject_4_F_4_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/BMLmovi/Subject_4_F_4_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 14.823087215423584
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/BMLrub/0021_jumping2_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/BMLrub/0021_jumping2_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/BMLrub/0021_jumping2_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 18.157358169555664
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/CMU/10_05_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/CMU/10_05_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/CMU/10_05_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 17.334058046340942
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/CNRS/SW_B_3_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/CNRS/SW_B_3_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/CNRS/SW_B_3_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 27.28811478614807
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/DFAUST/50009_shake_hips_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/DFAUST/50009_shake_hips_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/DFAUST/50009_shake_hips_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 15.577142000198364
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/EKUT/BEAMN02_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/EKUT/BEAMN02_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/EKUT/BEAMN02_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 17.09484887123108
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/Eyes_Japan_Dataset/pose-08-pray_buddhismintone-kanno_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/Eyes_Japan_Dataset/pose-08-pray_buddhismintone-kanno_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/Eyes_Japan_Dataset/pose-08-pray_buddhismintone-kanno_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 50.238300800323486
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/GRAB/elephant_pass_1_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/GRAB/elephant_pass_1_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/GRAB/elephant_pass_1_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 23.28487801551819
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/HDM05/HDM_dg_01-02_03_120_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/HDM05/HDM_dg_01-02_03_120_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/HDM05/HDM_dg_01-02_03_120_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 55.51188588142395
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/HUMAN4D/INF_Running_S2_01_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/HUMAN4D/INF_Running_S2_01_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/HUMAN4D/INF_Running_S2_01_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 56.58456993103027
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/HumanEva/Box_1_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/HumanEva/Box_1_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/HumanEva/Box_1_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 42.96535801887512
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/KIT/bend_left09_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/KIT/bend_left09_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/KIT/bend_left09_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 19.266300916671753
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/LARa/L01_S03_R10.raw_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/LARa/L01_S03_R10.raw_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/LARa/L01_S03_R10.raw_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 43.78538703918457
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/MOSh/misc_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/MOSh/misc_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/MOSh/misc_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 53.141481161117554
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/PosePrior/uar5_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/PosePrior/uar5_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/PosePrior/uar5_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 54.154991149902344
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/SFU/0012_JumpAndRoll001_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/SFU/0012_JumpAndRoll001_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/SFU/0012_JumpAndRoll001_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 20.971212148666382
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/SOMA/clap_002_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/SOMA/clap_002_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/SOMA/clap_002_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 21.54048204421997
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/SSM/punch_kick_sync_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/SSM/punch_kick_sync_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/SSM/punch_kick_sync_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 15.04230809211731
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/TCDHands/graspLumbricalB_cl_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/TCDHands/graspLumbricalB_cl_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/TCDHands/graspLumbricalB_cl_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 17.694610118865967
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/TotalCapture/rom1_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/TotalCapture/rom1_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/TotalCapture/rom1_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 52.28069806098938
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/Transitions/airkick_stand_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/Transitions/airkick_stand_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/Transitions/airkick_stand_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 26.833240747451782
+    },
+    {
+      "file": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/WEIZMANN/Fast_SShapeLR(10)_stageii.csv",
+      "rt_csv": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/WEIZMANN/Fast_SShapeLR(10)_stageii_realtime.csv",
+      "pdf": "/Users/enricomartini/Desktop/opensim-batch-dynamics/data/AMASS/WEIZMANN/Fast_SShapeLR(10)_stageii_realtime_vs_offline.pdf",
+      "ok": true,
+      "wall_s": 23.26582908630371
+    }
+  ]
+}

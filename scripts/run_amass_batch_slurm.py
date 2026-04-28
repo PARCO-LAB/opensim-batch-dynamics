@@ -262,6 +262,8 @@ def _write_sbatch_script(
         lines.append(f"#SBATCH --partition={args.slurm_partition}")
     if args.slurm_account:
         lines.append(f"#SBATCH --account={args.slurm_account}")
+    if args.slurm_nodelist:
+        lines.append(f"#SBATCH -w {args.slurm_nodelist}")
     lines.extend(
         [
             "",
@@ -853,6 +855,14 @@ def parse_args() -> argparse.Namespace:
     submit.add_argument("--slurm-job-name", default="amass_bsm")
     submit.add_argument("--slurm-partition", default=None)
     submit.add_argument("--slurm-account", default=None)
+    submit.add_argument(
+        "--slurm-nodelist",
+        default=None,
+        help=(
+            "Optional subset of nodes to use, passed through to SBATCH as '-w'. "
+            "Example: 'node[001-002],blade[010-012]'."
+        ),
+    )
     submit.add_argument("--slurm-time", default="08:00:00")
     submit.add_argument("--slurm-cpus-per-task", type=int, default=4)
     submit.add_argument("--slurm-mem", default="16G")

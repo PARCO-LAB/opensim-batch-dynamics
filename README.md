@@ -188,6 +188,7 @@ Assuming `~/storage` is a symlink to `/storage-large/shared-folders/gr_bombieri/
 python scripts/run_amass_batch_slurm.py submit \
   --addbio-root "$HOME/AddBiomechanics" \
   --slurm-job-name amass_bsm \
+  --slurm-nodelist 'node[001-002],blade[010-012]' \
   --slurm-time 08:00:00 \
   --slurm-cpus-per-task 4 \
   --slurm-mem 16G \
@@ -198,6 +199,8 @@ python scripts/run_amass_batch_slurm.py submit \
 ```
 
 If your cluster requires an explicit partition or account, add `--slurm-partition ...` and/or `--slurm-account ...`.
+If admins ask you to constrain jobs to a subset of hosts, add `--slurm-nodelist 'node[001-002],blade[010-012]'`.
+If the preferred queue is overloaded, consider switching some batches to `--slurm-partition low`.
 
 What this script does:
 
