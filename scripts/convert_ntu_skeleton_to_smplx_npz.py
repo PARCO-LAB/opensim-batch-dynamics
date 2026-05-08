@@ -207,6 +207,17 @@ def discover_skeleton_files(input_dir: Path, recursive: bool) -> list[Path]:
     return sorted(path for path in input_dir.glob(pattern) if path.is_file())
 
 
+def normalize_performer_key(raw: str) -> str:
+    value = str(raw).strip()
+    if not value:
+        raise ValueError("Empty performer key")
+    if value.lower() in {"unknown", "punknown"}:
+        return "Punknown"
+    if value[0].lower() == "p":
+        value = value[1:]
+    return f"P{int(value):03d}"
+
+
 def read_ntu_skeleton(path: str | Path) -> dict[str, NTUTrack]:
     source = Path(path)
     lines = source.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -713,6 +724,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--input-dir", type=Path, default=Path("data/ntu"))
+    parser.add_argument(
+        "--input-file",
+        type=Path,
+        default=None,
+        help="Optional single .skeleton file. When set, --input-dir is ignored.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("data/ntu_smplx_npz"))
     parser.add_argument("--smplx-model-dir", type=Path, default=Path("model/smpl"))
     parser.add_argument("--gender", choices=["neutral", "male", "female"], default="neutral")
@@ -730,9 +747,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--recursive", action="store_true")
+    parser.add_argument(
+        "--performer",
+        action="append",
+        default=[],
+        help="Optional performer filter, e.g. P001 or 1. Can be passed multiple times.",
+    )
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--fit-shapes-only",
+        action="store_true",
+        help="Fit/write performer beta cache from input skeletons, then stop before pose fitting.",
+    )
     parser.add_argument("--shape-cache-dir", type=Path, default=None)
     parser.add_argument("--shape-iters", type=int, default=300)
     parser.add_argument("--shape-lr", type=float, default=0.04)
@@ -790,16 +818,25 @@ def load_or_fit_betas(
 
 
 def run_conversion(args: argparse.Namespace) -> dict[str, object]:
-    input_dir = args.input_dir.resolve()
+    input_file = args.input_file.resolve() if args.input_file is not None else None
+    input_dir = args.input_dir.resolve() if input_file is None else input_file.parent.resolve()
     output_dir = args.output_dir.resolve()
-    if not input_dir.exists():
+    if input_file is not None and not input_file.exists():
+        raise FileNotFoundError(f"NTU input file not found: {input_file}")
+    if input_file is not None and input_file.suffix.lower() != ".skeleton":
+        raise ValueError(f"--input-file must point to a .skeleton file: {input_file}")
+    if input_file is None and not input_dir.exists():
         raise FileNotFoundError(f"NTU input directory not found: {input_dir}")
 
-    files = discover_skeleton_files(input_dir, recursive=args.recursive)
+    files = [input_file] if input_file is not None else discover_skeleton_files(input_dir, recursive=args.recursive)
+    performer_filter = {normalize_performer_key(value) for value in args.performer}
+    if performer_filter:
+        files = [path for path in files if parse_ntu_metadata(path).performer_key in performer_filter]
     if args.max_files is not None:
         files = files[: max(0, int(args.max_files))]
     if not files:
-        raise FileNotFoundError(f"No .skeleton files found under {input_dir}")
+        suffix = f" for performers {sorted(performer_filter)}" if performer_filter else ""
+        raise FileNotFoundError(f"No .skeleton files found under {input_dir}{suffix}")
 
     dry_run_items = []
     if args.dry_run:
@@ -840,6 +877,27 @@ def run_conversion(args: argparse.Namespace) -> dict[str, object]:
         betas, cache_hit = load_or_fit_betas(shape_key, targets, args, shape_cache_dir)
         betas_by_shape_key[shape_key] = betas
         shape_cache_hits[shape_key] = cache_hit
+
+    if args.fit_shapes_only:
+        summary = {
+            "mode": "fit_shapes",
+            "input_dir": str(input_dir),
+            "output_dir": str(output_dir),
+            "shape_cache_dir": str(shape_cache_dir),
+            "smplx_model_dir": str(args.smplx_model_dir.resolve()),
+            "actor_mode": args.actor_mode,
+            "performer_filter": sorted(performer_filter),
+            "target_frame": args.target_frame,
+            "num_files": len(files),
+            "num_shape_keys": len(aggregated_shape_targets),
+            "shape_keys": sorted(aggregated_shape_targets.keys()),
+            "shape_cache_hits": shape_cache_hits,
+        }
+        summary_path = (args.summary_json or (output_dir / "shape_fit_summary.json")).resolve()
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        summary["summary_json"] = str(summary_path)
+        return summary
 
     converted = []
     skipped = []
@@ -915,6 +973,7 @@ def run_conversion(args: argparse.Namespace) -> dict[str, object]:
         "output_dir": str(output_dir),
         "smplx_model_dir": str(args.smplx_model_dir.resolve()),
         "actor_mode": args.actor_mode,
+        "performer_filter": sorted(performer_filter),
         "target_frame": args.target_frame,
         "frame_rate_hz": float(args.frame_rate),
         "num_files": len(files),
