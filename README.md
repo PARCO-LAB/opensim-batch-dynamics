@@ -16,6 +16,12 @@ Main entrypoint:
 - [run_amass_to_bsm_csv.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/run_amass_to_bsm_csv.py)
 - `--trial all` runs every trial found inside a multi-trial `.npz` and exports one CSV per trial.
 
+Additional NTU entrypoints:
+
+- [convert_ntu_skeleton_to_smplx_npz.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/convert_ntu_skeleton_to_smplx_npz.py): converts NTU RGB+D `.skeleton` files to AMASS-like SMPL-X `.npz`.
+- [run_ntu_skeleton_batch_slurm.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/run_ntu_skeleton_batch_slurm.py): SLURM helper for NTU `.skeleton -> .npz` conversion.
+- [convert_humanml3d_joints_to_smplx_npz.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/convert_humanml3d_joints_to_smplx_npz.py): fits SMPL-X params from HumanML3D `joints/*.npy` 52-joint files.
+
 ## Required Inputs and Assets
 
 - AMASS input file (example): `data/A3-_Swing_arms_stageii.npz`
@@ -29,6 +35,20 @@ AMASS compatibility note:
 
 - The loader supports both Stage-II style `.npz` files and legacy AMASS files with `poses/trans`.
 - If present, sibling `shape.npz` is used automatically as fallback for `gender` and `betas`.
+
+NTU compatibility note:
+
+- NTU RGB+D `.skeleton` files contain 25 3D joints in camera coordinates.
+- The NTU converter fits an AMASS-like SMPL-X parameter file with `trans`, `root_orient`, `pose_body`, zero hand/face pose, `betas`, `gender`, `mocap_frame_rate`, and NTU metadata.
+- Raw NTU skeletons are treated as Y-up; by default the converter exports **Z-up** motion (`--target-frame z-up`) to match this repo's BSM/Nimble/OpenSim gravity convention.
+- Subject size is handled by fitting SMPL-X `betas` from metric 3D limb lengths.
+
+HumanML3D compatibility note:
+
+- `new_joint_vecs/*.npy` are feature vectors and are not direct SMPL parameters.
+- `new_joints/*.npy` are normalized 22-joint positions.
+- `joints/*.npy` are the preferred source for this repo because they contain 52 SMPL/SMPL-H-style joints, including hands.
+- HumanML3D motion is 20 fps by default.
 
 ## Ubuntu Setup
 
@@ -118,6 +138,167 @@ Final output:
 - `outputs/bsm/A3_swing_full.csv`
 
 With `--cleanup-intermediate`, all temporary files under `outputs/bsm/<trial>/` are removed after a successful run, leaving only the final CSV.
+
+## NTU `.skeleton` to SMPL-X `.npz`
+
+NTU RGB+D 60/120 skeleton files can be converted to AMASS-like SMPL-X `.npz` files, then passed to `run_amass_to_bsm_csv.py`.
+
+Single-file conversion:
+
+```bash
+python scripts/convert_ntu_skeleton_to_smplx_npz.py \
+  --input-file data/ntu/S001C001P001R001A001.skeleton \
+  --output-dir data/ntu_smplx_npz \
+  --smplx-model-dir model/smpl \
+  --target-frame z-up
+```
+
+Folder conversion:
+
+```bash
+python scripts/convert_ntu_skeleton_to_smplx_npz.py \
+  --input-dir data/ntu \
+  --output-dir data/ntu_smplx_npz \
+  --smplx-model-dir model/smpl \
+  --recursive \
+  --target-frame z-up
+```
+
+Output example:
+
+- `data/ntu_smplx_npz/S001C001P001R001A001.npz`
+- `data/ntu_smplx_npz/conversion_summary.json`
+- `data/ntu_smplx_npz/_shape_cache/P001.npy`
+
+Important options:
+
+- `--target-frame z-up` is the default and should be used before BSM/OpenSim dynamics.
+- `--target-frame y-up` preserves raw NTU vertical and is mainly for debugging.
+- `--actor-mode primary` keeps the main tracked body per file.
+- `--actor-mode all` exports additional tracked bodies as `_bodyXX`.
+- `--performer P001` filters conversion to one NTU performer.
+- `--fit-shapes-only` fits/writes performer beta cache, then stops before pose fitting.
+- `--force` recomputes existing outputs and shape cache entries.
+
+The generated `.npz` can be fed directly into the existing BSM pipeline:
+
+```bash
+python scripts/run_amass_to_bsm_csv.py \
+  --input data/ntu_smplx_npz/S001C001P001R001A001.npz \
+  --trial S001C001P001R001A001 \
+  --output-dir outputs/ntu_bsm \
+  --smplx-model-dir model/smpl \
+  --bsm-model model/bsm/bsm.osim \
+  --addbio-root "$HOME/AddBiomechanics" \
+  --id-grf-mode estimated \
+  --cleanup-intermediate
+```
+
+## NTU SLURM Batch Runner
+
+Preferred HPC mode is one SLURM array task per NTU performer:
+
+```bash
+python scripts/run_ntu_skeleton_batch_slurm.py submit-subjects \
+  --input-root data/ntu \
+  --output-dir data/ntu_smplx_npz \
+  --smplx-model-dir model/smpl \
+  --python-exe python \
+  --slurm-setup-cmd 'source "$HOME/miniconda3/etc/profile.d/conda.sh"' \
+  --slurm-setup-cmd 'conda activate opensim-torque' \
+  --slurm-array-parallelism 32 \
+  --submit
+```
+
+What `submit-subjects` does:
+
+- groups input files by NTU performer key (`P001`, `P002`, ...)
+- launches one SLURM array task per performer
+- inside each task, fits one common SMPL-X shape/beta vector for that performer
+- converts all that performer's `.skeleton` files to `.npz`
+- writes logs under `data/ntu_smplx_npz/logs/`
+- writes SLURM manifests and result JSON files under `data/ntu_smplx_npz/slurm/`
+
+This is usually cleaner than one job per file because each performer gets a shared shape estimate before pose fitting.
+
+Dry run:
+
+```bash
+python scripts/run_ntu_skeleton_batch_slurm.py submit-subjects \
+  --input-root data/ntu \
+  --output-dir data/ntu_smplx_npz \
+  --smplx-model-dir model/smpl \
+  --limit 1 \
+  --dry-run
+```
+
+Constrain the job to a specific node:
+
+```bash
+python scripts/run_ntu_skeleton_batch_slurm.py submit-subjects \
+  --input-root data/ntu \
+  --output-dir data/ntu_smplx_npz \
+  --smplx-model-dir model/smpl \
+  --slurm-node node001 \
+  --slurm-array-parallelism 32 \
+  --slurm-setup-cmd 'source "$HOME/miniconda3/etc/profile.d/conda.sh"' \
+  --slurm-setup-cmd 'conda activate opensim-torque' \
+  --submit
+```
+
+`--slurm-node node001` is an alias for `--slurm-nodelist node001` and writes `#SBATCH -w node001`.
+
+Alternative two-step mode:
+
+```bash
+python scripts/run_ntu_skeleton_batch_slurm.py prefit-shapes \
+  --input-root data/ntu \
+  --output-dir data/ntu_smplx_npz \
+  --smplx-model-dir model/smpl \
+  --python-exe python
+
+python scripts/run_ntu_skeleton_batch_slurm.py submit \
+  --input-root data/ntu \
+  --output-dir data/ntu_smplx_npz \
+  --smplx-model-dir model/smpl \
+  --python-exe python \
+  --slurm-setup-cmd 'source "$HOME/miniconda3/etc/profile.d/conda.sh"' \
+  --slurm-setup-cmd 'conda activate opensim-torque' \
+  --slurm-array-parallelism 32 \
+  --submit
+```
+
+Use this only if you explicitly want global prefit first and then one array task per file.
+
+## HumanML3D 52-Joint to SMPL-X `.npz`
+
+For HumanML3D, use the `joints/` folder, not `new_joint_vecs/`. The `joints/*.npy` files have shape `(T, 52, 3)` and provide the richest direct joint target.
+
+```bash
+python scripts/convert_humanml3d_joints_to_smplx_npz.py \
+  --input data/HumanML3D/joints/000000.npy \
+  --output-dir data/humanml3d_smplx_npz \
+  --smplx-model-dir model/smpl \
+  --target-frame z-up
+```
+
+Output example:
+
+- `data/humanml3d_smplx_npz/000000.npz`
+
+The generated `.npz` contains `trans`, `root_orient`, `pose_body`, `pose_hand`, `pose_jaw`, `pose_eye`, `betas`, `gender`, and `mocap_frame_rate`, so it can be passed to `run_amass_to_bsm_csv.py`:
+
+```bash
+python scripts/run_amass_to_bsm_csv.py \
+  --input data/humanml3d_smplx_npz/000000.npz \
+  --trial humanml3d_000000 \
+  --output-dir outputs/humanml3d_bsm \
+  --smplx-model-dir model/smpl \
+  --bsm-model model/bsm/bsm.osim \
+  --addbio-root "$HOME/AddBiomechanics" \
+  --id-grf-mode estimated \
+  --cleanup-intermediate
+```
 
 ## Batch Parallel Runner
 
@@ -233,6 +414,8 @@ GRF values are explicitly encoded with zeros when no contact is detected, so CSV
 
 ## Pipeline Summary
 
+For native AMASS input:
+
 1. Load AMASS (`SMPL-X`) from `.npz`.
 2. Run SMPL-X forward pass.
 3. Extract BSM virtual markers from SMPL-X vertices.
@@ -243,6 +426,22 @@ GRF values are explicitly encoded with zeros when no contact is detected, so CSV
 8. Estimate contact wrenches/GRF from motion.
 9. Run inverse dynamics in OpenSim.
 10. Merge kinematics + torques + GRF/contact into one final CSV.
+
+For NTU input, prepend:
+
+1. Read NTU RGB+D `.skeleton` 25-joint tracks.
+2. Convert raw NTU Y-up camera coordinates to Z-up world coordinates.
+3. Fit SMPL-X `betas` from metric segment lengths.
+4. Fit SMPL-X root/body pose over time.
+5. Export AMASS-like `.npz`, then run the same AMASS/BSM pipeline above.
+
+For HumanML3D `joints/*.npy` input, prepend:
+
+1. Read HumanML3D 52-joint SMPL/SMPL-H-style positions.
+2. Convert HumanML3D Y-up coordinates to Z-up world coordinates.
+3. Fit SMPL-X `betas` from 52-joint segment lengths.
+4. Fit SMPL-X root, body, and hand pose over time.
+5. Export AMASS-like `.npz`, then run the same AMASS/BSM pipeline above.
 
 ## Key CLI Options
 

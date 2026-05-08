@@ -47,6 +47,19 @@ NTU_JOINT_NAMES = (
     "thumb_r",
 )
 
+NTU_LEFT_RIGHT_PAIRS = (
+    (4, 8),
+    (5, 9),
+    (6, 10),
+    (7, 11),
+    (12, 16),
+    (13, 17),
+    (14, 18),
+    (15, 19),
+    (21, 23),
+    (22, 24),
+)
+
 # SMPL-X joint indices follow the standard SMPL body prefix used by smplx.
 SMPLX_BODY_JOINTS = {
     "pelvis": 0,
@@ -320,6 +333,27 @@ def transform_joints_to_target_frame(joints: np.ndarray, target_frame: str) -> n
     return transformed
 
 
+def swap_ntu_left_right(joints: np.ndarray) -> np.ndarray:
+    swapped = joints.astype(np.float32, copy=True)
+    for left_idx, right_idx in NTU_LEFT_RIGHT_PAIRS:
+        left = swapped[:, left_idx, :].copy()
+        swapped[:, left_idx, :] = swapped[:, right_idx, :]
+        swapped[:, right_idx, :] = left
+    return swapped
+
+
+def maybe_swap_track_left_right(track: NTUTrack, swap_left_right: bool) -> NTUTrack:
+    if not swap_left_right:
+        return track
+    swapped_joints = swap_ntu_left_right(track.joints)
+    swapped_tracking = track.tracking.copy()
+    for left_idx, right_idx in NTU_LEFT_RIGHT_PAIRS:
+        left = swapped_tracking[:, left_idx].copy()
+        swapped_tracking[:, left_idx] = swapped_tracking[:, right_idx]
+        swapped_tracking[:, right_idx] = left
+    return NTUTrack(body_id=track.body_id, joints=swapped_joints, tracking=swapped_tracking)
+
+
 def transform_track_to_target_frame(track: NTUTrack, target_frame: str) -> NTUTrack:
     return track.copy_with_joints(transform_joints_to_target_frame(track.joints, target_frame))
 
@@ -559,6 +593,39 @@ def _second_difference_loss(torch, value) -> object:
     return torch.mean(diff2**2)
 
 
+def _axis_angle_to_matrix(torch, rotvec):
+    angle = torch.linalg.norm(rotvec, dim=1, keepdim=True).clamp_min(1e-8)
+    axis = rotvec / angle
+    x, y, z = axis[:, 0], axis[:, 1], axis[:, 2]
+    zeros = torch.zeros_like(x)
+    k = torch.stack(
+        [
+            zeros,
+            -z,
+            y,
+            z,
+            zeros,
+            -x,
+            -y,
+            x,
+            zeros,
+        ],
+        dim=1,
+    ).reshape(-1, 3, 3)
+    eye = torch.eye(3, dtype=rotvec.dtype, device=rotvec.device).unsqueeze(0)
+    sin = torch.sin(angle).reshape(-1, 1, 1)
+    cos = torch.cos(angle).reshape(-1, 1, 1)
+    return eye + sin * k + (1.0 - cos) * torch.bmm(k, k)
+
+
+def _root_up_loss(torch, root_orient, target_frame: str):
+    matrices = _axis_angle_to_matrix(torch, root_orient)
+    local_up = matrices[:, :, 1]
+    target = torch.zeros_like(local_up)
+    target[:, target_frame_up_axis(target_frame)] = 1.0
+    return torch.mean((local_up - target) ** 2)
+
+
 def fit_pose_sequence(
     track: NTUTrack,
     betas_np: np.ndarray,
@@ -569,6 +636,7 @@ def fit_pose_sequence(
     iterations: int,
     lr: float,
     pose_prior_weight: float,
+    root_up_prior_weight: float,
     temporal_smooth_weight: float,
     floor_prior_weight: float,
     target_frame: str,
@@ -648,6 +716,7 @@ def fit_pose_sequence(
         joint_loss = torch.sum(weights * err) / torch.clamp(torch.sum(weights), min=1.0)
         loss = joint_loss
         loss = loss + float(pose_prior_weight) * torch.mean(body_pose**2)
+        loss = loss + float(root_up_prior_weight) * _root_up_loss(torch, root_orient, target_frame)
         loss = loss + float(temporal_smooth_weight) * (
             _second_difference_loss(torch, body_pose)
             + 0.2 * _second_difference_loss(torch, root_orient)
@@ -746,6 +815,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "this repo's BSM/Nimble gravity; y-up preserves raw NTU vertical."
         ),
     )
+    parser.add_argument(
+        "--swap-left-right",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Swap NTU left/right body labels before fitting. Default true because "
+            "NTU skeleton x-axis labels are mirrored relative to SMPL-X in the sample files."
+        ),
+    )
     parser.add_argument("--recursive", action="store_true")
     parser.add_argument(
         "--performer",
@@ -764,12 +842,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shape-cache-dir", type=Path, default=None)
     parser.add_argument("--shape-iters", type=int, default=300)
     parser.add_argument("--shape-lr", type=float, default=0.04)
-    parser.add_argument("--shape-beta-prior-weight", type=float, default=0.01)
+    parser.add_argument("--shape-beta-prior-weight", type=float, default=0.2)
     parser.add_argument("--shape-max-sequences-per-performer", type=int, default=20)
-    parser.add_argument("--pose-iters", type=int, default=220)
+    parser.add_argument("--pose-iters", type=int, default=900)
     parser.add_argument("--pose-lr", type=float, default=0.035)
-    parser.add_argument("--pose-prior-weight", type=float, default=0.001)
-    parser.add_argument("--temporal-smooth-weight", type=float, default=0.08)
+    parser.add_argument("--pose-prior-weight", type=float, default=0.05)
+    parser.add_argument("--root-up-prior-weight", type=float, default=10.0)
+    parser.add_argument("--temporal-smooth-weight", type=float, default=0.12)
     parser.add_argument("--floor-prior-weight", type=float, default=2.0)
     parser.add_argument(
         "--summary-json",
@@ -780,14 +859,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def collect_shape_records(files: Iterable[Path], actor_mode: str, max_per_performer: int) -> dict[str, list[dict[str, float]]]:
+def collect_shape_records(
+    files: Iterable[Path],
+    actor_mode: str,
+    max_per_performer: int,
+    swap_left_right: bool,
+) -> dict[str, list[dict[str, float]]]:
     records: dict[str, list[dict[str, float]]] = {}
     for path in files:
         for selected in select_tracks(path, actor_mode=actor_mode):
+            track = maybe_swap_track_left_right(selected.track, swap_left_right)
             bucket = records.setdefault(selected.shape_key, [])
             if len(bucket) >= int(max_per_performer):
                 continue
-            lengths = collect_segment_lengths(selected.track)
+            lengths = collect_segment_lengths(track)
             if lengths:
                 bucket.append(lengths)
     return records
@@ -866,6 +951,7 @@ def run_conversion(args: argparse.Namespace) -> dict[str, object]:
         files=files,
         actor_mode=args.actor_mode,
         max_per_performer=args.shape_max_sequences_per_performer,
+        swap_left_right=args.swap_left_right,
     )
     aggregated_shape_targets = {
         shape_key: aggregate_shape_targets(records) for shape_key, records in shape_records.items()
@@ -888,6 +974,7 @@ def run_conversion(args: argparse.Namespace) -> dict[str, object]:
             "actor_mode": args.actor_mode,
             "performer_filter": sorted(performer_filter),
             "target_frame": args.target_frame,
+            "swap_left_right": bool(args.swap_left_right),
             "num_files": len(files),
             "num_shape_keys": len(aggregated_shape_targets),
             "shape_keys": sorted(aggregated_shape_targets.keys()),
@@ -905,7 +992,8 @@ def run_conversion(args: argparse.Namespace) -> dict[str, object]:
     for path in files:
         try:
             for selected in select_tracks(path, actor_mode=args.actor_mode):
-                target_track = transform_track_to_target_frame(selected.track, args.target_frame)
+                source_track = maybe_swap_track_left_right(selected.track, args.swap_left_right)
+                target_track = transform_track_to_target_frame(source_track, args.target_frame)
                 selected_for_output = SelectedTrack(
                     source_path=selected.source_path,
                     metadata=selected.metadata,
@@ -930,6 +1018,7 @@ def run_conversion(args: argparse.Namespace) -> dict[str, object]:
                     iterations=args.pose_iters,
                     lr=args.pose_lr,
                     pose_prior_weight=args.pose_prior_weight,
+                    root_up_prior_weight=args.root_up_prior_weight,
                     temporal_smooth_weight=args.temporal_smooth_weight,
                     floor_prior_weight=args.floor_prior_weight,
                     target_frame=args.target_frame,
@@ -937,9 +1026,10 @@ def run_conversion(args: argparse.Namespace) -> dict[str, object]:
                 diagnostics = {
                     **fit_diag,
                     "target_frame": args.target_frame,
-                    "shape_key": shape_key,
-                    "shape_cache_hit": bool(shape_cache_hits.get(shape_key, False)),
-                    "valid_frames": target_track.valid_frames,
+                        "shape_key": shape_key,
+                        "shape_cache_hit": bool(shape_cache_hits.get(shape_key, False)),
+                        "swap_left_right": bool(args.swap_left_right),
+                        "valid_frames": target_track.valid_frames,
                     "body_id": target_track.body_id,
                     "body_rank": selected.body_rank,
                 }
@@ -975,6 +1065,7 @@ def run_conversion(args: argparse.Namespace) -> dict[str, object]:
         "actor_mode": args.actor_mode,
         "performer_filter": sorted(performer_filter),
         "target_frame": args.target_frame,
+        "swap_left_right": bool(args.swap_left_right),
         "frame_rate_hz": float(args.frame_rate),
         "num_files": len(files),
         "num_converted": len(converted),

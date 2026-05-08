@@ -144,6 +144,7 @@ def _build_converter_cmd(args: argparse.Namespace, converter_script: Path, task:
         args.actor_mode,
         "--target-frame",
         args.target_frame,
+        "--swap-left-right" if args.swap_left_right else "--no-swap-left-right",
         "--num-betas",
         str(args.num_betas),
         "--shape-cache-dir",
@@ -162,6 +163,8 @@ def _build_converter_cmd(args: argparse.Namespace, converter_script: Path, task:
         str(args.pose_lr),
         "--pose-prior-weight",
         str(args.pose_prior_weight),
+        "--root-up-prior-weight",
+        str(args.root_up_prior_weight),
         "--temporal-smooth-weight",
         str(args.temporal_smooth_weight),
         "--floor-prior-weight",
@@ -192,6 +195,7 @@ def _build_shape_prefit_cmd(args: argparse.Namespace, converter_script: Path, in
         args.actor_mode,
         "--target-frame",
         args.target_frame,
+        "--swap-left-right" if args.swap_left_right else "--no-swap-left-right",
         "--num-betas",
         str(args.num_betas),
         "--shape-cache-dir",
@@ -243,6 +247,7 @@ def _build_subject_converter_cmd(
         args.actor_mode,
         "--target-frame",
         args.target_frame,
+        "--swap-left-right" if args.swap_left_right else "--no-swap-left-right",
         "--performer",
         task.performer_key,
         "--recursive",
@@ -264,6 +269,8 @@ def _build_subject_converter_cmd(
         str(args.pose_lr),
         "--pose-prior-weight",
         str(args.pose_prior_weight),
+        "--root-up-prior-weight",
+        str(args.root_up_prior_weight),
         "--temporal-smooth-weight",
         str(args.temporal_smooth_weight),
         "--floor-prior-weight",
@@ -683,15 +690,17 @@ def _add_common_converter_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--frame-rate", type=float, default=30.0)
     parser.add_argument("--actor-mode", choices=["primary", "all"], default="primary")
     parser.add_argument("--target-frame", choices=["z-up", "y-up"], default="z-up")
+    parser.add_argument("--swap-left-right", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--num-betas", type=int, default=16)
     parser.add_argument("--shape-iters", type=int, default=300)
     parser.add_argument("--shape-lr", type=float, default=0.04)
-    parser.add_argument("--shape-beta-prior-weight", type=float, default=0.01)
+    parser.add_argument("--shape-beta-prior-weight", type=float, default=0.2)
     parser.add_argument("--shape-max-sequences-per-performer", type=int, default=20)
-    parser.add_argument("--pose-iters", type=int, default=220)
+    parser.add_argument("--pose-iters", type=int, default=900)
     parser.add_argument("--pose-lr", type=float, default=0.035)
-    parser.add_argument("--pose-prior-weight", type=float, default=0.001)
-    parser.add_argument("--temporal-smooth-weight", type=float, default=0.08)
+    parser.add_argument("--pose-prior-weight", type=float, default=0.05)
+    parser.add_argument("--root-up-prior-weight", type=float, default=10.0)
+    parser.add_argument("--temporal-smooth-weight", type=float, default=0.12)
     parser.add_argument("--floor-prior-weight", type=float, default=2.0)
 
 
