@@ -21,6 +21,7 @@ Additional NTU entrypoints:
 - [convert_ntu_skeleton_to_smplx_npz.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/convert_ntu_skeleton_to_smplx_npz.py): converts NTU RGB+D `.skeleton` files to AMASS-like SMPL-X `.npz`.
 - [run_ntu_skeleton_batch_slurm.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/run_ntu_skeleton_batch_slurm.py): SLURM helper for NTU `.skeleton -> .npz` conversion.
 - [convert_humanml3d_joints_to_smplx_npz.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/convert_humanml3d_joints_to_smplx_npz.py): fits SMPL-X params from HumanML3D `joints/*.npy` 52-joint files.
+- [run_humanml3d_joints_batch_slurm.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/run_humanml3d_joints_batch_slurm.py): SLURM helper for HumanML3D `joints/*.npy -> .npz` conversion.
 
 ## Required Inputs and Assets
 
@@ -41,6 +42,7 @@ NTU compatibility note:
 - NTU RGB+D `.skeleton` files contain 25 3D joints in camera coordinates.
 - The NTU converter fits an AMASS-like SMPL-X parameter file with `trans`, `root_orient`, `pose_body`, zero hand/face pose, `betas`, `gender`, `mocap_frame_rate`, and NTU metadata.
 - Raw NTU skeletons are treated as Y-up; by default the converter exports **Z-up** motion (`--target-frame z-up`) to match this repo's BSM/Nimble/OpenSim gravity convention.
+- NTU left/right labels are swapped by default before fitting (`--swap-left-right`) because the sample files are mirrored relative to the SMPL-X left/right convention.
 - Subject size is handled by fitting SMPL-X `betas` from metric 3D limb lengths.
 
 HumanML3D compatibility note:
@@ -177,6 +179,7 @@ Important options:
 - `--actor-mode primary` keeps the main tracked body per file.
 - `--actor-mode all` exports additional tracked bodies as `_bodyXX`.
 - `--performer P001` filters conversion to one NTU performer.
+- `--swap-left-right` is enabled by default; use `--no-swap-left-right` only when visual inspection shows the source skeleton already matches SMPL-X left/right.
 - `--fit-shapes-only` fits/writes performer beta cache, then stops before pose fitting.
 - `--force` recomputes existing outputs and shape cache entries.
 
@@ -285,6 +288,27 @@ python scripts/convert_humanml3d_joints_to_smplx_npz.py \
 Output example:
 
 - `data/humanml3d_smplx_npz/000000.npz`
+
+On HPC/SLURM, submit the full `joints/` folder with:
+
+```bash
+python scripts/run_humanml3d_joints_batch_slurm.py submit \
+  --input-root data/HumanML3D \
+  --output-dir data/humanml3d_smplx_npz \
+  --smplx-model-dir model/smpl \
+  --python-exe python \
+  --slurm-setup-cmd 'source "$HOME/miniconda3/etc/profile.d/conda.sh"' \
+  --slurm-setup-cmd 'conda activate opensim-torque' \
+  --slurm-array-parallelism 32 \
+  --submit
+```
+
+The script automatically uses `--input-root/joints` when that folder exists. It writes:
+
+- `data/humanml3d_smplx_npz/slurm/manifest.jsonl`
+- `data/humanml3d_smplx_npz/slurm/run_humanml3d_joints_to_npz.sbatch`
+- `data/humanml3d_smplx_npz/slurm/results/task_*.json`
+- per-file logs under `data/humanml3d_smplx_npz/logs/`
 
 The generated `.npz` contains `trans`, `root_orient`, `pose_body`, `pose_hand`, `pose_jaw`, `pose_eye`, `betas`, `gender`, and `mocap_frame_rate`, so it can be passed to `run_amass_to_bsm_csv.py`:
 
