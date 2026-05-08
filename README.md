@@ -297,16 +297,21 @@ python scripts/run_humanml3d_joints_batch_slurm.py submit \
   --output-dir data/humanml3d_smplx_npz \
   --smplx-model-dir model/smpl \
   --python-exe python \
+  --slurm-nodelist 'node[001-002],blade[010-012]' \
   --slurm-setup-cmd 'source "$HOME/miniconda3/etc/profile.d/conda.sh"' \
   --slurm-setup-cmd 'conda activate opensim-torque' \
+  --slurm-max-array-size 1000 \
   --slurm-array-parallelism 32 \
   --submit
 ```
 
-The script automatically uses `--input-root/joints` when that folder exists. It writes:
+The script automatically uses `--input-root/joints` when that folder exists. For large datasets, for example 17k HumanML3D files, it follows the same scheduling pattern as `run_amass_batch_slurm.py`: it splits the task list into multiple SLURM array chunks with `--slurm-max-array-size` (default `1000`) and submits them one at a time with retry/backoff. Use `--slurm-nodelist` or the alias `--slurm-node` to constrain execution to a node or node range.
+
+It writes:
 
 - `data/humanml3d_smplx_npz/slurm/manifest.jsonl`
 - `data/humanml3d_smplx_npz/slurm/run_humanml3d_joints_to_npz.sbatch`
+- additional chunk scripts such as `run_humanml3d_joints_to_npz_0001.sbatch` when needed
 - `data/humanml3d_smplx_npz/slurm/results/task_*.json`
 - per-file logs under `data/humanml3d_smplx_npz/logs/`
 

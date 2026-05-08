@@ -20,6 +20,14 @@ class BatchTask:
     log_path: Path
 
 
+@dataclass(frozen=True)
+class SbatchChunk:
+    script_path: Path
+    sbatch_cmd: list[str]
+    task_index_offset: int
+    task_count: int
+
+
 def _resolve_submit_path(raw: str | Path) -> Path:
     path = Path(os.path.expandvars(str(raw))).expanduser()
     if path.is_absolute():
@@ -165,15 +173,29 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
-def _write_sbatch_script(args: argparse.Namespace, output_root: Path, manifest_path: Path, task_count: int) -> Path:
+def _write_sbatch_script(
+    args: argparse.Namespace,
+    output_root: Path,
+    manifest_path: Path,
+    task_count: int,
+    task_index_offset: int = 0,
+    chunk_index: int = 0,
+) -> SbatchChunk:
     repo_root = Path(__file__).resolve().parents[1]
     slurm_root = output_root / "slurm"
-    log_dir = slurm_root / "logs"
+    log_dir = Path(args.slurm_log_dir).resolve() if args.slurm_log_dir else (slurm_root / "logs").resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
-    script_path = slurm_root / "run_humanml3d_joints_to_npz.sbatch"
+    script_name = (
+        "run_humanml3d_joints_to_npz.sbatch"
+        if chunk_index == 0
+        else f"run_humanml3d_joints_to_npz_{chunk_index:04d}.sbatch"
+    )
+    script_path = slurm_root / script_name
 
     array_spec = f"0-{task_count - 1}"
     if args.slurm_array_parallelism is not None:
+        if args.slurm_array_parallelism < 1:
+            raise ValueError("--slurm-array-parallelism must be >= 1")
         array_spec = f"{array_spec}%{args.slurm_array_parallelism}"
 
     worker_cmd = [
@@ -182,6 +204,8 @@ def _write_sbatch_script(args: argparse.Namespace, output_root: Path, manifest_p
         "worker",
         "--manifest",
         str(manifest_path),
+        "--task-index-offset",
+        str(task_index_offset),
     ]
     if args.skip_existing:
         worker_cmd.append("--skip-existing")
@@ -214,6 +238,17 @@ def _write_sbatch_script(args: argparse.Namespace, output_root: Path, manifest_p
             "unset PYTHONPATH",
             "export PYTHONNOUSERSITE=1",
             "export KMP_DUPLICATE_LIB_OK=TRUE",
+            'if [[ -n "${CONDA_PREFIX:-}" ]]; then',
+            '  PY_BIN="$(command -v python || true)"',
+            '  case "$PY_BIN" in',
+            '    "$CONDA_PREFIX"/*) ;;',
+            '    *)',
+            '      echo "ERROR: python does not come from active CONDA_PREFIX=$CONDA_PREFIX";',
+            '      echo "Resolved python: $PY_BIN";',
+            "      exit 2;",
+            "      ;;",
+            "  esac",
+            "fi",
             "export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}",
             "export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}",
             "export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}",
@@ -222,7 +257,85 @@ def _write_sbatch_script(args: argparse.Namespace, output_root: Path, manifest_p
     )
     script_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     script_path.chmod(0o755)
-    return script_path
+    return SbatchChunk(
+        script_path=script_path,
+        sbatch_cmd=["sbatch", str(script_path)],
+        task_index_offset=task_index_offset,
+        task_count=task_count,
+    )
+
+
+def _build_sbatch_chunks(
+    args: argparse.Namespace,
+    output_root: Path,
+    manifest_path: Path,
+    task_count: int,
+) -> list[SbatchChunk]:
+    max_array_size = args.slurm_max_array_size
+    if max_array_size is not None and max_array_size < 1:
+        raise ValueError("--slurm-max-array-size must be >= 1")
+
+    chunk_size = task_count
+    if max_array_size is not None:
+        chunk_size = min(task_count, max_array_size)
+
+    chunks: list[SbatchChunk] = []
+    task_index_offset = 0
+    chunk_index = 0
+    while task_index_offset < task_count:
+        current_task_count = min(chunk_size, task_count - task_index_offset)
+        chunks.append(
+            _write_sbatch_script(
+                args=args,
+                output_root=output_root,
+                manifest_path=manifest_path,
+                task_count=current_task_count,
+                task_index_offset=task_index_offset,
+                chunk_index=chunk_index,
+            )
+        )
+        task_index_offset += current_task_count
+        chunk_index += 1
+    return chunks
+
+
+def _should_retry_sbatch(stderr_text: str) -> bool:
+    msg = (stderr_text or "").lower()
+    return (
+        "temporarily unable to accept job" in msg
+        or "resource temporarily unavailable" in msg
+        or "socket timed out" in msg
+        or "connection timed out" in msg
+    )
+
+
+def _submit_chunk_with_retry(
+    chunk: SbatchChunk,
+    retries: int,
+    initial_sleep_s: float,
+) -> tuple[subprocess.CompletedProcess[str], int]:
+    attempts = 0
+    sleep_s = max(0.1, float(initial_sleep_s))
+    while True:
+        result = subprocess.run(
+            chunk.sbatch_cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return result, attempts
+        if attempts >= retries:
+            return result, attempts
+        if not _should_retry_sbatch(result.stderr):
+            return result, attempts
+        attempts += 1
+        print(
+            f"Transient sbatch failure for chunk offset={chunk.task_index_offset} "
+            f"(attempt {attempts}/{retries}). Retrying in {sleep_s:.1f}s..."
+        )
+        time.sleep(sleep_s)
+        sleep_s = min(sleep_s * 2.0, 60.0)
 
 
 def _submit(args: argparse.Namespace) -> int:
@@ -243,6 +356,11 @@ def _submit(args: argparse.Namespace) -> int:
             skipped += 1
         else:
             runnable.append(task)
+    pending_before_cap = len(runnable)
+    if args.max_submit_tasks is not None:
+        if args.max_submit_tasks < 1:
+            raise ValueError("--max-submit-tasks must be >= 1")
+        runnable = runnable[: args.max_submit_tasks]
 
     output_root.mkdir(parents=True, exist_ok=True)
     manifest_path = output_root / "slurm" / "manifest.jsonl"
@@ -257,6 +375,7 @@ def _submit(args: argparse.Namespace) -> int:
         "converter_script": str(converter_script),
         "total_discovered": len(tasks),
         "skipped_existing": skipped,
+        "pending_before_cap": pending_before_cap,
         "scheduled_tasks": len(runnable),
         "manifest_path": str(manifest_path),
         "submitted": False,
@@ -265,6 +384,9 @@ def _submit(args: argparse.Namespace) -> int:
     print(f"Scan root: {scan_root}")
     print(f"Found .npy: {len(tasks)}")
     print(f"Skip existing npz: {skipped}")
+    if args.max_submit_tasks is not None:
+        print(f"Max tasks per submit: {args.max_submit_tasks}")
+    print(f"Total pending before cap: {pending_before_cap}")
     print(f"Scheduled: {len(runnable)}")
     print(f"Manifest: {manifest_path}")
     if not runnable:
@@ -272,13 +394,27 @@ def _submit(args: argparse.Namespace) -> int:
         print("Nothing to submit.")
         return 0
 
-    sbatch_path = _write_sbatch_script(args, output_root, manifest_path, len(runnable))
-    sbatch_cmd = ["sbatch", str(sbatch_path)]
-    plan["sbatch_script"] = str(sbatch_path)
-    plan["sbatch_command"] = sbatch_cmd
+    sbatch_chunks = _build_sbatch_chunks(args, output_root, manifest_path, len(runnable))
+    sbatch_paths = [str(chunk.script_path) for chunk in sbatch_chunks]
+    sbatch_cmds = [chunk.sbatch_cmd for chunk in sbatch_chunks]
+    plan["sbatch_script"] = sbatch_paths[0]
+    plan["sbatch_command"] = sbatch_cmds[0]
+    plan["sbatch_scripts"] = sbatch_paths
+    plan["sbatch_commands"] = sbatch_cmds
+    plan["sbatch_chunk_count"] = len(sbatch_chunks)
     _write_json(output_root / "slurm" / "submit_plan.json", plan)
-    print(f"SBATCH: {sbatch_path}")
-    print(f"Command: {shlex.join(sbatch_cmd)}")
+    if len(sbatch_chunks) == 1:
+        print(f"SBATCH: {sbatch_chunks[0].script_path}")
+        print(f"Command: {shlex.join(sbatch_chunks[0].sbatch_cmd)}")
+    else:
+        print(f"SBATCH scripts: {len(sbatch_chunks)} chunks")
+        for chunk in sbatch_chunks[:5]:
+            print(
+                f"  chunk offset={chunk.task_index_offset} count={chunk.task_count}: "
+                f"{shlex.join(chunk.sbatch_cmd)}"
+            )
+        if len(sbatch_chunks) > 5:
+            print(f"  ... {len(sbatch_chunks) - 5} more chunks")
 
     if args.dry_run:
         for task in runnable[:5]:
@@ -288,16 +424,45 @@ def _submit(args: argparse.Namespace) -> int:
         print("Add --submit to launch.")
         return 0
 
-    result = subprocess.run(sbatch_cmd, capture_output=True, text=True, check=False)
-    if result.stdout.strip():
-        print(result.stdout.strip())
-    if result.stderr.strip():
-        print(result.stderr.strip())
-    plan["submitted"] = result.returncode == 0
-    plan["sbatch_stdout"] = result.stdout.strip()
-    plan["sbatch_stderr"] = result.stderr.strip()
+    submission_results: list[dict[str, object]] = []
+    all_ok = True
+    combined_stdout: list[str] = []
+    combined_stderr: list[str] = []
+    for chunk in sbatch_chunks:
+        result, retries_used = _submit_chunk_with_retry(
+            chunk=chunk,
+            retries=args.sbatch_retries,
+            initial_sleep_s=args.sbatch_retry_sleep_s,
+        )
+        if result.stdout.strip():
+            print(result.stdout.strip())
+            combined_stdout.append(result.stdout.strip())
+        if result.stderr.strip():
+            print(result.stderr.strip())
+            combined_stderr.append(result.stderr.strip())
+        submission_results.append(
+            {
+                "script_path": str(chunk.script_path),
+                "sbatch_command": chunk.sbatch_cmd,
+                "task_index_offset": chunk.task_index_offset,
+                "task_count": chunk.task_count,
+                "retry_count": retries_used,
+                "returncode": result.returncode,
+                "stdout": result.stdout.strip(),
+                "stderr": result.stderr.strip(),
+            }
+        )
+        if result.returncode != 0:
+            all_ok = False
+        if args.sbatch_submit_interval_s > 0:
+            time.sleep(args.sbatch_submit_interval_s)
+
+    plan["submitted"] = all_ok
+    plan["sbatch_stdout"] = "\n".join(combined_stdout)
+    plan["sbatch_stderr"] = "\n".join(combined_stderr)
+    plan["sbatch_submission_results"] = submission_results
     _write_json(output_root / "slurm" / "submit_plan.json", plan)
-    return result.returncode
+    return 0 if all_ok else 1
 
 
 def _worker(args: argparse.Namespace) -> int:
@@ -360,6 +525,12 @@ def _add_common_converter_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--converter-script", default=None)
     parser.add_argument("--python-exe", default=sys.executable)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--max-submit-tasks",
+        type=int,
+        default=None,
+        help="Optional cap on number of pending tasks to schedule in this submit call.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true", help="Forward --force to converter.")
 
@@ -388,12 +559,50 @@ def _add_submit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--slurm-job-name", default="humanml3d_smplx")
     parser.add_argument("--slurm-partition", default=None)
     parser.add_argument("--slurm-account", default=None)
-    parser.add_argument("--slurm-nodelist", "--slurm-node", dest="slurm_nodelist", default=None)
+    parser.add_argument(
+        "--slurm-nodelist",
+        "--slurm-node",
+        dest="slurm_nodelist",
+        default=None,
+        help=(
+            "Optional subset of nodes to use, passed through to SBATCH as '-w'. "
+            "Example: 'node[001-002],blade[010-012]'."
+        ),
+    )
     parser.add_argument("--slurm-time", default="08:00:00")
     parser.add_argument("--slurm-cpus-per-task", type=int, default=4)
     parser.add_argument("--slurm-mem", default="16G")
     parser.add_argument("--slurm-gres", default=None, help="Optional SLURM --gres, e.g. gpu:1.")
+    parser.add_argument(
+        "--sbatch-retries",
+        type=int,
+        default=6,
+        help="Retry count for transient sbatch submission failures.",
+    )
+    parser.add_argument(
+        "--sbatch-retry-sleep-s",
+        type=float,
+        default=5.0,
+        help="Initial retry sleep in seconds for transient sbatch failures.",
+    )
+    parser.add_argument(
+        "--sbatch-submit-interval-s",
+        type=float,
+        default=1.0,
+        help="Sleep interval between sbatch submissions to avoid overloading the scheduler.",
+    )
+    parser.add_argument(
+        "--slurm-max-array-size",
+        type=int,
+        default=1000,
+        help="Maximum number of tasks per submitted SLURM array chunk.",
+    )
     parser.add_argument("--slurm-array-parallelism", type=int, default=None)
+    parser.add_argument(
+        "--slurm-log-dir",
+        default=None,
+        help="Optional path for SBATCH stdout/stderr logs (default: <output-dir>/slurm/logs).",
+    )
     parser.add_argument("--slurm-python-exe", default=None)
     parser.add_argument("--slurm-setup-cmd", action="append", default=[])
 
