@@ -14,6 +14,7 @@ from convert_ntu_skeleton_to_smplx_npz import (
     TARGET_FRAME_Y_UP,
     TARGET_FRAME_Z_UP,
     _import_torch_and_smplx,
+    _root_up_loss,
     _second_difference_loss,
     resolve_smplx_model_path,
     target_frame_root_init,
@@ -105,6 +106,18 @@ def load_humanml3d_joints(path: Path) -> np.ndarray:
     return joints.astype(np.float32, copy=False)
 
 
+def smooth_joints_temporal(joints: np.ndarray, passes: int) -> np.ndarray:
+    passes = max(0, int(passes))
+    if passes == 0 or joints.shape[0] < 3:
+        return joints.astype(np.float32, copy=True)
+    weights = np.asarray([1.0, 4.0, 6.0, 4.0, 1.0], dtype=np.float32) / 16.0
+    smoothed = joints.astype(np.float32, copy=True)
+    for _ in range(passes):
+        padded = np.pad(smoothed, ((2, 2), (0, 0), (0, 0)), mode="edge")
+        smoothed = sum(float(weights[idx]) * padded[idx : idx + joints.shape[0]] for idx in range(5))
+    return smoothed.astype(np.float32, copy=False)
+
+
 def collect_shape_targets(joints: np.ndarray) -> dict[tuple[int, int, int, int], float]:
     targets: dict[tuple[int, int, int, int], float] = {}
     for human_a, human_b, smplx_a, smplx_b, _weight in SHAPE_SEGMENTS:
@@ -184,6 +197,36 @@ def estimate_floor_height(joints: np.ndarray, up_axis: int) -> float:
     return 0.0 if values.size == 0 else float(np.percentile(values, 2.0))
 
 
+def estimate_foot_contact_weights(joints: np.ndarray, up_axis: int, floor_height: float) -> np.ndarray:
+    foot_indices = [10, 11]
+    heights = joints[:, foot_indices, up_axis].astype(np.float32)
+    rel_height = heights - float(floor_height)
+    contact = np.clip(1.0 - rel_height / 0.10, 0.0, 1.0)
+    if joints.shape[0] >= 3:
+        velocity = np.zeros_like(rel_height)
+        velocity[1:] = np.abs(np.diff(heights, axis=0))
+        contact *= np.clip(1.0 - velocity / 0.04, 0.0, 1.0)
+    return contact.astype(np.float32)
+
+
+def _direction_loss(torch, pred_joints, target_joints, pairs: list[tuple[int, int]]) -> object:
+    losses = []
+    for a, b in pairs:
+        pred_vec = pred_joints[:, b] - pred_joints[:, a]
+        target_vec = target_joints[:, b] - target_joints[:, a]
+        pred_dir = pred_vec / torch.clamp(torch.linalg.norm(pred_vec, dim=1, keepdim=True), min=1e-6)
+        target_dir = target_vec / torch.clamp(torch.linalg.norm(target_vec, dim=1, keepdim=True), min=1e-6)
+        losses.append(torch.mean((pred_dir - target_dir) ** 2))
+    return torch.stack(losses).mean()
+
+
+def _third_difference_loss(torch, value) -> object:
+    if value.shape[0] < 4:
+        return torch.zeros((), dtype=value.dtype, device=value.device)
+    diff3 = value[3:] - 3.0 * value[2:-1] + 3.0 * value[1:-2] - value[:-3]
+    return torch.mean(diff3**2)
+
+
 def fit_pose_sequence_from_humanml3d(
     joints: np.ndarray,
     betas_np: np.ndarray,
@@ -194,8 +237,14 @@ def fit_pose_sequence_from_humanml3d(
     iterations: int,
     lr: float,
     pose_prior_weight: float,
+    root_up_prior_weight: float,
+    torso_frame_prior_weight: float,
     hand_prior_weight: float,
+    fit_hands: bool,
+    foot_flat_prior_weight: float,
     temporal_smooth_weight: float,
+    temporal_joint_smooth_weight: float,
+    temporal_joint_jerk_weight: float,
     floor_prior_weight: float,
     target_frame: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
@@ -204,6 +253,7 @@ def fit_pose_sequence_from_humanml3d(
     n_frames = int(joints.shape[0])
     up_axis = target_frame_up_axis(target_frame)
     floor_height = estimate_floor_height(joints, up_axis)
+    foot_contact_weights_np = estimate_foot_contact_weights(joints, up_axis, floor_height)
 
     model = smplx.create(
         model_path=str(model_path),
@@ -222,12 +272,15 @@ def fit_pose_sequence_from_humanml3d(
     betas = torch.as_tensor(betas_np[:num_betas], dtype=torch.float32, device=device).reshape(1, -1)
     betas = betas.repeat(n_frames, 1)
 
-    human_indices = [item[0] for item in HUMANML3D_TO_SMPLX]
-    smplx_indices = [item[1] for item in HUMANML3D_TO_SMPLX]
-    joint_weights = [item[2] for item in HUMANML3D_TO_SMPLX]
+    mapping = HUMANML3D_TO_SMPLX if fit_hands else tuple(item for item in HUMANML3D_TO_SMPLX if item[0] < 22)
+    human_indices = [item[0] for item in mapping]
+    smplx_indices = [item[1] for item in mapping]
+    joint_weights = [item[2] for item in mapping]
     targets = torch.as_tensor(joints[:, human_indices, :], dtype=torch.float32, device=device)
     weights = torch.as_tensor(joint_weights, dtype=torch.float32, device=device).reshape(1, -1)
     selected = torch.as_tensor(smplx_indices, dtype=torch.long, device=device)
+    foot_contact_weights = torch.as_tensor(foot_contact_weights_np, dtype=torch.float32, device=device)
+    body_targets = torch.as_tensor(joints[:, :22, :], dtype=torch.float32, device=device)
 
     with torch.no_grad():
         root_init = torch.as_tensor(target_frame_root_init(target_frame), dtype=torch.float32, device=device).reshape(1, 3)
@@ -247,24 +300,25 @@ def fit_pose_sequence_from_humanml3d(
 
     root_orient = root_init_batch.detach().clone().requires_grad_(True)
     body_pose = torch.zeros((n_frames, 63), dtype=torch.float32, device=device, requires_grad=True)
-    left_hand_pose = torch.zeros((n_frames, 45), dtype=torch.float32, device=device, requires_grad=True)
-    right_hand_pose = torch.zeros((n_frames, 45), dtype=torch.float32, device=device, requires_grad=True)
+    left_hand_pose = torch.zeros((n_frames, 45), dtype=torch.float32, device=device, requires_grad=fit_hands)
+    right_hand_pose = torch.zeros((n_frames, 45), dtype=torch.float32, device=device, requires_grad=fit_hands)
     transl = transl_init.detach().clone().requires_grad_(True)
     zero_face = {
         "jaw_pose": torch.zeros((n_frames, 3), dtype=torch.float32, device=device),
         "leye_pose": torch.zeros((n_frames, 3), dtype=torch.float32, device=device),
         "reye_pose": torch.zeros((n_frames, 3), dtype=torch.float32, device=device),
     }
-    optimizer = torch.optim.Adam(
-        [
-            {"params": [root_orient, body_pose], "lr": float(lr)},
-            {"params": [left_hand_pose, right_hand_pose], "lr": float(lr) * 0.65},
-            {"params": [transl], "lr": float(lr) * 0.5},
-        ]
-    )
+    optimizer_params = [
+        {"params": [root_orient, body_pose], "lr": float(lr)},
+        {"params": [transl], "lr": float(lr) * 0.5},
+    ]
+    if fit_hands:
+        optimizer_params.insert(1, {"params": [left_hand_pose, right_hand_pose], "lr": float(lr) * 0.65})
+    optimizer = torch.optim.Adam(optimizer_params)
 
     final_joint_error = math.nan
-    for _ in range(max(0, int(iterations))):
+    total_iterations = max(0, int(iterations))
+    for iteration_idx in range(total_iterations):
         optimizer.zero_grad(set_to_none=True)
         out = model(
             betas=betas,
@@ -282,14 +336,57 @@ def fit_pose_sequence_from_humanml3d(
         joint_loss = torch.sum(weighted_err) / torch.clamp(torch.sum(weights.expand_as(err)), min=1.0)
         loss = joint_loss
         loss = loss + float(pose_prior_weight) * torch.mean(body_pose**2)
-        loss = loss + float(hand_prior_weight) * (torch.mean(left_hand_pose**2) + torch.mean(right_hand_pose**2))
+        loss = loss + float(root_up_prior_weight) * _root_up_loss(torch, root_orient, target_frame)
+        if torso_frame_prior_weight > 0.0:
+            loss = loss + float(torso_frame_prior_weight) * _direction_loss(
+                torch,
+                out.joints[:, :22],
+                body_targets,
+                [(1, 2), (13, 14), (16, 17), (0, 3), (3, 6), (6, 9), (9, 12)],
+            )
+        if fit_hands:
+            loss = loss + float(hand_prior_weight) * (torch.mean(left_hand_pose**2) + torch.mean(right_hand_pose**2))
         loss = loss + float(temporal_smooth_weight) * (
             _second_difference_loss(torch, body_pose)
-            + 0.5 * _second_difference_loss(torch, left_hand_pose)
-            + 0.5 * _second_difference_loss(torch, right_hand_pose)
             + 0.2 * _second_difference_loss(torch, root_orient)
             + 2.0 * _second_difference_loss(torch, transl)
         )
+        progress = 1.0 if total_iterations <= 1 else float(iteration_idx) / float(total_iterations - 1)
+        joint_smooth_ramp = min(1.0, max(0.0, (progress - 0.35) / 0.65))
+        if temporal_joint_smooth_weight > 0.0 and joint_smooth_ramp > 0.0:
+            smooth_joints = out.joints[:, :22]
+            loss = loss + (
+                joint_smooth_ramp
+                * float(temporal_joint_smooth_weight)
+                * _second_difference_loss(torch, smooth_joints)
+            )
+        if temporal_joint_jerk_weight > 0.0 and joint_smooth_ramp > 0.0:
+            smooth_joints = out.joints[:, :22]
+            loss = loss + (
+                joint_smooth_ramp
+                * float(temporal_joint_jerk_weight)
+                * _third_difference_loss(torch, smooth_joints)
+            )
+        if fit_hands:
+            loss = loss + float(temporal_smooth_weight) * (
+                0.5 * _second_difference_loss(torch, left_hand_pose)
+                + 0.5 * _second_difference_loss(torch, right_hand_pose)
+            )
+        if foot_flat_prior_weight > 0.0:
+            left_foot = out.joints.index_select(
+                1, torch.as_tensor([10, 60, 61, 62], dtype=torch.long, device=device)
+            )[:, :, up_axis]
+            right_foot = out.joints.index_select(
+                1, torch.as_tensor([11, 63, 64, 65], dtype=torch.long, device=device)
+            )[:, :, up_axis]
+            left_var = torch.mean((left_foot - torch.mean(left_foot, dim=1, keepdim=True)) ** 2, dim=1)
+            right_var = torch.mean((right_foot - torch.mean(right_foot, dim=1, keepdim=True)) ** 2, dim=1)
+            contact_sum = torch.clamp(torch.sum(foot_contact_weights), min=1.0)
+            foot_flat_loss = (
+                torch.sum(foot_contact_weights[:, 0] * left_var)
+                + torch.sum(foot_contact_weights[:, 1] * right_var)
+            ) / contact_sum
+            loss = loss + float(foot_flat_prior_weight) * foot_flat_loss
         if floor_prior_weight > 0.0:
             foot_indices = torch.as_tensor([7, 8, 10, 11], dtype=torch.long, device=device)
             foot_height = out.joints.index_select(1, foot_indices)[:, :, up_axis]
@@ -309,7 +406,11 @@ def fit_pose_sequence_from_humanml3d(
             "weighted_joint_error_m": final_joint_error,
             "floor_height_m": float(floor_height),
             "up_axis": int(up_axis),
-            "fit_joint_count": int(len(HUMANML3D_TO_SMPLX)),
+            "fit_joint_count": int(len(mapping)),
+            "fit_hands": bool(fit_hands),
+            "foot_contact_frames": int(np.sum(np.max(foot_contact_weights_np, axis=1) > 0.1)),
+            "temporal_joint_smooth_weight": float(temporal_joint_smooth_weight),
+            "temporal_joint_jerk_weight": float(temporal_joint_jerk_weight),
         },
     )
 
@@ -319,6 +420,7 @@ def fit_humanml3d(
     args: argparse.Namespace,
 ) -> FitResult:
     target_joints = transform_joints_to_target_frame(joints, args.target_frame)
+    target_joints = smooth_joints_temporal(target_joints, args.input_smooth_passes)
     betas = fit_shape_betas_from_humanml3d(
         joints=target_joints,
         smplx_model_dir=args.smplx_model_dir,
@@ -339,8 +441,14 @@ def fit_humanml3d(
         iterations=args.pose_iters,
         lr=args.pose_lr,
         pose_prior_weight=args.pose_prior_weight,
+        root_up_prior_weight=args.root_up_prior_weight,
+        torso_frame_prior_weight=args.torso_frame_prior_weight,
         hand_prior_weight=args.hand_prior_weight,
+        fit_hands=args.fit_hands,
+        foot_flat_prior_weight=args.foot_flat_prior_weight,
         temporal_smooth_weight=args.temporal_smooth_weight,
+        temporal_joint_smooth_weight=args.temporal_joint_smooth_weight,
+        temporal_joint_jerk_weight=args.temporal_joint_jerk_weight,
         floor_prior_weight=args.floor_prior_weight,
         target_frame=args.target_frame,
     )
@@ -355,6 +463,7 @@ def fit_humanml3d(
             "source_format": "HumanML3D/joints",
             "source_shape": list(joints.shape),
             "target_frame": args.target_frame,
+            "input_smooth_passes": int(args.input_smooth_passes),
         },
     )
 
@@ -400,11 +509,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shape-iters", type=int, default=800)
     parser.add_argument("--shape-lr", type=float, default=0.04)
     parser.add_argument("--shape-beta-prior-weight", type=float, default=0.01)
-    parser.add_argument("--pose-iters", type=int, default=1600)
+    parser.add_argument("--input-smooth-passes", type=int, default=1)
+    parser.add_argument("--pose-iters", type=int, default=2600)
     parser.add_argument("--pose-lr", type=float, default=0.018)
-    parser.add_argument("--pose-prior-weight", type=float, default=0.0005)
-    parser.add_argument("--hand-prior-weight", type=float, default=0.001)
-    parser.add_argument("--temporal-smooth-weight", type=float, default=0.01)
+    parser.add_argument("--pose-prior-weight", type=float, default=0.05)
+    parser.add_argument("--root-up-prior-weight", type=float, default=10.0)
+    parser.add_argument("--torso-frame-prior-weight", type=float, default=2.0)
+    parser.add_argument("--hand-prior-weight", type=float, default=0.01)
+    parser.add_argument(
+        "--fit-hands",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Fit SMPL-X finger pose from HumanML3D 52-joint hands. Disabled by default "
+            "because SMPL-H-to-SMPL-X finger mapping is noisy and can create visual twist."
+        ),
+    )
+    parser.add_argument("--foot-flat-prior-weight", type=float, default=25.0)
+    parser.add_argument("--temporal-smooth-weight", type=float, default=0.03)
+    parser.add_argument("--temporal-joint-smooth-weight", type=float, default=500.0)
+    parser.add_argument("--temporal-joint-jerk-weight", type=float, default=50.0)
     parser.add_argument("--floor-prior-weight", type=float, default=0.5)
     parser.add_argument("--force", action="store_true")
     return parser

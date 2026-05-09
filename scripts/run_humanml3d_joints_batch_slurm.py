@@ -123,16 +123,29 @@ def _build_converter_cmd(args: argparse.Namespace, converter_script: Path, task:
         str(args.shape_lr),
         "--shape-beta-prior-weight",
         str(args.shape_beta_prior_weight),
+        "--input-smooth-passes",
+        str(args.input_smooth_passes),
         "--pose-iters",
         str(args.pose_iters),
         "--pose-lr",
         str(args.pose_lr),
         "--pose-prior-weight",
         str(args.pose_prior_weight),
+        "--root-up-prior-weight",
+        str(args.root_up_prior_weight),
+        "--torso-frame-prior-weight",
+        str(args.torso_frame_prior_weight),
         "--hand-prior-weight",
         str(args.hand_prior_weight),
+        "--fit-hands" if args.fit_hands else "--no-fit-hands",
+        "--foot-flat-prior-weight",
+        str(args.foot_flat_prior_weight),
         "--temporal-smooth-weight",
         str(args.temporal_smooth_weight),
+        "--temporal-joint-smooth-weight",
+        str(args.temporal_joint_smooth_weight),
+        "--temporal-joint-jerk-weight",
+        str(args.temporal_joint_jerk_weight),
         "--floor-prior-weight",
         str(args.floor_prior_weight),
     ]
@@ -543,11 +556,18 @@ def _add_common_converter_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--shape-iters", type=int, default=800)
     parser.add_argument("--shape-lr", type=float, default=0.04)
     parser.add_argument("--shape-beta-prior-weight", type=float, default=0.01)
-    parser.add_argument("--pose-iters", type=int, default=1600)
+    parser.add_argument("--input-smooth-passes", type=int, default=1)
+    parser.add_argument("--pose-iters", type=int, default=2600)
     parser.add_argument("--pose-lr", type=float, default=0.018)
-    parser.add_argument("--pose-prior-weight", type=float, default=0.0005)
-    parser.add_argument("--hand-prior-weight", type=float, default=0.001)
-    parser.add_argument("--temporal-smooth-weight", type=float, default=0.01)
+    parser.add_argument("--pose-prior-weight", type=float, default=0.05)
+    parser.add_argument("--root-up-prior-weight", type=float, default=10.0)
+    parser.add_argument("--torso-frame-prior-weight", type=float, default=2.0)
+    parser.add_argument("--hand-prior-weight", type=float, default=0.01)
+    parser.add_argument("--fit-hands", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--foot-flat-prior-weight", type=float, default=25.0)
+    parser.add_argument("--temporal-smooth-weight", type=float, default=0.03)
+    parser.add_argument("--temporal-joint-smooth-weight", type=float, default=500.0)
+    parser.add_argument("--temporal-joint-jerk-weight", type=float, default=50.0)
     parser.add_argument("--floor-prior-weight", type=float, default=0.5)
 
 

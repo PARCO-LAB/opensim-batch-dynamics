@@ -307,6 +307,8 @@ python scripts/run_humanml3d_joints_batch_slurm.py submit \
 
 The script automatically uses `--input-root/joints` when that folder exists. For large datasets, for example 17k HumanML3D files, it follows the same scheduling pattern as `run_amass_batch_slurm.py`: it splits the task list into multiple SLURM array chunks with `--slurm-max-array-size` (default `1000`) and submits them one at a time with retry/backoff. Use `--slurm-nodelist` or the alias `--slurm-node` to constrain execution to a node or node range.
 
+HumanML3D fitting defaults are conservative for visual stability: `--input-smooth-passes 1`, `--pose-iters 2600`, `--no-fit-hands`, `--root-up-prior-weight 10`, `--torso-frame-prior-weight 2`, `--pose-prior-weight 0.05`, `--temporal-smooth-weight 0.03`, `--temporal-joint-smooth-weight 500`, `--temporal-joint-jerk-weight 50`, and `--foot-flat-prior-weight 25`. The hand fit is disabled by default because the HumanML3D 52-joint hands come from SMPL/SMPL-H-style joints and can create unnatural SMPL-X finger/body twists. The torso-frame prior matches hip, spine, collar, and shoulder directions from the source joints, the joint smooth/jerk priors suppress short flicker bursts, and the foot-flat prior keeps SMPL-X ankle, heel, and toe joints coplanar during detected contact frames.
+
 It writes:
 
 - `data/humanml3d_smplx_npz/slurm/manifest.jsonl`
@@ -469,7 +471,7 @@ For HumanML3D `joints/*.npy` input, prepend:
 1. Read HumanML3D 52-joint SMPL/SMPL-H-style positions.
 2. Convert HumanML3D Y-up coordinates to Z-up world coordinates.
 3. Fit SMPL-X `betas` from 52-joint segment lengths.
-4. Fit SMPL-X root, body, and hand pose over time.
+4. Fit SMPL-X root and body pose over time, with hands neutral by default.
 5. Export AMASS-like `.npz`, then run the same AMASS/BSM pipeline above.
 
 ## Key CLI Options
