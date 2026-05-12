@@ -85,9 +85,9 @@ def _discover_npz_files(input_root: Path) -> list[Path]:
         "male_stagei.npz",
     }
     files = [
-        path
-        for path in input_root.rglob("*.npz")
-        if path.is_file() and path.name.lower() not in excluded_names
+        path for path in input_root.rglob("*.npz") if path.is_file() and path.name.lower() not in excluded_names
+    ] + [
+        path for path in input_root.rglob("*.npy") if path.is_file() and path.name.lower() not in excluded_names
     ]
     files.sort()
     return files
