@@ -42,7 +42,7 @@ NTU compatibility note:
 - NTU RGB+D `.skeleton` files contain 25 3D joints in camera coordinates.
 - The NTU converter fits an AMASS-like SMPL-X parameter file with `trans`, `root_orient`, `pose_body`, zero hand/face pose, `betas`, `gender`, `mocap_frame_rate`, and NTU metadata.
 - Raw NTU skeletons are treated as Y-up; by default the converter exports **Z-up** motion (`--target-frame z-up`) to match this repo's BSM/Nimble/OpenSim gravity convention.
-- NTU left/right labels are swapped by default before fitting (`--swap-left-right`) because the sample files are mirrored relative to the SMPL-X left/right convention.
+- NTU uses a viewer-compatible 180-degree root yaw by default; left/right labels are not swapped unless `--swap-left-right` is passed.
 - Subject size is handled by fitting SMPL-X `betas` from metric 3D limb lengths.
 
 HumanML3D compatibility note:
@@ -179,7 +179,8 @@ Important options:
 - `--actor-mode primary` keeps the main tracked body per file.
 - `--actor-mode all` exports additional tracked bodies as `_bodyXX`.
 - `--performer P001` filters conversion to one NTU performer.
-- `--swap-left-right` is enabled by default; use `--no-swap-left-right` only when visual inspection shows the source skeleton already matches SMPL-X left/right.
+- `--swap-left-right` is disabled by default. Use it only when visual inspection shows left/right are reversed for a specific source.
+- The NTU fitter is conservative by default: `--input-smooth-passes 1`, `--center-horizontal`, `--root-yaw-degrees 180`, `--root-up-prior-weight 50`, `--torso-frame-prior-weight 3`, `--spine-upright-prior-weight 8`, `--foot-flat-prior-weight 25`, `--temporal-joint-smooth-weight 350`, and `--temporal-joint-jerk-weight 35`. These defaults center Kinect camera-depth coordinates around the actor, align SMPL-X anatomical front with NTU camera-front, keep the torso upright while preserving shoulder/hip yaw, suppress short-frame flicker, and keep SMPL-X heel/toe joints flat during contact.
 - `--fit-shapes-only` fits/writes performer beta cache, then stops before pose fitting.
 - `--force` recomputes existing outputs and shape cache entries.
 
@@ -462,8 +463,8 @@ For NTU input, prepend:
 
 1. Read NTU RGB+D `.skeleton` 25-joint tracks.
 2. Convert raw NTU Y-up camera coordinates to Z-up world coordinates.
-3. Fit SMPL-X `betas` from metric segment lengths.
-4. Fit SMPL-X root/body pose over time.
+3. Smooth the metric joint targets and fit SMPL-X `betas` from segment lengths.
+4. Fit SMPL-X root/body pose over time with torso-frame, foot-flat, and joint smoothness priors.
 5. Export AMASS-like `.npz`, then run the same AMASS/BSM pipeline above.
 
 For HumanML3D `joints/*.npy` input, prepend:

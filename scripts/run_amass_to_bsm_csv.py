@@ -24,11 +24,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the AMASS -> SMPL-X -> BSM -> AddBiomechanics -> CSV pipeline."
     )
-    parser.add_argument("--input", required=True, help="Path to AMASS SMPL-X npz file")
+    parser.add_argument(
+        "--input",
+        required=True,
+        help="Path to AMASS SMPL-X .npz file or Motion-X smplx_322 .npy file",
+    )
     parser.add_argument(
         "--trial",
         required=True,
-        help="Trial name used for outputs, or 'all' to export one CSV per trial found in the input npz",
+        help="Trial name used for outputs, or 'all' to export one CSV per trial found in the input file",
     )
     parser.add_argument(
         "--output-dir",
@@ -405,7 +409,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, object]:
 
     return {
         "mode": "all",
-        "input_npz_path": str(Path(args.input).resolve()),
+        "input_path": str(Path(args.input).resolve()),
         "trial_count": len(trial_summaries),
         "trial_names": list(trial_summaries.keys()),
         "final_csv_paths": ordered_final_csv_paths,

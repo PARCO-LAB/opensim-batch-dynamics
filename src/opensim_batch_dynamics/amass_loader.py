@@ -43,6 +43,17 @@ _SHARED_FIELDS = (
     "betas",
 )
 
+_MOTIONX_SMPLX_322_DIMS = 322
+_MOTIONX_FRAME_RATE_HZ = 30.0
+_MOTIONX_Y_UP_TO_Z_UP_MATRIX = np.array(
+    (
+        (1.0, 0.0, 0.0),
+        (0.0, 0.0, -1.0),
+        (0.0, 1.0, 0.0),
+    ),
+    dtype=np.float32,
+)
+
 
 def _to_scalar(value: Any) -> Any:
     """Convert 0-d numpy arrays to Python scalars."""
@@ -338,6 +349,50 @@ def _extract_records_from_trials_obj(trials_obj: Any) -> dict[str, dict[str, Any
     return result
 
 
+def _motionx_root_orient_y_up_to_z_up(root_orient: np.ndarray) -> np.ndarray:
+    """Convert Motion-X global orientation from Y-up world to pipeline Z-up world."""
+    try:
+        from scipy.spatial.transform import Rotation
+    except ImportError as exc:
+        raise RuntimeError("scipy is required to load Motion-X .npy inputs.") from exc
+
+    frame_rotation = Rotation.from_matrix(_MOTIONX_Y_UP_TO_Z_UP_MATRIX)
+    root_rotation = Rotation.from_rotvec(root_orient.astype(np.float64, copy=False))
+    return (frame_rotation * root_rotation).as_rotvec().astype(np.float32)
+
+
+def _motionx_322_fields(source: Path, motion: np.ndarray) -> dict[str, Any]:
+    """Convert Motion-X smplx_322 arrays to the AMASS-like field mapping."""
+    if motion.ndim != 2 or motion.shape[1] != _MOTIONX_SMPLX_322_DIMS:
+        raise ValueError(
+            "Motion-X .npy input must have shape "
+            f"(T, {_MOTIONX_SMPLX_322_DIMS}), got {motion.shape} in '{source.name}'."
+        )
+    n_frames = motion.shape[0]
+    pose_eye = np.zeros((n_frames, 6), dtype=np.float32)
+    trans = motion[:, 309:312] @ _MOTIONX_Y_UP_TO_Z_UP_MATRIX.T
+    return {
+        "surface_model_type": "smplx",
+        "gender": "neutral",
+        "mocap_frame_rate": np.array(_MOTIONX_FRAME_RATE_HZ, dtype=np.float32),
+        "root_orient": _motionx_root_orient_y_up_to_z_up(motion[:, :3]),
+        "pose_body": motion[:, 3:66],
+        "pose_hand": motion[:, 66:156],
+        "pose_jaw": motion[:, 156:159],
+        "pose_eye": pose_eye,
+        "trans": trans.astype(np.float32, copy=False),
+        "betas": motion[0, 312:],
+    }
+
+
+def _load_all_motionx_npy(source: Path) -> dict[str, AMASSSequence]:
+    motion = np.load(source, allow_pickle=True)
+    if not isinstance(motion, np.ndarray):
+        raise ValueError(f"Expected numpy array in Motion-X input '{source.name}'.")
+    fields = _motionx_322_fields(source, np.asarray(motion, dtype=np.float32))
+    return {source.stem: _build_sequence_from_fields(source, fields)}
+
+
 def load_all_amass_npz(path: str | Path) -> dict[str, AMASSSequence]:
     """
     Load one or multiple AMASS sequences from a single npz.
@@ -348,6 +403,9 @@ def load_all_amass_npz(path: str | Path) -> dict[str, AMASSSequence]:
     - Multi-trial object container under ``trials`` (dict/list of records).
     """
     source = Path(path).resolve()
+    if source.suffix.lower() == ".npy":
+        return _load_all_motionx_npy(source)
+
     shape_defaults = _load_shape_fallback(source)
     with np.load(source, allow_pickle=True) as npz:
         shared_fields = {name: npz[name] for name in _SHARED_FIELDS if name in npz.files}

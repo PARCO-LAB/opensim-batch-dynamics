@@ -35,14 +35,14 @@ class BatchTaskResult:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the full AMASS->OpenSim->CSV pipeline in parallel over all .npz files "
+            "Run the full AMASS->OpenSim->CSV pipeline in parallel over all .npz/.npy files "
             "found inside an input folder."
         )
     )
     parser.add_argument(
         "--input-root",
         required=True,
-        help="Root folder containing AMASS .npz files (searched recursively).",
+        help="Root folder containing AMASS .npz or Motion-X .npy files (searched recursively).",
     )
     parser.add_argument(
         "--output-dir",
@@ -167,7 +167,7 @@ def _resolve_pipeline_script(path_from_arg: str | None) -> Path:
     return (repo_root / "scripts" / "run_amass_to_bsm_csv.py").resolve()
 
 
-def _discover_npz_files(input_root: Path) -> list[Path]:
+def _discover_input_files(input_root: Path) -> list[Path]:
     excluded_names = {
         "shape.npz",
         "neutral_stagei.npz",
@@ -176,7 +176,8 @@ def _discover_npz_files(input_root: Path) -> list[Path]:
     }
     files = [
         path
-        for path in input_root.rglob("*.npz")
+        for pattern in ("*.npz", "*.npy")
+        for path in input_root.rglob(pattern)
         if path.is_file() and path.name.lower() not in excluded_names
     ]
     files.sort()
@@ -184,7 +185,7 @@ def _discover_npz_files(input_root: Path) -> list[Path]:
 
 
 def _build_tasks(args: argparse.Namespace, input_root: Path, output_root: Path) -> list[BatchTask]:
-    files = _discover_npz_files(input_root)
+    files = _discover_input_files(input_root)
     if args.limit is not None:
         files = files[: max(0, args.limit)]
 
@@ -415,7 +416,7 @@ def main() -> int:
         raise ValueError("--workers must be >= 1")
 
     tasks = _build_tasks(args, input_root=input_root, output_root=output_root)
-    print(f"Discovered {len(tasks)} .npz files under: {input_root}")
+    print(f"Discovered {len(tasks)} .npz/.npy files under: {input_root}")
     print(f"Output root: {output_root}")
     print(f"Workers: {args.workers}")
     if args.skip_existing:

@@ -374,6 +374,16 @@ def target_frame_root_init(target_frame: str) -> np.ndarray:
     raise ValueError(f"Unsupported target frame: {target_frame}")
 
 
+def apply_root_yaw(root_orient: np.ndarray, yaw_degrees: float) -> np.ndarray:
+    if abs(float(yaw_degrees)) < 1e-8:
+        return root_orient.astype(np.float32, copy=True)
+    from scipy.spatial.transform import Rotation as R
+
+    root_rot = R.from_rotvec(np.asarray(root_orient, dtype=np.float64).reshape(3))
+    yaw_rot = R.from_euler("z", float(yaw_degrees), degrees=True)
+    return (yaw_rot * root_rot).as_rotvec().astype(np.float32)
+
+
 def interpolate_missing_joints(joints: np.ndarray) -> np.ndarray:
     """Fill missing NTU frames/joints by per-coordinate linear interpolation."""
     filled = joints.astype(np.float32, copy=True)
@@ -394,6 +404,29 @@ def interpolate_missing_joints(joints: np.ndarray) -> np.ndarray:
                 values[:] = 0.0
             filled[:, joint_idx, axis] = values
     return filled
+
+
+def smooth_joints_temporal(joints: np.ndarray, passes: int) -> np.ndarray:
+    passes = max(0, int(passes))
+    if passes == 0 or joints.shape[0] < 3:
+        return joints.astype(np.float32, copy=True)
+    weights = np.asarray([1.0, 4.0, 6.0, 4.0, 1.0], dtype=np.float32) / 16.0
+    smoothed = joints.astype(np.float32, copy=True)
+    for _ in range(passes):
+        padded = np.pad(smoothed, ((2, 2), (0, 0), (0, 0)), mode="edge")
+        smoothed = sum(float(weights[idx]) * padded[idx : idx + joints.shape[0]] for idx in range(5))
+    return smoothed.astype(np.float32, copy=False)
+
+
+def center_joints_horizontal(joints: np.ndarray, up_axis: int) -> tuple[np.ndarray, np.ndarray]:
+    centered = joints.astype(np.float32, copy=True)
+    valid = np.isfinite(centered[:, 0, :]).all(axis=1)
+    offset = np.zeros(3, dtype=np.float32)
+    if np.any(valid):
+        offset = np.median(centered[valid, 0, :], axis=0).astype(np.float32)
+        offset[up_axis] = 0.0
+        centered = centered - offset.reshape(1, 1, 3)
+    return centered.astype(np.float32, copy=False), offset
 
 
 def tracking_to_weight(tracking: np.ndarray) -> np.ndarray:
@@ -593,6 +626,52 @@ def _second_difference_loss(torch, value) -> object:
     return torch.mean(diff2**2)
 
 
+def _third_difference_loss(torch, value) -> object:
+    if value.shape[0] < 4:
+        return torch.zeros((), dtype=value.dtype, device=value.device)
+    diff3 = value[3:] - 3.0 * value[2:-1] + 3.0 * value[1:-2] - value[:-3]
+    return torch.mean(diff3**2)
+
+
+def _direction_loss(torch, pred_a, pred_b, target_a, target_b, weights=None) -> object:
+    pred_vec = pred_b - pred_a
+    target_vec = target_b - target_a
+    pred_dir = pred_vec / torch.clamp(torch.linalg.norm(pred_vec, dim=1, keepdim=True), min=1e-6)
+    target_dir = target_vec / torch.clamp(torch.linalg.norm(target_vec, dim=1, keepdim=True), min=1e-6)
+    err = torch.sum((pred_dir - target_dir) ** 2, dim=1)
+    if weights is not None:
+        err = err * weights
+        return torch.sum(err) / torch.clamp(torch.sum(weights), min=1.0)
+    return torch.mean(err)
+
+
+def _selective_pose_prior(torch, body_pose, weight: float) -> object:
+    if weight <= 0.0:
+        return torch.zeros((), dtype=body_pose.dtype, device=body_pose.device)
+    pose = body_pose.reshape(body_pose.shape[0], 21, 3)
+    joint_weights = torch.ones((21,), dtype=body_pose.dtype, device=body_pose.device) * 0.15
+    # Keep torso, neck, and head close to a plausible upright body. NTU has too
+    # few torso markers to safely solve these DOFs from positions alone.
+    joint_weights[torch.as_tensor([2, 5, 8, 11, 14], dtype=torch.long, device=body_pose.device)] = 4.0
+    joint_weights[torch.as_tensor([0, 1], dtype=torch.long, device=body_pose.device)] = 1.5
+    joint_weights[torch.as_tensor([3, 4, 6, 7, 9, 10], dtype=torch.long, device=body_pose.device)] = 0.35
+    joint_weights[torch.as_tensor([12, 13, 15, 16], dtype=torch.long, device=body_pose.device)] = 0.4
+    joint_weights[torch.as_tensor([17, 18, 19, 20], dtype=torch.long, device=body_pose.device)] = 0.08
+    return float(weight) * torch.mean(joint_weights.reshape(1, 21, 1) * pose**2)
+
+
+def _upright_vector_loss(torch, pred_a, pred_b, up_axis: int, weights=None) -> object:
+    vec = pred_b - pred_a
+    length = torch.clamp(torch.linalg.norm(vec, dim=1), min=1e-6)
+    axes = [axis for axis in range(3) if axis != up_axis]
+    horizontal = torch.linalg.norm(vec[:, axes], dim=1) / length
+    err = horizontal**2
+    if weights is not None:
+        err = err * weights
+        return torch.sum(err) / torch.clamp(torch.sum(weights), min=1.0)
+    return torch.mean(err)
+
+
 def _axis_angle_to_matrix(torch, rotvec):
     angle = torch.linalg.norm(rotvec, dim=1, keepdim=True).clamp_min(1e-8)
     axis = rotvec / angle
@@ -626,6 +705,18 @@ def _root_up_loss(torch, root_orient, target_frame: str):
     return torch.mean((local_up - target) ** 2)
 
 
+def estimate_foot_contact_weights(joints: np.ndarray, up_axis: int, floor_height: float) -> np.ndarray:
+    foot_indices = [15, 19]
+    heights = joints[:, foot_indices, up_axis].astype(np.float32)
+    rel_height = heights - float(floor_height)
+    contact = np.clip(1.0 - rel_height / 0.12, 0.0, 1.0)
+    if joints.shape[0] >= 3:
+        velocity = np.zeros_like(rel_height)
+        velocity[1:] = np.abs(np.diff(heights, axis=0))
+        contact *= np.clip(1.0 - velocity / 0.035, 0.0, 1.0)
+    return contact.astype(np.float32)
+
+
 def fit_pose_sequence(
     track: NTUTrack,
     betas_np: np.ndarray,
@@ -637,9 +728,15 @@ def fit_pose_sequence(
     lr: float,
     pose_prior_weight: float,
     root_up_prior_weight: float,
+    torso_frame_prior_weight: float,
+    spine_upright_prior_weight: float,
+    foot_flat_prior_weight: float,
     temporal_smooth_weight: float,
+    temporal_joint_smooth_weight: float,
+    temporal_joint_jerk_weight: float,
     floor_prior_weight: float,
     target_frame: str,
+    root_yaw_degrees: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
     torch, smplx = _import_torch_and_smplx()
     model_path, resolved_gender = resolve_smplx_model_path(smplx_model_dir, gender)
@@ -650,6 +747,9 @@ def fit_pose_sequence(
         up_axis=up_axis,
     )
     n_frames = int(targets_np.shape[0])
+    filled_joints_np = interpolate_missing_joints(track.joints)
+    tracking_weights_np = tracking_to_weight(track.tracking)
+    foot_contact_weights_np = estimate_foot_contact_weights(filled_joints_np, up_axis, floor_height)
 
     model = smplx.create(
         model_path=str(model_path),
@@ -671,10 +771,13 @@ def fit_pose_sequence(
     targets = torch.as_tensor(targets_np, dtype=torch.float32, device=device)
     weights = torch.as_tensor(weights_np, dtype=torch.float32, device=device)
     selected = torch.as_tensor(smplx_indices, dtype=torch.long, device=device)
+    source_joints = torch.as_tensor(filled_joints_np, dtype=torch.float32, device=device)
+    source_weights = torch.as_tensor(tracking_weights_np, dtype=torch.float32, device=device)
+    foot_contact_weights = torch.as_tensor(foot_contact_weights_np, dtype=torch.float32, device=device)
     zeros = _zero_pose_tensors(torch, n_frames, device)
 
     with torch.no_grad():
-        root_init_np = target_frame_root_init(target_frame)
+        root_init_np = apply_root_yaw(target_frame_root_init(target_frame), root_yaw_degrees)
         root_init_t = torch.as_tensor(root_init_np, dtype=torch.float32, device=device).reshape(1, 3)
         root_init_batch = root_init_t.repeat(n_frames, 1)
         neutral_out = model(
@@ -701,7 +804,8 @@ def fit_pose_sequence(
     )
 
     final_joint_error = math.nan
-    for _ in range(max(0, int(iterations))):
+    total_iterations = max(0, int(iterations))
+    for iteration_idx in range(total_iterations):
         optimizer.zero_grad(set_to_none=True)
         output = model(
             betas=betas,
@@ -715,13 +819,59 @@ def fit_pose_sequence(
         err = torch.sqrt(torch.sum((pred - targets) ** 2, dim=2) + 1e-8)
         joint_loss = torch.sum(weights * err) / torch.clamp(torch.sum(weights), min=1.0)
         loss = joint_loss
-        loss = loss + float(pose_prior_weight) * torch.mean(body_pose**2)
+        loss = loss + _selective_pose_prior(torch, body_pose, pose_prior_weight)
         loss = loss + float(root_up_prior_weight) * _root_up_loss(torch, root_orient, target_frame)
+        if torso_frame_prior_weight > 0.0:
+            out_joints = output.joints
+            hip_w = torch.minimum(source_weights[:, 12], source_weights[:, 16])
+            shoulder_w = torch.minimum(source_weights[:, 4], source_weights[:, 8])
+            loss = loss + float(torso_frame_prior_weight) * (
+                _direction_loss(torch, out_joints[:, 1], out_joints[:, 2], source_joints[:, 12], source_joints[:, 16], hip_w)
+                + _direction_loss(torch, out_joints[:, 16], out_joints[:, 17], source_joints[:, 4], source_joints[:, 8], shoulder_w)
+            )
+        if spine_upright_prior_weight > 0.0:
+            out_joints = output.joints
+            spine_w = torch.minimum(source_weights[:, 0], source_weights[:, 20])
+            loss = loss + float(spine_upright_prior_weight) * (
+                _upright_vector_loss(torch, out_joints[:, 0], out_joints[:, 12], up_axis, spine_w)
+                + 0.25 * _upright_vector_loss(torch, out_joints[:, 12], out_joints[:, 15], up_axis, spine_w)
+            )
         loss = loss + float(temporal_smooth_weight) * (
             _second_difference_loss(torch, body_pose)
             + 0.2 * _second_difference_loss(torch, root_orient)
             + 2.0 * _second_difference_loss(torch, transl)
         )
+        progress = 1.0 if total_iterations <= 1 else float(iteration_idx) / float(total_iterations - 1)
+        joint_smooth_ramp = min(1.0, max(0.0, (progress - 0.35) / 0.65))
+        if joint_smooth_ramp > 0.0 and temporal_joint_smooth_weight > 0.0:
+            smooth_joints = output.joints[:, :22]
+            loss = loss + (
+                joint_smooth_ramp
+                * float(temporal_joint_smooth_weight)
+                * _second_difference_loss(torch, smooth_joints)
+            )
+        if joint_smooth_ramp > 0.0 and temporal_joint_jerk_weight > 0.0:
+            smooth_joints = output.joints[:, :22]
+            loss = loss + (
+                joint_smooth_ramp
+                * float(temporal_joint_jerk_weight)
+                * _third_difference_loss(torch, smooth_joints)
+            )
+        if foot_flat_prior_weight > 0.0:
+            left_foot = output.joints.index_select(
+                1, torch.as_tensor([10, 60, 61, 62], dtype=torch.long, device=device)
+            )[:, :, up_axis]
+            right_foot = output.joints.index_select(
+                1, torch.as_tensor([11, 63, 64, 65], dtype=torch.long, device=device)
+            )[:, :, up_axis]
+            left_var = torch.mean((left_foot - torch.mean(left_foot, dim=1, keepdim=True)) ** 2, dim=1)
+            right_var = torch.mean((right_foot - torch.mean(right_foot, dim=1, keepdim=True)) ** 2, dim=1)
+            contact_sum = torch.clamp(torch.sum(foot_contact_weights), min=1.0)
+            foot_flat_loss = (
+                torch.sum(foot_contact_weights[:, 0] * left_var)
+                + torch.sum(foot_contact_weights[:, 1] * right_var)
+            ) / contact_sum
+            loss = loss + float(foot_flat_prior_weight) * foot_flat_loss
         if floor_prior_weight > 0.0:
             foot_indices = torch.as_tensor(
                 [SMPLX_BODY_JOINTS["left_ankle"], SMPLX_BODY_JOINTS["right_ankle"], SMPLX_BODY_JOINTS["left_foot"], SMPLX_BODY_JOINTS["right_foot"]],
@@ -744,6 +894,13 @@ def fit_pose_sequence(
             "floor_height_m": float(floor_height),
             "up_axis": int(up_axis),
             "fit_joint_count": int(len(smplx_indices)),
+            "foot_contact_frames": int(np.sum(np.max(foot_contact_weights_np, axis=1) > 0.1)),
+            "torso_frame_prior_weight": float(torso_frame_prior_weight),
+            "spine_upright_prior_weight": float(spine_upright_prior_weight),
+            "foot_flat_prior_weight": float(foot_flat_prior_weight),
+            "temporal_joint_smooth_weight": float(temporal_joint_smooth_weight),
+            "temporal_joint_jerk_weight": float(temporal_joint_jerk_weight),
+            "root_yaw_degrees": float(root_yaw_degrees),
         },
     )
 
@@ -818,10 +975,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--swap-left-right",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
-            "Swap NTU left/right body labels before fitting. Default true because "
-            "NTU skeleton x-axis labels are mirrored relative to SMPL-X in the sample files."
+            "Swap NTU left/right body labels before fitting. Default false with the "
+            "viewer-compatible 180-degree NTU root yaw."
         ),
     )
     parser.add_argument("--recursive", action="store_true")
@@ -844,12 +1001,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shape-lr", type=float, default=0.04)
     parser.add_argument("--shape-beta-prior-weight", type=float, default=0.2)
     parser.add_argument("--shape-max-sequences-per-performer", type=int, default=20)
-    parser.add_argument("--pose-iters", type=int, default=900)
-    parser.add_argument("--pose-lr", type=float, default=0.035)
-    parser.add_argument("--pose-prior-weight", type=float, default=0.05)
-    parser.add_argument("--root-up-prior-weight", type=float, default=10.0)
-    parser.add_argument("--temporal-smooth-weight", type=float, default=0.12)
-    parser.add_argument("--floor-prior-weight", type=float, default=2.0)
+    parser.add_argument("--input-smooth-passes", type=int, default=1)
+    parser.add_argument("--center-horizontal", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--pose-iters", type=int, default=2200)
+    parser.add_argument("--pose-lr", type=float, default=0.018)
+    parser.add_argument("--pose-prior-weight", type=float, default=0.08)
+    parser.add_argument("--root-up-prior-weight", type=float, default=50.0)
+    parser.add_argument("--root-yaw-degrees", type=float, default=180.0)
+    parser.add_argument("--torso-frame-prior-weight", type=float, default=3.0)
+    parser.add_argument("--spine-upright-prior-weight", type=float, default=8.0)
+    parser.add_argument("--foot-flat-prior-weight", type=float, default=25.0)
+    parser.add_argument("--temporal-smooth-weight", type=float, default=0.04)
+    parser.add_argument("--temporal-joint-smooth-weight", type=float, default=350.0)
+    parser.add_argument("--temporal-joint-jerk-weight", type=float, default=35.0)
+    parser.add_argument("--floor-prior-weight", type=float, default=3.0)
     parser.add_argument(
         "--summary-json",
         type=Path,
@@ -994,6 +1159,16 @@ def run_conversion(args: argparse.Namespace) -> dict[str, object]:
             for selected in select_tracks(path, actor_mode=args.actor_mode):
                 source_track = maybe_swap_track_left_right(selected.track, args.swap_left_right)
                 target_track = transform_track_to_target_frame(source_track, args.target_frame)
+                target_track = target_track.copy_with_joints(
+                    smooth_joints_temporal(target_track.joints, args.input_smooth_passes)
+                )
+                center_offset = np.zeros(3, dtype=np.float32)
+                if args.center_horizontal:
+                    centered_joints, center_offset = center_joints_horizontal(
+                        target_track.joints,
+                        target_frame_up_axis(args.target_frame),
+                    )
+                    target_track = target_track.copy_with_joints(centered_joints)
                 selected_for_output = SelectedTrack(
                     source_path=selected.source_path,
                     metadata=selected.metadata,
@@ -1019,17 +1194,27 @@ def run_conversion(args: argparse.Namespace) -> dict[str, object]:
                     lr=args.pose_lr,
                     pose_prior_weight=args.pose_prior_weight,
                     root_up_prior_weight=args.root_up_prior_weight,
+                    torso_frame_prior_weight=args.torso_frame_prior_weight,
+                    spine_upright_prior_weight=args.spine_upright_prior_weight,
+                    foot_flat_prior_weight=args.foot_flat_prior_weight,
                     temporal_smooth_weight=args.temporal_smooth_weight,
+                    temporal_joint_smooth_weight=args.temporal_joint_smooth_weight,
+                    temporal_joint_jerk_weight=args.temporal_joint_jerk_weight,
                     floor_prior_weight=args.floor_prior_weight,
                     target_frame=args.target_frame,
+                    root_yaw_degrees=args.root_yaw_degrees,
                 )
                 diagnostics = {
                     **fit_diag,
                     "target_frame": args.target_frame,
-                        "shape_key": shape_key,
-                        "shape_cache_hit": bool(shape_cache_hits.get(shape_key, False)),
-                        "swap_left_right": bool(args.swap_left_right),
-                        "valid_frames": target_track.valid_frames,
+                    "shape_key": shape_key,
+                    "shape_cache_hit": bool(shape_cache_hits.get(shape_key, False)),
+                    "swap_left_right": bool(args.swap_left_right),
+                    "root_yaw_degrees": float(args.root_yaw_degrees),
+                    "input_smooth_passes": int(args.input_smooth_passes),
+                    "center_horizontal": bool(args.center_horizontal),
+                    "center_offset_m": center_offset.astype(float).tolist(),
+                    "valid_frames": target_track.valid_frames,
                     "body_id": target_track.body_id,
                     "body_rank": selected.body_rank,
                 }

@@ -157,6 +157,9 @@ def _build_converter_cmd(args: argparse.Namespace, converter_script: Path, task:
         str(args.shape_beta_prior_weight),
         "--shape-max-sequences-per-performer",
         str(args.shape_max_sequences_per_performer),
+        "--input-smooth-passes",
+        str(args.input_smooth_passes),
+        "--center-horizontal" if args.center_horizontal else "--no-center-horizontal",
         "--pose-iters",
         str(args.pose_iters),
         "--pose-lr",
@@ -165,8 +168,20 @@ def _build_converter_cmd(args: argparse.Namespace, converter_script: Path, task:
         str(args.pose_prior_weight),
         "--root-up-prior-weight",
         str(args.root_up_prior_weight),
+        "--root-yaw-degrees",
+        str(args.root_yaw_degrees),
+        "--torso-frame-prior-weight",
+        str(args.torso_frame_prior_weight),
+        "--spine-upright-prior-weight",
+        str(args.spine_upright_prior_weight),
+        "--foot-flat-prior-weight",
+        str(args.foot_flat_prior_weight),
         "--temporal-smooth-weight",
         str(args.temporal_smooth_weight),
+        "--temporal-joint-smooth-weight",
+        str(args.temporal_joint_smooth_weight),
+        "--temporal-joint-jerk-weight",
+        str(args.temporal_joint_jerk_weight),
         "--floor-prior-weight",
         str(args.floor_prior_weight),
     ]
@@ -263,6 +278,9 @@ def _build_subject_converter_cmd(
         str(args.shape_beta_prior_weight),
         "--shape-max-sequences-per-performer",
         str(args.shape_max_sequences_per_performer),
+        "--input-smooth-passes",
+        str(args.input_smooth_passes),
+        "--center-horizontal" if args.center_horizontal else "--no-center-horizontal",
         "--pose-iters",
         str(args.pose_iters),
         "--pose-lr",
@@ -271,8 +289,20 @@ def _build_subject_converter_cmd(
         str(args.pose_prior_weight),
         "--root-up-prior-weight",
         str(args.root_up_prior_weight),
+        "--root-yaw-degrees",
+        str(args.root_yaw_degrees),
+        "--torso-frame-prior-weight",
+        str(args.torso_frame_prior_weight),
+        "--spine-upright-prior-weight",
+        str(args.spine_upright_prior_weight),
+        "--foot-flat-prior-weight",
+        str(args.foot_flat_prior_weight),
         "--temporal-smooth-weight",
         str(args.temporal_smooth_weight),
+        "--temporal-joint-smooth-weight",
+        str(args.temporal_joint_smooth_weight),
+        "--temporal-joint-jerk-weight",
+        str(args.temporal_joint_jerk_weight),
         "--floor-prior-weight",
         str(args.floor_prior_weight),
         "--summary-json",
@@ -690,18 +720,26 @@ def _add_common_converter_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--frame-rate", type=float, default=30.0)
     parser.add_argument("--actor-mode", choices=["primary", "all"], default="primary")
     parser.add_argument("--target-frame", choices=["z-up", "y-up"], default="z-up")
-    parser.add_argument("--swap-left-right", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--swap-left-right", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--num-betas", type=int, default=16)
     parser.add_argument("--shape-iters", type=int, default=300)
     parser.add_argument("--shape-lr", type=float, default=0.04)
     parser.add_argument("--shape-beta-prior-weight", type=float, default=0.2)
     parser.add_argument("--shape-max-sequences-per-performer", type=int, default=20)
-    parser.add_argument("--pose-iters", type=int, default=900)
-    parser.add_argument("--pose-lr", type=float, default=0.035)
-    parser.add_argument("--pose-prior-weight", type=float, default=0.05)
-    parser.add_argument("--root-up-prior-weight", type=float, default=10.0)
-    parser.add_argument("--temporal-smooth-weight", type=float, default=0.12)
-    parser.add_argument("--floor-prior-weight", type=float, default=2.0)
+    parser.add_argument("--input-smooth-passes", type=int, default=1)
+    parser.add_argument("--center-horizontal", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--pose-iters", type=int, default=2200)
+    parser.add_argument("--pose-lr", type=float, default=0.018)
+    parser.add_argument("--pose-prior-weight", type=float, default=0.08)
+    parser.add_argument("--root-up-prior-weight", type=float, default=50.0)
+    parser.add_argument("--root-yaw-degrees", type=float, default=180.0)
+    parser.add_argument("--torso-frame-prior-weight", type=float, default=3.0)
+    parser.add_argument("--spine-upright-prior-weight", type=float, default=8.0)
+    parser.add_argument("--foot-flat-prior-weight", type=float, default=25.0)
+    parser.add_argument("--temporal-smooth-weight", type=float, default=0.04)
+    parser.add_argument("--temporal-joint-smooth-weight", type=float, default=350.0)
+    parser.add_argument("--temporal-joint-jerk-weight", type=float, default=35.0)
+    parser.add_argument("--floor-prior-weight", type=float, default=3.0)
 
 
 def _add_submit_args(parser: argparse.ArgumentParser) -> None:
