@@ -747,8 +747,8 @@ def _add_pipeline_forwarded_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--id-contact-bodies", default="all")
     parser.add_argument("--id-friction-coeff", type=float, default=0.8)
-    parser.add_argument("--id-contact-height-threshold-m", type=float, default=0.06)
-    parser.add_argument("--id-contact-speed-threshold-mps", type=float, default=0.6)
+    parser.add_argument("--id-contact-height-threshold-m", type=float, default=0.04)
+    parser.add_argument("--id-contact-speed-threshold-mps", type=float, default=0.5)
     parser.add_argument(
         "--cleanup-intermediate",
         dest="cleanup_intermediate",

@@ -93,7 +93,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="all",
         help=(
             "Comma-separated contact body names used to estimate GRF. "
-            "Use 'all' (default) to consider all body nodes."
+            "Use 'all' (default) to consider all non-ground body nodes."
         ),
     )
     parser.add_argument(
@@ -105,14 +105,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--id-contact-height-threshold-m",
         type=float,
-        default=0.06,
-        help="Contact activation height threshold above floor in meters (default: 0.06)",
+        default=0.04,
+        help="Contact activation height threshold above floor in meters (default: 0.04)",
     )
     parser.add_argument(
         "--id-contact-speed-threshold-mps",
         type=float,
-        default=0.6,
-        help="Contact activation normal speed threshold in m/s (default: 0.6)",
+        default=0.5,
+        help="Contact activation foot-cluster speed threshold in m/s (default: 0.5)",
     )
     parser.add_argument(
         "--final-csv-path",

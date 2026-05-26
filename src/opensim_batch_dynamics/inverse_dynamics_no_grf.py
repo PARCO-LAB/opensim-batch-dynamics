@@ -126,6 +126,14 @@ def _prepare_model_for_inverse_dynamics(
     prepared_model_path = output_dir / f"{trial_name}_id_model_nomarkers.osim"
     opensim.Logger.setLevelString("error")
     model = opensim.Model(str(model_path))
+    gravity = model.getGravity()
+    gravity_norm = math.sqrt(
+        float(gravity.get(0)) ** 2
+        + float(gravity.get(1)) ** 2
+        + float(gravity.get(2)) ** 2
+    )
+    if gravity_norm > 1e-8:
+        model.setGravity(opensim.Vec3(0.0, 0.0, -gravity_norm))
     marker_set = model.updMarkerSet()
     if marker_set.getSize() > 0:
         marker_set.clearAndDestroy()
@@ -184,6 +192,87 @@ def _project_force_to_friction_cone(
     return tangential + normal_force * up
 
 
+def _auto_contact_body_names(available_names: list[str]) -> list[str]:
+    return [name for name in available_names if name.lower() != "ground"]
+
+
+def _side_key(body_name: str) -> str | None:
+    lowered = body_name.lower()
+    if lowered.endswith("_r") or lowered.startswith("r_") or "right" in lowered:
+        return "right"
+    if lowered.endswith("_l") or lowered.startswith("l_") or "left" in lowered:
+        return "left"
+    return None
+
+
+def _is_foot_group_body(body_name: str) -> bool:
+    lowered = body_name.lower()
+    return any(token in lowered for token in ("calcn", "toe", "foot", "heel", "talus"))
+
+
+def _contact_group_key(body_name: str) -> str:
+    side_key = _side_key(body_name)
+    if side_key is not None and _is_foot_group_body(body_name):
+        return f"{side_key}_foot"
+    lowered = body_name.lower()
+    return lowered
+
+
+def _fill_short_false_runs(mask: np.ndarray, max_gap_frames: int) -> np.ndarray:
+    if max_gap_frames <= 0 or mask.size == 0:
+        return mask.copy()
+    out = mask.astype(bool, copy=True)
+    padded = np.r_[True, out, True]
+    transitions = np.flatnonzero(np.diff(padded.astype(np.int8)))
+    for start, end in zip(transitions[0::2], transitions[1::2]):
+        if start == 0 or end == out.size:
+            continue
+        if end - start <= max_gap_frames:
+            out[start:end] = True
+    return out
+
+
+def _remove_short_true_runs(mask: np.ndarray, min_run_frames: int) -> np.ndarray:
+    if min_run_frames <= 1 or mask.size == 0:
+        return mask.copy()
+    out = mask.astype(bool, copy=True)
+    padded = np.r_[False, out, False]
+    transitions = np.flatnonzero(np.diff(padded.astype(np.int8)))
+    for start, end in zip(transitions[0::2], transitions[1::2]):
+        if end - start < min_run_frames:
+            out[start:end] = False
+    return out
+
+
+def _smooth_contact_weight(mask: np.ndarray, transition_frames: int) -> np.ndarray:
+    if transition_frames <= 0 or mask.size == 0:
+        return mask.astype(np.float64)
+    kernel = np.ones((2 * transition_frames + 1,), dtype=np.float64)
+    kernel /= float(np.sum(kernel))
+    padded = np.pad(mask.astype(np.float64), (transition_frames, transition_frames), mode="edge")
+    weights = np.convolve(padded, kernel, mode="valid")
+    weights[weights < 1e-3] = 0.0
+    return weights
+
+
+def _interpolate_short_weight_gaps(weights: np.ndarray, max_gap_frames: int) -> np.ndarray:
+    if max_gap_frames <= 0 or weights.size == 0:
+        return weights.copy()
+    out = weights.astype(np.float64, copy=True)
+    active = out > 0.0
+    padded = np.r_[True, active, True]
+    transitions = np.flatnonzero(np.diff(padded.astype(np.int8)))
+    for start, end in zip(transitions[0::2], transitions[1::2]):
+        if start == 0 or end == out.size:
+            continue
+        if end - start > max_gap_frames:
+            continue
+        left = float(out[start - 1])
+        right = float(out[end])
+        out[start:end] = np.linspace(left, right, end - start + 2, dtype=np.float64)[1:-1]
+    return out
+
+
 def _estimate_contact_wrenches_from_kinematics(
     model_path: Path,
     ik_mot_path: Path,
@@ -229,6 +318,9 @@ def _estimate_contact_wrenches_from_kinematics(
     if finite_dt.size == 0:
         raise ValueError("Could not infer sample rate from IK timestamps.")
     sample_rate_hz = 1.0 / float(np.median(finite_dt))
+    contact_force_cutoff_hz = (
+        None if force_cutoff_hz is None else min(float(force_cutoff_hz), 12.0)
+    )
 
     gravity = np.asarray(skel.getGravity(), dtype=np.float64).reshape(3)
     gravity_norm = float(np.linalg.norm(gravity))
@@ -245,7 +337,7 @@ def _estimate_contact_wrenches_from_kinematics(
     use_all_bodies = bool(requested_lower & {"all", "auto", "*"})
 
     if use_all_bodies:
-        selected_names = [name for name in available_names if name.lower() != "ground"]
+        selected_names = _auto_contact_body_names(available_names)
     else:
         selected_names = [name for name in requested_names if name in available_set]
 
@@ -271,6 +363,9 @@ def _estimate_contact_wrenches_from_kinematics(
             f"Requested={contact_body_names}, available={available_names}"
         )
     contact_nodes = [skel.getBodyNode(name) for name in selected_names]
+    contact_group_indices: dict[str, list[int]] = {}
+    for body_idx, body_name in enumerate(selected_names):
+        contact_group_indices.setdefault(_contact_group_key(body_name), []).append(body_idx)
 
     frames = poses.shape[1]
     com_positions = np.zeros((frames, 3), dtype=np.float64)
@@ -288,7 +383,7 @@ def _estimate_contact_wrenches_from_kinematics(
         com_positions_filt[:, axis] = _lowpass_butterworth_4th(
             com_positions[:, axis],
             sample_rate_hz=sample_rate_hz,
-            cutoff_hz=force_cutoff_hz,
+            cutoff_hz=contact_force_cutoff_hz,
         )
     body_positions_filt = np.zeros_like(body_positions)
     for body_idx in range(len(contact_nodes)):
@@ -296,12 +391,58 @@ def _estimate_contact_wrenches_from_kinematics(
             body_positions_filt[body_idx, :, axis] = _lowpass_butterworth_4th(
                 body_positions[body_idx, :, axis],
                 sample_rate_hz=sample_rate_hz,
-                cutoff_hz=force_cutoff_hz,
+                cutoff_hz=contact_force_cutoff_hz,
             )
 
-    # Use a robust estimate of floor height from contact body trajectories.
-    heights_all = body_positions_filt @ up
-    ground_height = float(np.percentile(heights_all, 1.0))
+    marker_entries_by_group: dict[str, list[tuple[object, np.ndarray]]] = {
+        group_key: [] for group_key in contact_group_indices
+    }
+    markers_map = getattr(osim, "markersMap", {})
+    if isinstance(markers_map, dict):
+        selected_set = set(selected_names)
+        for body, local_offset in markers_map.values():
+            body_name = body.getName()
+            if body_name not in selected_set:
+                continue
+            marker_entries_by_group.setdefault(_contact_group_key(body_name), []).append(
+                (body, np.asarray(local_offset, dtype=np.float64).reshape(3))
+            )
+
+    detection_points_by_group: dict[str, np.ndarray] = {}
+    for group_key, body_indices in contact_group_indices.items():
+        marker_entries = marker_entries_by_group.get(group_key, [])
+        if marker_entries:
+            point_positions = np.zeros((len(marker_entries), frames, 3), dtype=np.float64)
+            for frame_idx in range(frames):
+                skel.setPositions(poses[:, frame_idx])
+                for point_idx, (body, local_offset) in enumerate(marker_entries):
+                    point_positions[point_idx, frame_idx, :] = np.asarray(
+                        body.getWorldTransform().multiply(local_offset),
+                        dtype=np.float64,
+                    ).reshape(3)
+        else:
+            point_positions = body_positions_filt[np.asarray(body_indices, dtype=np.int32), :, :]
+
+        point_positions_filt = np.zeros_like(point_positions)
+        for point_idx in range(point_positions.shape[0]):
+            for axis in range(3):
+                point_positions_filt[point_idx, :, axis] = _lowpass_butterworth_4th(
+                    point_positions[point_idx, :, axis],
+                    sample_rate_hz=sample_rate_hz,
+                    cutoff_hz=contact_force_cutoff_hz,
+                )
+        detection_points_by_group[group_key] = point_positions_filt
+
+    detection_heights = [
+        (point_positions @ up).reshape(-1)
+        for point_positions in detection_points_by_group.values()
+        if point_positions.size > 0
+    ]
+    if detection_heights:
+        heights_for_floor = np.concatenate(detection_heights)
+    else:
+        heights_for_floor = (body_positions_filt @ up).reshape(-1)
+    ground_height = float(np.percentile(heights_for_floor, 1.0))
 
     com_acc = np.gradient(
         np.gradient(com_positions_filt, timestamps, axis=0),
@@ -313,11 +454,8 @@ def _estimate_contact_wrenches_from_kinematics(
         total_external_force[:, axis] = _lowpass_butterworth_4th(
             total_external_force[:, axis],
             sample_rate_hz=sample_rate_hz,
-            cutoff_hz=force_cutoff_hz,
+            cutoff_hz=contact_force_cutoff_hz,
         )
-
-    window_frames = max(1, int(round(0.04 / float(np.median(np.diff(timestamps))))))
-    kernel = np.ones((2 * window_frames + 1,), dtype=np.int32)
 
     force_per_body = np.zeros((len(contact_nodes), frames, 3), dtype=np.float64)
     cop_per_body = np.zeros((len(contact_nodes), frames, 3), dtype=np.float64)
@@ -328,43 +466,67 @@ def _estimate_contact_wrenches_from_kinematics(
             point = body_positions_filt[body_idx, frame_idx, :]
             cop_per_body[body_idx, frame_idx, :] = _project_point_to_plane(point, up, ground_height)
 
-    height_per_body = heights_all - ground_height
-    normal_speed_per_body = np.gradient(heights_all, timestamps, axis=1)
-    active_mask = (height_per_body <= contact_height_threshold_m) & (
-        np.abs(normal_speed_per_body) <= contact_speed_threshold_mps
-    )
-    # Briefly close gaps to avoid frame-by-frame force flicker.
-    for body_idx in range(active_mask.shape[0]):
-        expanded = np.convolve(active_mask[body_idx, :].astype(np.int32), kernel, mode="same") > 0
-        active_mask[body_idx, :] = expanded
+    median_dt = float(np.median(np.diff(timestamps)))
+    min_contact_run_frames = max(1, int(round(0.08 / median_dt)))
+    max_contact_gap_frames = max(0, int(round(0.03 / median_dt)))
+    transition_frames = max(1, int(round(0.08 / median_dt)))
+    group_keys = list(contact_group_indices.keys())
+    group_activation = np.zeros((len(group_keys), frames), dtype=np.float64)
+    for group_idx, group_key in enumerate(group_keys):
+        point_positions = detection_points_by_group[group_key]
+        point_heights = point_positions @ up
+        low_height = np.min(point_heights - ground_height, axis=0)
+        centroid = np.mean(point_positions, axis=0)
+        centroid_velocity = np.gradient(centroid, timestamps, axis=0)
+        centroid_speed = np.linalg.norm(centroid_velocity, axis=1)
+        raw_mask = (low_height <= contact_height_threshold_m) & (
+            centroid_speed <= contact_speed_threshold_mps
+        )
+        stable_mask = _fill_short_false_runs(raw_mask, max_contact_gap_frames)
+        stable_mask = _remove_short_true_runs(stable_mask, min_contact_run_frames)
+        smoothed_activation = _smooth_contact_weight(stable_mask, transition_frames)
+        group_activation[group_idx, :] = _interpolate_short_weight_gaps(
+            smoothed_activation,
+            max_gap_frames=max(1, int(round(0.05 / median_dt))),
+        )
 
     for frame_idx in range(frames):
-        force_target = total_external_force[frame_idx, :].copy()
-        up_component = float(np.dot(force_target, up))
-        if up_component <= 0.0:
-            # Airborne/no support: keep zero contact forces.
+        raw_force_target = total_external_force[frame_idx, :].copy()
+        support_scale = min(1.0, float(np.sum(group_activation[:, frame_idx])))
+        if support_scale <= 0.0:
             continue
-
-        active_indices = [i for i in range(len(contact_nodes)) if active_mask[i, frame_idx]]
-        if not active_indices:
-            # Fallback: use closest body to floor if no active contact was detected.
-            min_idx = int(np.argmin(height_per_body[:, frame_idx]))
-            active_indices = [min_idx]
+        up_component = float(np.dot(raw_force_target, up))
+        min_normal_force = support_scale * 0.25 * mass_kg * gravity_norm
+        normal_magnitude = max(up_component, min_normal_force)
+        normal_force_target = normal_magnitude * up
+        raw_tangential_force = raw_force_target - up_component * up
+        if min_normal_force > 1e-8:
+            tangential_reliability = min(1.0, max(0.0, up_component / min_normal_force))
+        else:
+            tangential_reliability = 1.0
+        tangential_force_target = tangential_reliability * raw_tangential_force
+        force_target = (
+            support_scale * normal_force_target
+            + (support_scale * support_scale * support_scale) * tangential_force_target
+        )
 
         com_proj = _project_point_to_plane(com_positions_filt[frame_idx, :], up, ground_height)
         weights = np.zeros((len(contact_nodes),), dtype=np.float64)
-        for i in active_indices:
-            point = cop_per_body[i, frame_idx, :]
-            planar_delta = point - com_proj
-            planar_delta -= float(np.dot(planar_delta, up)) * up
-            distance = float(np.linalg.norm(planar_delta))
-            weights[i] = 1.0 / (distance + 1e-3)
+        for group_idx, group_key in enumerate(group_keys):
+            activation = float(group_activation[group_idx, frame_idx])
+            if activation <= 0.0:
+                continue
+            for body_idx in contact_group_indices[group_key]:
+                point = cop_per_body[body_idx, frame_idx, :]
+                planar_delta = point - com_proj
+                planar_delta -= float(np.dot(planar_delta, up)) * up
+                distance = float(np.linalg.norm(planar_delta))
+                weights[body_idx] = activation / (distance + 1e-3)
         weight_sum = float(np.sum(weights))
         if weight_sum <= 1e-12:
-            for i in active_indices:
-                weights[i] = 1.0
-            weight_sum = float(np.sum(weights))
+            continue
         weights /= weight_sum
+        active_indices = [i for i in range(len(contact_nodes)) if weights[i] > 0.0]
 
         for body_idx in range(len(contact_nodes)):
             if weights[body_idx] <= 0.0:
@@ -575,8 +737,8 @@ def run_inverse_dynamics_with_estimated_grf(
     cutoff_hz: float | None = None,
     contact_body_names: tuple[str, ...] = ("all",),
     friction_coeff: float = 0.8,
-    contact_height_threshold_m: float = 0.06,
-    contact_speed_threshold_mps: float = 0.6,
+    contact_height_threshold_m: float = 0.04,
+    contact_speed_threshold_mps: float = 0.5,
 ) -> tuple[Path, Path, float | None, Path, Path, Path]:
     """
     Run OpenSim ID using GRF/contact wrench estimated from kinematics.
@@ -605,7 +767,7 @@ def run_inverse_dynamics_with_estimated_grf(
 
     grf_mot_path, external_loads_xml_path, contact_wrench_csv_path = (
         _estimate_contact_wrenches_from_kinematics(
-            model_path=id_model_path,
+            model_path=model_path,
             ik_mot_path=ik_mot_path,
             output_dir=output_dir,
             trial_name=trial_name,
@@ -722,8 +884,8 @@ def run_inverse_dynamics_and_export_torque_csv(
     grf_mode: str = "estimated",
     contact_body_names: tuple[str, ...] = ("all",),
     friction_coeff: float = 0.8,
-    contact_height_threshold_m: float = 0.06,
-    contact_speed_threshold_mps: float = 0.6,
+    contact_height_threshold_m: float = 0.04,
+    contact_speed_threshold_mps: float = 0.5,
 ) -> InverseDynamicsNoGrfSummary:
     """High-level helper: run ID (no GRF) and export DOF torque CSV."""
     ik_labels, ik_rows = parse_mot(ik_mot_path)
