@@ -26,4 +26,5 @@ dependencies:
       - loguru
       - omegaconf
       - pyrender
+      - --no-build-isolation
       - git+https://github.com/vchoutas/torch-trust-ncg.git
