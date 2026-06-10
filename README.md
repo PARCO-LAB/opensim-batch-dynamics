@@ -95,7 +95,13 @@ conda env create -f environment.yml
 conda activate opensim-torque
 ```
 
-4. Clone AddBiomechanics:
+4. Install the SMPL-X trust-region optimizer inside the activated env:
+
+```bash
+python -m pip install --no-build-isolation git+https://github.com/vchoutas/torch-trust-ncg.git
+```
+
+5. Clone AddBiomechanics:
 
 ```bash
 git clone https://github.com/keenon/AddBiomechanics.git "$HOME/AddBiomechanics"
@@ -111,7 +117,13 @@ conda env create -f environment.yml
 conda activate opensim-torque
 ```
 
-3. Clone AddBiomechanics:
+3. Install the SMPL-X trust-region optimizer inside the activated env:
+
+```bash
+python -m pip install --no-build-isolation git+https://github.com/vchoutas/torch-trust-ncg.git
+```
+
+4. Clone AddBiomechanics:
 
 ```bash
 git clone https://github.com/keenon/AddBiomechanics.git "$HOME/AddBiomechanics"
