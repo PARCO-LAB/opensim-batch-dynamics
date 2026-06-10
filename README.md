@@ -22,6 +22,7 @@ Additional NTU entrypoints:
 - [run_ntu_skeleton_batch_slurm.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/run_ntu_skeleton_batch_slurm.py): SLURM helper for NTU `.skeleton -> .npz` conversion.
 - [convert_humanml3d_joints_to_smplx_npz.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/convert_humanml3d_joints_to_smplx_npz.py): fits SMPL-X params from HumanML3D `joints/*.npy` 52-joint files.
 - [run_humanml3d_joints_batch_slurm.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/run_humanml3d_joints_batch_slurm.py): SLURM helper for HumanML3D `joints/*.npy -> .npz` conversion.
+- [convert_carepd_smpl_pkl_to_smplx_npz.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/convert_carepd_smpl_pkl_to_smplx_npz.py): converts CARE-PD SMPL `.pkl` takes to AMASS-like SMPL-X `.npz`, one file per take.
 
 ## Required Inputs and Assets
 
@@ -51,6 +52,24 @@ HumanML3D compatibility note:
 - `new_joints/*.npy` are normalized 22-joint positions.
 - `joints/*.npy` are the preferred source for this repo because they contain 52 SMPL/SMPL-H-style joints, including hands.
 - HumanML3D motion is 20 fps by default.
+
+CARE-PD compatibility note:
+
+- The CARE-PD converter now uses official `vchoutas/smplx/transfer_model` pipeline.
+- Input source can be canonicalized SMPL `.pkl` files with packed `poses` or split `global_orient` + `body_pose`.
+- It first renders SMPL meshes, then runs `transfer_model`, then merges output into AMASS-like SMPL-X `.npz`, one file per take.
+- You need a local `smplx` checkout plus `transfer_data/smpl2smplx_deftrafo_setup.pkl` and `transfer_data/smplx_mask_ids.npy` from official correspondences package.
+- Defaults point at `/Volumes/MAEVE/dataset/CARE-PD/Canonicalized_SMPL_pickles` and `/Volumes/MAEVE/dataset/CARE-PD/npz`.
+
+Example:
+
+```bash
+conda activate opensim-torque
+python scripts/convert_carepd_smpl_pkl_to_smplx_npz.py \
+  --input-root /Volumes/MAEVE/dataset/CARE-PD/Canonicalized_SMPL_pickles \
+  --output-dir /Volumes/MAEVE/dataset/CARE-PD/npz \
+  --force
+```
 
 ## Ubuntu Setup
 

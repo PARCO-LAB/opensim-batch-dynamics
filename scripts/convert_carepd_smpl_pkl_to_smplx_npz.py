@@ -406,7 +406,10 @@ def _prepare_official_models_root(workdir: Path, smpl_model_root: Path) -> Path:
         target = models_root / subdir
         if target.exists() or target.is_symlink():
             continue
-        target.symlink_to(smpl_model_root, target_is_directory=True)
+        try:
+            target.symlink_to(smpl_model_root, target_is_directory=True)
+        except OSError:
+            shutil.copytree(smpl_model_root, target)
     return models_root
 
 
