@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import concurrent.futures
 import argparse
 import json
 import os
@@ -24,6 +25,20 @@ DEFAULT_NUM_BETAS = 16
 DEFAULT_SMPLX_REPO_ROOT = Path(__file__).resolve().parents[1] / "smplx"
 DEFAULT_TRANSFER_DATA_ROOT = Path(__file__).resolve().parents[1] / "transfer_data"
 DEFAULT_SMPL_MODEL_ROOT = Path(__file__).resolve().parents[1] / "model" / "smpl"
+
+
+@dataclass(frozen=True)
+class ConversionConfig:
+    input_root: Path
+    output_root: Path
+    repo_root: Path
+    transfer_data_root: Path
+    smpl_model_root: Path
+    force: bool
+    frame_rate_hz: float
+    num_betas: int
+    keep_workdirs: bool
+    limit_threads: bool
 
 
 @dataclass(frozen=True)
@@ -88,6 +103,12 @@ def parse_args() -> argparse.Namespace:
         help="Only scan top-level .pkl files.",
     )
     parser.add_argument("--force", action="store_true", help="Overwrite existing .npz files.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, (os.cpu_count() or 1) // 2),
+        help="Number of parallel source-pickle workers (default: max(1, cpu_count/2)).",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Plan only. No files written.")
     parser.add_argument(
         "--frame-rate",
@@ -347,6 +368,26 @@ def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _configure_worker_runtime(limit_threads: bool) -> None:
+    if not limit_threads:
+        return
+
+    for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(key, "1")
+
+    try:
+        import torch
+
+        torch.set_num_threads(1)
+        if hasattr(torch, "set_num_interop_threads"):
+            try:
+                torch.set_num_interop_threads(1)
+            except RuntimeError:
+                pass
+    except Exception:
+        pass
+
+
 def _resolve_repo_root(path: Path) -> Path:
     repo_root = path.expanduser().resolve()
     if not repo_root.exists():
@@ -411,6 +452,15 @@ def _prepare_official_models_root(workdir: Path, smpl_model_root: Path) -> Path:
         except OSError:
             shutil.copytree(smpl_model_root, target)
     return models_root
+
+
+def _build_subprocess_env(limit_threads: bool) -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    if limit_threads:
+        for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            env.setdefault(key, "1")
+    return env
 
 
 def _write_motion_npz(path: Path, poses: np.ndarray, betas: np.ndarray, gender: str, frame_rate_hz: float) -> None:
@@ -523,7 +573,7 @@ output_folder: "{(path.parent / 'transfer_output').as_posix()}"
     path.write_text(yaml_text, encoding="utf-8")
 
 
-def _run_transfer_model(repo_root: Path, config_path: Path) -> None:
+def _run_transfer_model(repo_root: Path, config_path: Path, limit_threads: bool) -> None:
     cmd = [
         sys.executable,
         "-m",
@@ -531,12 +581,11 @@ def _run_transfer_model(repo_root: Path, config_path: Path) -> None:
         "--exp-cfg",
         str(config_path),
     ]
-    env = os.environ.copy()
-    env.setdefault("PYTHONUNBUFFERED", "1")
+    env = _build_subprocess_env(limit_threads)
     subprocess.run(cmd, cwd=str(repo_root), env=env, check=True)
 
 
-def _run_merge_output(repo_root: Path, transfer_output: Path, gender: str) -> Path:
+def _run_merge_output(repo_root: Path, transfer_output: Path, gender: str, limit_threads: bool) -> Path:
     cmd = [
         sys.executable,
         str(repo_root / "transfer_model" / "merge_output.py"),
@@ -544,8 +593,7 @@ def _run_merge_output(repo_root: Path, transfer_output: Path, gender: str) -> Pa
         "--gender",
         gender,
     ]
-    env = os.environ.copy()
-    env.setdefault("PYTHONUNBUFFERED", "1")
+    env = _build_subprocess_env(limit_threads)
     subprocess.run(cmd, cwd=str(repo_root), env=env, check=True)
     merged_path = transfer_output / "merged.pkl"
     if not merged_path.exists():
@@ -686,14 +734,11 @@ def _merged_pkl_to_amass_npz(
 
 def _convert_one_take(
     take: TakeRecord,
-    args: argparse.Namespace,
-    repo_root: Path,
-    transfer_data_root: Path,
-    smpl_model_root: Path,
+    config: ConversionConfig,
 ) -> dict[str, Any]:
-    work_root = Path(tempfile.mkdtemp(prefix="carepd_transfer_", dir=str(args.output_dir)))
+    work_root = Path(tempfile.mkdtemp(prefix="carepd_transfer_", dir=str(config.output_root)))
     try:
-        models_root = _prepare_official_models_root(work_root, smpl_model_root)
+        models_root = _prepare_official_models_root(work_root, config.smpl_model_root)
         target_gender = _resolve_model_gender(models_root / "smplx", "SMPLX", take.gender)
         smpl_meshes = work_root / "transfer_data" / "meshes" / "smpl"
         transfer_output = work_root / "transfer_output"
@@ -702,9 +747,9 @@ def _convert_one_take(
         motion_npz = work_root / "motion.npz"
         _write_motion_npz(motion_npz, take.poses, take.betas, take.gender, take.frame_rate_hz)
         _write_smpl_meshes(smpl_meshes, take.poses, take.betas, take.gender, models_root)
-        _write_transfer_config(config_path, smpl_meshes, transfer_data_root, models_root, target_gender)
-        _run_transfer_model(repo_root, config_path)
-        merged_path = _run_merge_output(repo_root, transfer_output, take.gender)
+        _write_transfer_config(config_path, smpl_meshes, config.transfer_data_root, models_root, target_gender)
+        _run_transfer_model(config.repo_root, config_path, config.limit_threads)
+        merged_path = _run_merge_output(config.repo_root, transfer_output, take.gender, config.limit_threads)
         _merged_pkl_to_amass_npz(
             merged_path=merged_path,
             output_path=take.output_path,
@@ -722,11 +767,95 @@ def _convert_one_take(
             "status": "written",
         }
     finally:
-        if args.keep_workdirs:
+        if config.keep_workdirs:
             kept = work_root
             print(f"Kept workdir: {kept}")
         else:
             shutil.rmtree(work_root, ignore_errors=True)
+
+
+def _plan_take_records(
+    source_path: Path,
+    loaded: Any,
+    config: ConversionConfig,
+) -> tuple[list[TakeRecord], int]:
+    planned: list[TakeRecord] = []
+    skipped_existing = 0
+    for take_name, record in _iter_take_records(loaded, source_path):
+        poses, betas, gender, frame_rate_hz, diagnostics = _extract_take_record(
+            record=record,
+            source_path=source_path,
+            take_name=take_name,
+            fallback_frame_rate=float(config.frame_rate_hz),
+            num_betas=int(config.num_betas),
+        )
+        output_path = _build_output_path(config.output_root, config.input_root, source_path, take_name)
+        take = TakeRecord(
+            source_path=source_path,
+            take_name=str(take_name),
+            output_path=output_path,
+            poses=poses,
+            betas=betas,
+            gender=gender,
+            frame_rate_hz=frame_rate_hz,
+            diagnostics=diagnostics,
+        )
+        if output_path.exists() and not config.force:
+            skipped_existing += 1
+            continue
+        planned.append(take)
+    return planned, skipped_existing
+
+
+def _process_source_file(source_path: Path, config: ConversionConfig) -> dict[str, Any]:
+    try:
+        _configure_worker_runtime(config.limit_threads)
+        loaded = _load_pickle(source_path)
+        planned, skipped_existing = _plan_take_records(source_path, loaded, config)
+
+        results: list[dict[str, Any]] = []
+        failures: list[dict[str, Any]] = []
+        for take in planned:
+            try:
+                print(f"Convert {take.source_path} :: {take.take_name}", flush=True)
+                results.append(_convert_one_take(take, config))
+            except Exception as exc:
+                failures.append(
+                    {
+                        "source_path": str(take.source_path),
+                        "take_name": take.take_name,
+                        "output_path": str(take.output_path),
+                        "error": str(exc),
+                    }
+                )
+                print(f"Fail {take.source_path} :: {take.take_name} -> {exc}", file=sys.stderr, flush=True)
+
+        return {
+            "source_path": str(source_path),
+            "written_count": len(results),
+            "skipped_existing_count": int(skipped_existing),
+            "failed_count": len(failures),
+            "files": results,
+            "failures": failures,
+            "status": "ok",
+        }
+    except Exception as exc:
+        return {
+            "source_path": str(source_path),
+            "written_count": 0,
+            "skipped_existing_count": 0,
+            "failed_count": 1,
+            "files": [],
+            "failures": [
+                {
+                    "source_path": str(source_path),
+                    "take_name": None,
+                    "output_path": None,
+                    "error": str(exc),
+                }
+            ],
+            "status": "failed",
+        }
 
 
 def _load_pickle(path: Path) -> Any:
@@ -748,61 +877,85 @@ def main() -> None:
     source_files = _discover_pickles(input_root, args.recursive)
     if not source_files:
         raise FileNotFoundError(f"No .pkl files found under {input_root}")
+    if args.workers < 1:
+        raise ValueError("--workers must be >= 1")
 
     output_root.mkdir(parents=True, exist_ok=True)
 
-    planned: list[TakeRecord] = []
-    skipped_existing = 0
-    for source_path in source_files:
-        loaded = _load_pickle(source_path)
-        for take_name, record in _iter_take_records(loaded, source_path):
-            poses, betas, gender, frame_rate_hz, diagnostics = _extract_take_record(
-                record=record,
-                source_path=source_path,
-                take_name=take_name,
-                fallback_frame_rate=float(args.frame_rate),
-                num_betas=int(args.num_betas),
-            )
-            output_path = _build_output_path(output_root, input_root, source_path, take_name)
-            take = TakeRecord(
-                source_path=source_path,
-                take_name=str(take_name),
-                output_path=output_path,
-                poses=poses,
-                betas=betas,
-                gender=gender,
-                frame_rate_hz=frame_rate_hz,
-                diagnostics=diagnostics,
-            )
-            if output_path.exists() and not args.force:
-                skipped_existing += 1
-                continue
-            planned.append(take)
+    config = ConversionConfig(
+        input_root=input_root,
+        output_root=output_root,
+        repo_root=repo_root,
+        transfer_data_root=transfer_data_root,
+        smpl_model_root=smpl_model_root,
+        force=bool(args.force),
+        frame_rate_hz=float(args.frame_rate),
+        num_betas=int(args.num_betas),
+        keep_workdirs=bool(args.keep_workdirs),
+        limit_threads=args.workers > 1,
+    )
 
     if args.dry_run:
-        print(f"Planned {len(planned)} conversions from {len(source_files)} source files.")
-        for item in planned[:50]:
-            print(f"{item.source_path} -> {item.output_path}")
-        if len(planned) > 50:
-            print(f"... {len(planned) - 50} more")
+        planned_total = 0
+        skipped_existing = 0
+        for source_path in source_files:
+            loaded = _load_pickle(source_path)
+            planned, skipped = _plan_take_records(source_path, loaded, config)
+            planned_total += len(planned)
+            skipped_existing += skipped
+            print(
+                f"{source_path}: planned {len(planned)} conversions, skipped {skipped}",
+                flush=True,
+            )
+            for item in planned[:10]:
+                print(f"  {item.source_path} -> {item.output_path}", flush=True)
+            if len(planned) > 10:
+                print(f"  ... {len(planned) - 10} more", flush=True)
+        print(
+            f"Planned {planned_total} conversions from {len(source_files)} source files "
+            f"({skipped_existing} already present).",
+            flush=True,
+        )
         return
+
+    print(
+        f"Parallel mode: {args.workers} worker(s) over {len(source_files)} source pickle(s).",
+        flush=True,
+    )
+
+    source_results: list[dict[str, Any]] = []
+    if args.workers == 1:
+        for source_path in source_files:
+            source_results.append(_process_source_file(source_path, config))
+    else:
+        max_workers = min(int(args.workers), len(source_files))
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_to_source = {
+                executor.submit(_process_source_file, source_path, config): source_path
+                for source_path in source_files
+            }
+            completed = 0
+            for future in concurrent.futures.as_completed(future_to_source):
+                completed += 1
+                result = future.result()
+                source_results.append(result)
+                print(
+                    f"[{completed}/{len(source_files)}] {Path(result['source_path']).name}: "
+                    f"written {result['written_count']}, skipped {result['skipped_existing_count']}, "
+                    f"failed {result['failed_count']}",
+                    flush=True,
+                )
 
     results: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
-    for take in planned:
-        try:
-            print(f"Convert {take.source_path} :: {take.take_name}")
-            results.append(_convert_one_take(take, args, repo_root, transfer_data_root, smpl_model_root))
-        except Exception as exc:
-            failures.append(
-                {
-                    "source_path": str(take.source_path),
-                    "take_name": take.take_name,
-                    "output_path": str(take.output_path),
-                    "error": str(exc),
-                }
-            )
-            print(f"Fail {take.source_path} :: {take.take_name} -> {exc}", file=sys.stderr)
+    skipped_existing = 0
+    for source_result in source_results:
+        results.extend(source_result["files"])
+        failures.extend(source_result["failures"])
+        skipped_existing += int(source_result["skipped_existing_count"])
+
+    results.sort(key=lambda item: (item["source_path"], item["take_name"]))
+    failures.sort(key=lambda item: (item["source_path"], item.get("take_name") or ""))
 
     summary = {
         "input_root": str(input_root),
