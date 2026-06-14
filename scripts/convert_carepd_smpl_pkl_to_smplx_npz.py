@@ -17,6 +17,14 @@ from typing import Any, Mapping
 
 import numpy as np
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from smplx.transfer_model import merge_output as transfer_merge_output
+from smplx.transfer_model.transfer_model import prepare_fitting_assets, run_fitting
+from smplx.transfer_model.utils import read_deformation_transfer
+
 
 DEFAULT_INPUT_ROOT = Path("/Volumes/MAEVE/dataset/CARE-PD/Canonicalized_SMPL_pickles")
 DEFAULT_OUTPUT_DIR = Path("/Volumes/MAEVE/dataset/CARE-PD/npz")
@@ -25,6 +33,23 @@ DEFAULT_NUM_BETAS = 16
 DEFAULT_SMPLX_REPO_ROOT = Path(__file__).resolve().parents[1] / "smplx"
 DEFAULT_TRANSFER_DATA_ROOT = Path(__file__).resolve().parents[1] / "transfer_data"
 DEFAULT_SMPL_MODEL_ROOT = Path(__file__).resolve().parents[1] / "model" / "smpl"
+TRANSFER_MODEL_NUM_BETAS = 10
+TRANSFER_MODEL_NUM_EXPRESSION = 10
+_IN_MEMORY_MERGE_KEYS = (
+    "transl",
+    "global_orient",
+    "body_pose",
+    "betas",
+    "left_hand_pose",
+    "right_hand_pose",
+    "jaw_pose",
+    "leye_pose",
+    "reye_pose",
+    "expression",
+)
+
+
+_IN_MEMORY_RUNTIME_CACHE: dict[tuple[str, ...], InMemoryWorkerRuntime] = {}
 
 
 @dataclass(frozen=True)
@@ -34,6 +59,7 @@ class ConversionConfig:
     repo_root: Path
     transfer_data_root: Path
     smpl_model_root: Path
+    pipeline: str
     force: bool
     frame_rate_hz: float
     num_betas: int
@@ -51,6 +77,19 @@ class TakeRecord:
     gender: str
     frame_rate_hz: float
     diagnostics: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class InMemoryWorkerRuntime:
+    device: Any
+    def_matrix: Any
+    mask_ids: Any
+    transfer_cfg: dict[str, Any]
+    source_model: Any
+    target_models: dict[str, Any]
+    target_assets: dict[str, Any]
+    source_faces: np.ndarray
+    source_faces_tensor: Any
 
 
 def parse_args() -> argparse.Namespace:
@@ -131,6 +170,15 @@ def parse_args() -> argparse.Namespace:
         "--summary-name",
         default="conversion_summary.json",
         help="JSON summary filename written inside output root.",
+    )
+    parser.add_argument(
+        "--pipeline",
+        choices=("in-memory", "classic"),
+        default="in-memory",
+        help=(
+            "Conversion backend. 'in-memory' avoids intermediate OBJ/pkl files and "
+            "reuses loaded models; 'classic' keeps the original transfer_model CLI flow."
+        ),
     )
     return parser.parse_args()
 
@@ -463,6 +511,134 @@ def _build_subprocess_env(limit_threads: bool) -> dict[str, str]:
     return env
 
 
+def _transfer_exp_cfg() -> dict[str, Any]:
+    return {
+        "summary_steps": 100,
+        "interactive": False,
+        "optim": {
+            "type": "trust-ncg",
+            "maxiters": 100,
+            "gtol": 1e-6,
+        },
+        "edge_fitting": {
+            "per_part": False,
+        },
+        "vertex_fitting": {},
+    }
+
+
+def _model_file(root: Path, prefix: str, gender: str, ext: str) -> Path:
+    requested = _resolve_model_gender(root, prefix, gender)
+    return root / f"{prefix}_{requested.upper()}.{ext}"
+
+
+def _runtime_cache_key(config: ConversionConfig) -> tuple[str, ...]:
+    return (
+        str(config.input_root),
+        str(config.output_root),
+        str(config.repo_root),
+        str(config.transfer_data_root),
+        str(config.smpl_model_root),
+        str(config.pipeline),
+        str(config.force),
+        str(config.frame_rate_hz),
+        str(config.num_betas),
+        str(config.keep_workdirs),
+        str(config.limit_threads),
+    )
+
+
+def _build_in_memory_runtime(config: ConversionConfig) -> InMemoryWorkerRuntime:
+    import torch
+    import smplx
+    from smplx import build_layer
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if config.limit_threads:
+        _configure_worker_runtime(True)
+
+    def_matrix = read_deformation_transfer(
+        str(config.transfer_data_root / "smpl2smplx_deftrafo_setup.pkl"),
+        device=device,
+    )
+    mask_ids = np.load(config.transfer_data_root / "smplx_mask_ids.npy")
+    mask_ids = torch.as_tensor(mask_ids, dtype=torch.long, device=device)
+
+    source_gender = _resolve_model_gender(config.smpl_model_root, "SMPL", "neutral")
+    source_model_path = _model_file(config.smpl_model_root, "SMPL", source_gender, "pkl")
+    source_model = smplx.create(
+        model_path=str(source_model_path),
+        model_type="smpl",
+        use_pca=False,
+        batch_size=1,
+        gender=source_gender,
+        ext="pkl",
+        num_betas=max(1, int(config.num_betas)),
+    ).to(device=device)
+    source_model.eval()
+    source_faces = np.asarray(source_model.faces, dtype=np.int32)
+    source_faces_tensor = torch.as_tensor(source_faces, dtype=torch.long, device=device)
+
+    runtime = InMemoryWorkerRuntime(
+        device=device,
+        def_matrix=def_matrix,
+        mask_ids=mask_ids,
+        transfer_cfg=_transfer_exp_cfg(),
+        source_model=source_model,
+        target_models={},
+        target_assets={},
+        source_faces=source_faces,
+        source_faces_tensor=source_faces_tensor,
+    )
+    return runtime
+
+
+def _get_worker_runtime(config: ConversionConfig) -> InMemoryWorkerRuntime:
+    key = _runtime_cache_key(config)
+    runtime = _IN_MEMORY_RUNTIME_CACHE.get(key)
+    if runtime is None:
+        runtime = _build_in_memory_runtime(config)
+        _IN_MEMORY_RUNTIME_CACHE[key] = runtime
+    return runtime
+
+
+def _get_target_model_and_assets(
+    runtime: InMemoryWorkerRuntime,
+    config: ConversionConfig,
+    gender: str,
+):
+    import torch
+    from smplx import build_layer
+
+    resolved_gender = _resolve_model_gender(config.smpl_model_root, "SMPLX", gender)
+    model = runtime.target_models.get(resolved_gender)
+    if model is None:
+        model_path = _model_file(config.smpl_model_root, "SMPLX", resolved_gender, "npz")
+        model = build_layer(
+            str(model_path),
+            gender=resolved_gender,
+            use_compressed=False,
+            use_face_contour=True,
+            num_betas=TRANSFER_MODEL_NUM_BETAS,
+            num_expression_coeffs=TRANSFER_MODEL_NUM_EXPRESSION,
+            batch_size=1,
+            ext="npz",
+        ).to(device=runtime.device)
+        model.eval()
+        runtime.target_models[resolved_gender] = model
+
+    assets = runtime.target_assets.get(resolved_gender)
+    if assets is None:
+        assets = prepare_fitting_assets(
+            runtime.transfer_cfg,
+            model,
+            runtime.def_matrix,
+            mask_ids=runtime.mask_ids,
+        )
+        runtime.target_assets[resolved_gender] = assets
+    return model, assets, resolved_gender
+
+
 def _write_motion_npz(path: Path, poses: np.ndarray, betas: np.ndarray, gender: str, frame_rate_hz: float) -> None:
     _ensure_dir(path.parent)
     np.savez_compressed(
@@ -645,22 +821,79 @@ def _normalize_translation_sequence(array: Any) -> np.ndarray:
     raise ValueError(f"Unsupported transl shape {arr.shape}")
 
 
-def _merged_pkl_to_amass_npz(
-    merged_path: Path,
+def _source_vertices_for_take(
+    runtime: InMemoryWorkerRuntime,
+    poses: np.ndarray,
+    betas: np.ndarray,
+) -> np.ndarray:
+    import torch
+
+    pose_array = np.asarray(poses, dtype=np.float32)
+    if pose_array.ndim != 2:
+        raise ValueError(f"Expected 2D pose array, got shape {pose_array.shape}")
+    if pose_array.shape[1] < 72:
+        pose_array = np.pad(pose_array, ((0, 0), (0, 72 - pose_array.shape[1])), mode="constant")
+    elif pose_array.shape[1] > 72:
+        pose_array = pose_array[:, :72]
+
+    betas_vec = np.asarray(betas, dtype=np.float32).reshape(-1)
+    if betas_vec.size == 0:
+        betas_vec = np.zeros((runtime.source_model.num_betas,), dtype=np.float32)
+    if betas_vec.size < runtime.source_model.num_betas:
+        betas_vec = np.pad(betas_vec, (0, runtime.source_model.num_betas - betas_vec.size))
+    elif betas_vec.size > runtime.source_model.num_betas:
+        betas_vec = betas_vec[: runtime.source_model.num_betas]
+
+    betas_t = torch.as_tensor(
+        betas_vec[: runtime.source_model.num_betas],
+        dtype=torch.float32,
+        device=runtime.device,
+    ).reshape(1, -1)
+    betas_t = betas_t.repeat(int(pose_array.shape[0]), 1)
+
+    root_orient = torch.as_tensor(pose_array[:, :3], dtype=torch.float32, device=runtime.device)
+    body_pose = torch.as_tensor(pose_array[:, 3:], dtype=torch.float32, device=runtime.device)
+    transl = torch.zeros((pose_array.shape[0], 3), dtype=torch.float32, device=runtime.device)
+
+    with torch.no_grad():
+        output = runtime.source_model(
+            betas=betas_t,
+            global_orient=root_orient,
+            body_pose=body_pose,
+            transl=transl,
+            return_verts=True,
+        )
+    return output.vertices.detach().cpu().numpy()
+
+
+def _aggregate_in_memory_outputs(
+    frame_outputs: list[Mapping[str, Any]],
+    gender: str,
+) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for key in _IN_MEMORY_MERGE_KEYS:
+        values = [frame[key] for frame in frame_outputs if key in frame]
+        if not values:
+            continue
+        merged[key] = transfer_merge_output.aggregate_function[key](values)
+    merged["gender"] = gender
+    return merged
+
+
+def _merged_dict_to_amass_npz(
+    merged: Mapping[str, Any],
     output_path: Path,
     source_path: Path,
     take_name: str,
     frame_rate_hz: float,
+    pipeline: str,
 ) -> None:
-    with merged_path.open("rb") as handle:
-        merged = pickle.load(handle)
-
     if merged.get("transl") is None:
-        raise KeyError(f"Missing transl in {merged_path}")
+        raise KeyError(f"Missing transl for {output_path}")
     if merged.get("global_orient") is None:
-        raise KeyError(f"Missing global_orient in {merged_path}")
+        raise KeyError(f"Missing global_orient for {output_path}")
     if merged.get("body_pose") is None:
-        raise KeyError(f"Missing body_pose in {merged_path}")
+        raise KeyError(f"Missing body_pose for {output_path}")
 
     transl = _normalize_translation_sequence(merged.get("transl"))
     root_orient = _normalize_axis_angle_sequence(merged.get("global_orient"), 3)
@@ -695,11 +928,15 @@ def _merged_pkl_to_amass_npz(
     else:
         reye_pose = _normalize_axis_angle_sequence(reye_pose, 3)
 
-    betas = np.asarray(merged.get("betas"), dtype=np.float32)
-    if betas.ndim > 1:
-        betas = betas.mean(axis=0)
-    if betas.size == 0:
+    betas_value = merged.get("betas")
+    if betas_value is None:
         betas = np.zeros((DEFAULT_NUM_BETAS,), dtype=np.float32)
+    else:
+        betas = np.asarray(betas_value, dtype=np.float32)
+        if betas.ndim > 1:
+            betas = betas.mean(axis=0)
+        if betas.size == 0:
+            betas = np.zeros((DEFAULT_NUM_BETAS,), dtype=np.float32)
 
     gender = str(merged.get("gender", "neutral")).lower()
     n_frames = int(transl.shape[0])
@@ -722,6 +959,7 @@ def _merged_pkl_to_amass_npz(
             json.dumps(
                 {
                     "merged_keys": sorted(str(key) for key in merged.keys()),
+                    "pipeline": pipeline,
                     "source_path": str(source_path),
                     "take_name": take_name,
                     "frame_rate_hz": float(frame_rate_hz),
@@ -732,11 +970,91 @@ def _merged_pkl_to_amass_npz(
     )
 
 
+def _merged_pkl_to_amass_npz(
+    merged_path: Path,
+    output_path: Path,
+    source_path: Path,
+    take_name: str,
+    frame_rate_hz: float,
+) -> None:
+    with merged_path.open("rb") as handle:
+        merged = pickle.load(handle)
+    _merged_dict_to_amass_npz(
+        merged=merged,
+        output_path=output_path,
+        source_path=source_path,
+        take_name=take_name,
+        frame_rate_hz=frame_rate_hz,
+        pipeline="classic",
+    )
+
+
+def _convert_one_take_in_memory(
+    take: TakeRecord,
+    config: ConversionConfig,
+) -> dict[str, Any]:
+    runtime = _get_worker_runtime(config)
+    target_model, prepared_assets, _ = _get_target_model_and_assets(runtime, config, take.gender)
+    source_vertices = _source_vertices_for_take(runtime, take.poses, take.betas)
+
+    import torch
+
+    frame_outputs: list[Mapping[str, Any]] = []
+    for frame_idx in range(source_vertices.shape[0]):
+        batch = {
+            "vertices": torch.as_tensor(
+                source_vertices[frame_idx : frame_idx + 1],
+                dtype=torch.float32,
+                device=runtime.device,
+            ),
+            "faces": runtime.source_faces_tensor,
+        }
+        var_dict = run_fitting(
+            runtime.transfer_cfg,
+            batch,
+            target_model,
+            runtime.def_matrix,
+            mask_ids=runtime.mask_ids,
+            prepared_assets=prepared_assets,
+        )
+        frame_output: dict[str, Any] = {}
+        for key in _IN_MEMORY_MERGE_KEYS:
+            value = var_dict.get(key)
+            if value is None:
+                continue
+            if torch.is_tensor(value):
+                frame_output[key] = value.detach().cpu()
+            else:
+                frame_output[key] = torch.as_tensor(np.asarray(value))
+        frame_outputs.append(frame_output)
+
+    merged = _aggregate_in_memory_outputs(frame_outputs, take.gender)
+    _merged_dict_to_amass_npz(
+        merged=merged,
+        output_path=take.output_path,
+        source_path=take.source_path,
+        take_name=take.take_name,
+        frame_rate_hz=take.frame_rate_hz,
+        pipeline="in-memory",
+    )
+    return {
+        "source_path": str(take.source_path),
+        "take_name": take.take_name,
+        "output_path": str(take.output_path),
+        "n_frames": int(take.poses.shape[0]),
+        "gender": take.gender,
+        "frame_rate_hz": float(take.frame_rate_hz),
+        "status": "written",
+    }
+
+
 def _convert_one_take(
     take: TakeRecord,
     config: ConversionConfig,
 ) -> dict[str, Any]:
-    work_root = Path(tempfile.mkdtemp(prefix="carepd_transfer_", dir=str(config.output_root)))
+    # Keep temporary workdirs off the output volume so cleanup or sync tooling
+    # on the results directory cannot interfere with in-flight conversions.
+    work_root = Path(tempfile.mkdtemp(prefix="carepd_transfer_"))
     try:
         models_root = _prepare_official_models_root(work_root, config.smpl_model_root)
         target_gender = _resolve_model_gender(models_root / "smplx", "SMPLX", take.gender)
@@ -744,8 +1062,6 @@ def _convert_one_take(
         transfer_output = work_root / "transfer_output"
         config_path = work_root / "smpl2smplx.yaml"
 
-        motion_npz = work_root / "motion.npz"
-        _write_motion_npz(motion_npz, take.poses, take.betas, take.gender, take.frame_rate_hz)
         _write_smpl_meshes(smpl_meshes, take.poses, take.betas, take.gender, models_root)
         _write_transfer_config(config_path, smpl_meshes, config.transfer_data_root, models_root, target_gender)
         _run_transfer_model(config.repo_root, config_path, config.limit_threads)
@@ -813,12 +1129,14 @@ def _process_source_file(source_path: Path, config: ConversionConfig) -> dict[st
         loaded = _load_pickle(source_path)
         planned, skipped_existing = _plan_take_records(source_path, loaded, config)
 
+        convert_take = _convert_one_take_in_memory if config.pipeline == "in-memory" else _convert_one_take
+
         results: list[dict[str, Any]] = []
         failures: list[dict[str, Any]] = []
         for take in planned:
             try:
                 print(f"Convert {take.source_path} :: {take.take_name}", flush=True)
-                results.append(_convert_one_take(take, config))
+                results.append(convert_take(take, config))
             except Exception as exc:
                 failures.append(
                     {
@@ -880,6 +1198,14 @@ def main() -> None:
     if args.workers < 1:
         raise ValueError("--workers must be >= 1")
 
+    effective_workers = int(args.workers)
+    if args.pipeline == "in-memory" and effective_workers != 1:
+        print(
+            f"In-memory pipeline uses a single GPU worker; ignoring --workers={effective_workers}.",
+            flush=True,
+        )
+        effective_workers = 1
+
     output_root.mkdir(parents=True, exist_ok=True)
 
     config = ConversionConfig(
@@ -892,7 +1218,8 @@ def main() -> None:
         frame_rate_hz=float(args.frame_rate),
         num_betas=int(args.num_betas),
         keep_workdirs=bool(args.keep_workdirs),
-        limit_threads=args.workers > 1,
+        limit_threads=effective_workers > 1,
+        pipeline=str(args.pipeline),
     )
 
     if args.dry_run:
@@ -919,16 +1246,24 @@ def main() -> None:
         return
 
     print(
-        f"Parallel mode: {args.workers} worker(s) over {len(source_files)} source pickle(s).",
+        f"Parallel mode: {effective_workers} worker(s) over {len(source_files)} source pickle(s) "
+        f"with {args.pipeline} pipeline.",
         flush=True,
     )
 
     source_results: list[dict[str, Any]] = []
-    if args.workers == 1:
-        for source_path in source_files:
-            source_results.append(_process_source_file(source_path, config))
+    if effective_workers == 1:
+        for idx, source_path in enumerate(source_files, start=1):
+            result = _process_source_file(source_path, config)
+            source_results.append(result)
+            print(
+                f"[{idx}/{len(source_files)}] {Path(result['source_path']).name}: "
+                f"written {result['written_count']}, skipped {result['skipped_existing_count']}, "
+                f"failed {result['failed_count']}",
+                flush=True,
+            )
     else:
-        max_workers = min(int(args.workers), len(source_files))
+        max_workers = min(effective_workers, len(source_files))
         with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
             future_to_source = {
                 executor.submit(_process_source_file, source_path, config): source_path
@@ -963,6 +1298,8 @@ def main() -> None:
         "smplx_repo_root": str(repo_root),
         "transfer_data_root": str(transfer_data_root),
         "smpl_model_root": str(smpl_model_root),
+        "pipeline": str(args.pipeline),
+        "workers": int(effective_workers),
         "source_file_count": len(source_files),
         "written_count": len(results),
         "skipped_existing_count": int(skipped_existing),
@@ -971,6 +1308,7 @@ def main() -> None:
         "failures": failures,
     }
     summary_path = output_root / str(args.summary_name)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     print(f"Summary: {summary_path}")
     if failures:
