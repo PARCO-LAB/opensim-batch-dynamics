@@ -101,7 +101,16 @@ conda activate opensim-torque
 python -m pip install --no-build-isolation git+https://github.com/vchoutas/torch-trust-ncg.git
 ```
 
-5. Clone AddBiomechanics:
+5. Install the PSBody mesh package required by `smplx/transfer_model`:
+
+```bash
+sudo apt-get install -y libboost-dev
+git clone https://github.com/MPI-IS/mesh.git "$HOME/mesh"
+cd "$HOME/mesh"
+make all
+```
+
+6. Clone AddBiomechanics:
 
 ```bash
 git clone https://github.com/keenon/AddBiomechanics.git "$HOME/AddBiomechanics"
@@ -123,7 +132,16 @@ conda activate opensim-torque
 python -m pip install --no-build-isolation git+https://github.com/vchoutas/torch-trust-ncg.git
 ```
 
-4. Clone AddBiomechanics:
+4. Install the PSBody mesh package required by `smplx/transfer_model`:
+
+```bash
+sudo apt-get install -y libboost-dev
+git clone https://github.com/MPI-IS/mesh.git "$HOME/mesh"
+cd "$HOME/mesh"
+make all
+```
+
+5. Clone AddBiomechanics:
 
 ```bash
 git clone https://github.com/keenon/AddBiomechanics.git "$HOME/AddBiomechanics"
