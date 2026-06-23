@@ -15,6 +15,7 @@ from add_babel_action_column import (
     action_at_time,
     extract_frame_labels,
     extract_sequence_labels,
+    expand_dataset_alias_candidates,
     iter_babel_json_paths,
     normalize_feat_path,
     sequence_action_text,
@@ -200,7 +201,7 @@ def csv_to_feat_candidates(csv_path: Path, input_root: Path) -> list[str]:
             candidate = f"{prefix}/{suffix}" if prefix else suffix
             if candidate not in candidates:
                 candidates.append(candidate)
-    return candidates
+    return expand_dataset_alias_candidates(candidates)
 
 
 def collect_input_csvs(input_root: Path, output_root: Path, pattern: str) -> list[Path]:

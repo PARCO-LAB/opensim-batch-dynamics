@@ -28,6 +28,18 @@ class BabelMatch:
     seq_labels: list[str]
 
 
+DEFAULT_DATASET_ALIASES = {
+    "DFaust": "DFaust67",
+    "DFAUST": "DFaust67",
+    "Eyes_Japan_Dataset": "EyesJapanDataset",
+    "HDM05": "MPIHDM05",
+    "MoSh": "MPImosh",
+    "SSM": "SSMsynced",
+    "TCDHands": "TCDhandMocap",
+    "Transitions": "Transitionsmocap",
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -137,7 +149,30 @@ def candidate_feat_paths(input_csv: Path, explicit_feat_p: str | None) -> list[s
             candidate = f"{prefix}/{item}"
             if candidate not in candidates:
                 candidates.append(candidate)
-    return candidates
+    return expand_dataset_alias_candidates(candidates)
+
+
+def expand_dataset_alias_candidates(candidates: Iterable[str]) -> list[str]:
+    expanded: list[str] = []
+    for candidate in candidates:
+        normalized = candidate.replace("\\", "/")
+        for item in dataset_alias_variants(normalized):
+            if item not in expanded:
+                expanded.append(item)
+    return expanded
+
+
+def dataset_alias_variants(path: str) -> list[str]:
+    parts = path.replace("\\", "/").split("/")
+    variants = ["/".join(parts)]
+    for index, part in enumerate(parts):
+        alias = DEFAULT_DATASET_ALIASES.get(part)
+        if not alias:
+            continue
+        aliased = list(parts)
+        aliased[index] = alias
+        variants.append("/".join(aliased))
+    return variants
 
 
 def feat_matches(feat_p: str, candidates: list[str]) -> bool:
