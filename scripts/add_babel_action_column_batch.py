@@ -16,6 +16,7 @@ from add_babel_action_column import (
     extract_frame_labels,
     extract_sequence_labels,
     iter_babel_json_paths,
+    normalize_feat_path,
     sequence_action_text,
     split_priority,
 )
@@ -51,11 +52,13 @@ class BabelIndex:
                 best_by_feat[match.feat_p] = match
 
         self._by_suffix: dict[str, list[BabelMatch]] = {}
+        self._by_normalized_suffix: dict[str, list[BabelMatch]] = {}
         for match in best_by_feat.values():
             parts = match.feat_p.replace("\\", "/").split("/")
             for start in range(len(parts)):
                 suffix = "/".join(parts[start:])
                 self._by_suffix.setdefault(suffix, []).append(match)
+                self._by_normalized_suffix.setdefault(normalize_feat_path(suffix), []).append(match)
 
     @classmethod
     def from_json_paths(cls, json_paths: list[Path], label_field: str) -> "BabelIndex":
@@ -88,6 +91,8 @@ class BabelIndex:
     def find(self, candidates: list[str]) -> tuple[BabelMatch | None, list[BabelMatch]]:
         for candidate in sorted(set(candidates), key=lambda item: (item.count("/"), len(item)), reverse=True):
             matches = self._by_suffix.get(candidate.replace("\\", "/"))
+            if not matches:
+                matches = self._by_normalized_suffix.get(normalize_feat_path(candidate))
             if not matches:
                 continue
             if len(matches) == 1:

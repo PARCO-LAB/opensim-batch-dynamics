@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -141,7 +142,24 @@ def candidate_feat_paths(input_csv: Path, explicit_feat_p: str | None) -> list[s
 
 def feat_matches(feat_p: str, candidates: list[str]) -> bool:
     normalized = feat_p.replace("\\", "/")
-    return any(normalized == c or normalized.endswith("/" + c) for c in candidates)
+    if any(normalized == c or normalized.endswith("/" + c) for c in candidates):
+        return True
+    normalized_feat = normalize_feat_path(normalized)
+    return any(
+        normalized_feat == normalize_feat_path(candidate)
+        or normalized_feat.endswith("/" + normalize_feat_path(candidate))
+        for candidate in candidates
+    )
+
+
+def normalize_feat_path(path: str) -> str:
+    parts = path.replace("\\", "/").split("/")
+    normalized_parts = []
+    for part in parts:
+        normalized = re.sub(r"[^a-z0-9]+", "", part.lower())
+        if normalized:
+            normalized_parts.append(normalized)
+    return "/".join(normalized_parts)
 
 
 def label_text(label: dict[str, Any], field: str) -> str:
