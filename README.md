@@ -23,6 +23,7 @@ Additional NTU entrypoints:
 - [convert_humanml3d_joints_to_smplx_npz.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/convert_humanml3d_joints_to_smplx_npz.py): fits SMPL-X params from HumanML3D `joints/*.npy` 52-joint files.
 - [run_humanml3d_joints_batch_slurm.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/run_humanml3d_joints_batch_slurm.py): SLURM helper for HumanML3D `joints/*.npy -> .npz` conversion.
 - [convert_carepd_smpl_pkl_to_smplx_npz.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/convert_carepd_smpl_pkl_to_smplx_npz.py): converts CARE-PD SMPL `.pkl` takes to AMASS-like SMPL-X `.npz`, one file per take.
+- [extract_carepd_mds_updrs_gait_severity_csv.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/extract_carepd_mds_updrs_gait_severity_csv.py): extracts the CARE-PD `UPDRS_GAIT` score from each take into a semicolon-delimited CSV.
 
 ## Required Inputs and Assets
 
@@ -69,6 +70,14 @@ python scripts/convert_carepd_smpl_pkl_to_smplx_npz.py \
   --input-root /Volumes/MAEVE/dataset/CARE-PD/Canonicalized_SMPL_pickles \
   --output-dir /Volumes/MAEVE/dataset/CARE-PD/npz \
   --force
+```
+
+To extract the gait severity score only:
+
+```bash
+python scripts/extract_carepd_mds_updrs_gait_severity_csv.py \
+  --input-root /Volumes/MAEVE/dataset/CARE-PD/Canonicalized_SMPL_pickles \
+  --output-csv /Volumes/MAEVE/dataset/CARE-PD/carepd_mds_updrs_gait_severity.csv
 ```
 
 ## Ubuntu Setup
