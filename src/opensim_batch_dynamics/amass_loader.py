@@ -67,11 +67,6 @@ def _to_str(value: Any) -> str:
     return str(value)
 
 
-def _to_float(value: Any) -> float:
-    value = _to_scalar(value)
-    return float(value)
-
-
 def _is_supported_split_surface_model_type(surface_model_type: str) -> bool:
     """
     Accept split-pose formats derived from SMPL-X.
@@ -183,7 +178,7 @@ def _build_sequence_from_fields(
             f"Missing frame-rate field while parsing '{source.name}'. "
             "Expected 'mocap_frame_rate' or 'mocap_framerate'."
         )
-    frame_rate_hz = _to_float(frame_rate_raw)
+    frame_rate_hz = float(_to_scalar(frame_rate_raw))
 
     if "trans" not in fields:
         raise KeyError(f"Missing required field 'trans' while parsing '{source.name}'")

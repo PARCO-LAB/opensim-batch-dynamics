@@ -1,4 +1,4 @@
-name: opensim-torque
+name: opensim-torque-rt
 channels:
   - opensim-org
   - conda-forge
@@ -12,8 +12,17 @@ dependencies:
   - tqdm
   - matplotlib
   - pytorch
+  - cvxpy
+  - pandas
+  - pyyaml
+  - rtree
+  - shapely
   - pip
   - pip:
       - smplx
       - nimblephysics
       - meshio
+      - open3d
+      - loguru
+      - omegaconf
+      - pyrender

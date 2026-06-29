@@ -11,6 +11,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from batch_common import is_nonempty_file, read_manifest_record, resolve_submit_path, write_json as _write_json
+
 
 @dataclass(frozen=True)
 class BatchTask:
@@ -26,22 +28,6 @@ class SbatchChunk:
     sbatch_cmd: list[str]
     task_index_offset: int
     task_count: int
-
-
-def _resolve_submit_path(raw: str | Path) -> Path:
-    path = Path(os.path.expandvars(str(raw))).expanduser()
-    if path.is_absolute():
-        return path.resolve()
-    repo_root = Path(__file__).resolve().parents[1]
-    candidates = [
-        (Path.cwd() / path).resolve(),
-        (repo_root / path).resolve(),
-        (Path.home() / path).resolve(),
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return candidates[0]
 
 
 def _resolve_converter_script(raw: str | None) -> Path:
@@ -63,10 +49,6 @@ def _discover_joint_files(scan_root: Path, limit: int | None) -> list[Path]:
     if limit is not None:
         files = files[: max(0, int(limit))]
     return files
-
-
-def _is_ready(path: Path) -> bool:
-    return path.exists() and path.is_file() and path.stat().st_size > 0
 
 
 def _build_tasks(scan_root: Path, output_root: Path, limit: int | None) -> list[BatchTask]:
@@ -171,19 +153,6 @@ def _write_manifest(path: Path, tasks: list[BatchTask], commands: list[list[str]
                 )
                 + "\n"
             )
-
-
-def _read_manifest_record(manifest_path: Path, task_index: int) -> dict[str, object]:
-    with manifest_path.open("r", encoding="utf-8") as handle:
-        for idx, line in enumerate(handle):
-            if idx == task_index:
-                return json.loads(line)
-    raise IndexError(f"Task index {task_index} out of range: {manifest_path}")
-
-
-def _write_json(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def _write_sbatch_script(
@@ -352,8 +321,8 @@ def _submit_chunk_with_retry(
 
 
 def _submit(args: argparse.Namespace) -> int:
-    input_root = _resolve_submit_path(args.input_root)
-    output_root = _resolve_submit_path(args.output_dir)
+    input_root = resolve_submit_path(args.input_root)
+    output_root = resolve_submit_path(args.output_dir)
     scan_root = _scan_root(input_root, args.joints_subdir)
     converter_script = _resolve_converter_script(args.converter_script)
     if not scan_root.is_dir():
@@ -365,7 +334,7 @@ def _submit(args: argparse.Namespace) -> int:
     skipped = 0
     runnable: list[BatchTask] = []
     for task in tasks:
-        if args.skip_existing and _is_ready(task.output_npz_path):
+        if args.skip_existing and is_nonempty_file(task.output_npz_path):
             skipped += 1
         else:
             runnable.append(task)
@@ -484,13 +453,13 @@ def _worker(args: argparse.Namespace) -> int:
     if raw_index is None:
         raise ValueError("Need SLURM_ARRAY_TASK_ID or --task-index")
     task_index = int(raw_index) + int(args.task_index_offset)
-    record = _read_manifest_record(manifest_path, task_index)
+    record = read_manifest_record(manifest_path, task_index)
 
     output_npz = Path(str(record["output_npz_path"])).resolve()
     log_path = Path(str(record["log_path"])).resolve()
     result_path = manifest_path.parent / "results" / f"task_{task_index:06d}.json"
 
-    if args.skip_existing and _is_ready(output_npz):
+    if args.skip_existing and is_nonempty_file(output_npz):
         payload = {
             "task_index": task_index,
             "status": "skipped_existing",
@@ -515,7 +484,7 @@ def _worker(args: argparse.Namespace) -> int:
         + proc.stderr,
         encoding="utf-8",
     )
-    status = "ok" if proc.returncode == 0 and _is_ready(output_npz) else "failed"
+    status = "ok" if proc.returncode == 0 and is_nonempty_file(output_npz) else "failed"
     payload = {
         "task_index": task_index,
         "status": status,

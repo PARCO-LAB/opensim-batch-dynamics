@@ -9,17 +9,18 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.backends.backend_pdf import PdfPages
 
 from csv_explorer import load_motion_csv
-
-
-METRIC_EXCLUDE_PREFIXES = (
-    "ankle_angle_",
-    "subtalar_angle_",
-    "head_",
-    "wrist_",
-    "pro_sup_",
+from report_common import (
+    add_text_page,
+    binary_classification_metrics,
+    compute_smart_ylim,
+    format_float,
+    include_in_precision_metrics,
+    is_translational_dof,
+    mae,
+    rmse,
+    write_pdf_report,
 )
 
 
@@ -47,12 +48,6 @@ def default_output_pdf(offline_csv: Path, realtime_csv: Path) -> Path:
     return realtime_csv.with_name(f"{realtime_csv.stem}_vs_{offline_csv.stem}.pdf")
 
 
-def format_float(value: float | None, digits: int = 4) -> str:
-    if value is None or not np.isfinite(value):
-        return "n/a"
-    return f"{value:.{digits}f}"
-
-
 def smart_min_span(signal_kind: str, dof_name: str | None = None) -> float:
     translational = False if dof_name is None else is_translational_dof(dof_name)
 
@@ -73,81 +68,6 @@ def smart_min_span(signal_kind: str, dof_name: str | None = None) -> float:
     if signal_kind == "time_ms":
         return 2.0
     return 1.0
-
-
-def compute_smart_ylim(
-    *arrays: np.ndarray,
-    min_span: float,
-    pad_ratio: float = 0.12,
-    center_on_zero: bool = False,
-) -> tuple[float, float] | None:
-    finite_arrays = []
-    for arr in arrays:
-        values = np.asarray(arr, dtype=float).reshape(-1)
-        values = values[np.isfinite(values)]
-        if values.size:
-            finite_arrays.append(values)
-
-    if not finite_arrays:
-        return None
-
-    values = np.concatenate(finite_arrays)
-    low = float(np.min(values))
-    high = float(np.max(values))
-
-    if center_on_zero:
-        bound = max(abs(low), abs(high), 0.5 * float(min_span))
-        bound *= 1.0 + pad_ratio
-        return (-bound, bound)
-
-    span = high - low
-    if span < float(min_span):
-        mid = 0.5 * (low + high)
-        half = 0.5 * float(min_span)
-        low = mid - half
-        high = mid + half
-    else:
-        pad = max(span * pad_ratio, 0.02 * float(min_span))
-        low -= pad
-        high += pad
-
-    return (float(low), float(high))
-
-
-def rmse(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.sqrt(np.mean(np.square(np.asarray(a, dtype=float) - np.asarray(b, dtype=float)))))
-
-
-def mae(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.mean(np.abs(np.asarray(a, dtype=float) - np.asarray(b, dtype=float))))
-
-
-def binary_classification_metrics(pred: np.ndarray, target: np.ndarray) -> dict[str, float]:
-    pred_bool = np.asarray(pred, dtype=bool)
-    target_bool = np.asarray(target, dtype=bool)
-    tp = float(np.sum(pred_bool & target_bool))
-    tn = float(np.sum((~pred_bool) & (~target_bool)))
-    fp = float(np.sum(pred_bool & (~target_bool)))
-    fn = float(np.sum((~pred_bool) & target_bool))
-    total = tp + tn + fp + fn
-    accuracy = (tp + tn) / total if total > 0.0 else 0.0
-    precision = tp / (tp + fp) if (tp + fp) > 0.0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0.0 else 0.0
-    f1 = 2.0 * precision * recall / (precision + recall) if (precision + recall) > 0.0 else 0.0
-    return {
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-    }
-
-
-def is_translational_dof(name: str) -> bool:
-    return name.endswith("_tx") or name.endswith("_ty") or name.endswith("_tz")
-
-
-def include_in_precision_metrics(dof_name: str) -> bool:
-    return not any(dof_name.startswith(prefix) for prefix in METRIC_EXCLUDE_PREFIXES)
 
 
 def contact_intervals(time_values: np.ndarray, contact_values: np.ndarray) -> list[tuple[float, float]]:
@@ -388,13 +308,9 @@ def build_report(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
-def add_title_page(pdf: PdfPages, report: dict[str, object]) -> None:
+def add_title_page(pdf: object, report: dict[str, object]) -> None:
     metrics = report["metrics"]
     assert isinstance(metrics, dict)
-    fig = plt.figure(figsize=(11.69, 8.27))
-    fig.suptitle(str(report["title"]), fontsize=18, fontweight="bold", y=0.98)
-    ax = fig.add_subplot(111)
-    ax.axis("off")
 
     lines = [
         f"Offline CSV:  {report['offline_csv']}",
@@ -430,12 +346,10 @@ def add_title_page(pdf: PdfPages, report: dict[str, object]) -> None:
         lines.append(f"solve time mean [ms]: {format_float(float(np.mean(report['solve_time_ms'])), 3)}")
         lines.append(f"solve time p95  [ms]: {format_float(float(np.percentile(report['solve_time_ms'], 95.0)), 3)}")
 
-    ax.text(0.02, 0.96, "\n".join(lines), va="top", ha="left", fontsize=11, family="monospace")
-    pdf.savefig(fig, bbox_inches="tight")
-    plt.close(fig)
+    add_text_page(pdf, str(report["title"]), lines, body_y=0.96)
 
 
-def add_overview_page(pdf: PdfPages, report: dict[str, object]) -> None:
+def add_overview_page(pdf: object, report: dict[str, object]) -> None:
     time_values = np.asarray(report["time"], dtype=float)
     q_frame_rmse = np.asarray(report["q_frame_rmse"], dtype=float)
     tau_frame_rmse = np.asarray(report["tau_frame_rmse"], dtype=float)
@@ -488,7 +402,7 @@ def add_overview_page(pdf: PdfPages, report: dict[str, object]) -> None:
     plt.close(fig)
 
 
-def add_diagnostics_page(pdf: PdfPages, report: dict[str, object]) -> int:
+def add_diagnostics_page(pdf: object, report: dict[str, object]) -> int:
     diagnostics = [
         ("Realtime MPJPE [m]", report["mpjpe"], "#2563EB"),
         ("Dynamics residual norm", report["dyn_residual"], "#B91C1C"),
@@ -522,7 +436,7 @@ def add_diagnostics_page(pdf: PdfPages, report: dict[str, object]) -> int:
     return 1
 
 
-def add_dof_pages(pdf: PdfPages, report: dict[str, object], max_dofs: int | None = None) -> int:
+def add_dof_pages(pdf: object, report: dict[str, object], max_dofs: int | None = None) -> int:
     time_values = np.asarray(report["time"], dtype=float)
     dof_names = list(report["dof_names"])
     q_offline = np.asarray(report["q_offline"], dtype=float)
@@ -605,7 +519,7 @@ def add_dof_pages(pdf: PdfPages, report: dict[str, object], max_dofs: int | None
     return plotted
 
 
-def add_grf_pages(pdf: PdfPages, report: dict[str, object]) -> int:
+def add_grf_pages(pdf: object, report: dict[str, object]) -> int:
     time_values = np.asarray(report["time"], dtype=float)
     page_count = 0
 
@@ -677,13 +591,19 @@ def add_grf_pages(pdf: PdfPages, report: dict[str, object]) -> int:
 
 
 def build_pdf_report(report: dict[str, object], output_pdf: Path, max_dofs: int | None) -> dict[str, object]:
-    output_pdf.parent.mkdir(parents=True, exist_ok=True)
-    with PdfPages(output_pdf) as pdf:
-        add_title_page(pdf, report)
-        add_overview_page(pdf, report)
-        diagnostics_pages = add_diagnostics_page(pdf, report)
-        dof_pages = add_dof_pages(pdf, report, max_dofs=max_dofs)
-        grf_pages = add_grf_pages(pdf, report)
+    page_results = write_pdf_report(
+        output_pdf,
+        [
+            lambda pdf: add_title_page(pdf, report),
+            lambda pdf: add_overview_page(pdf, report),
+            lambda pdf: add_diagnostics_page(pdf, report),
+            lambda pdf: add_dof_pages(pdf, report, max_dofs=max_dofs),
+            lambda pdf: add_grf_pages(pdf, report),
+        ],
+    )
+    diagnostics_pages = page_results[2]
+    dof_pages = page_results[3]
+    grf_pages = page_results[4]
 
     return {
         "output_pdf": str(output_pdf),

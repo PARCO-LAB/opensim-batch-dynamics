@@ -21,13 +21,6 @@ class FinalCsvSummary:
     height_m: float
 
 
-def _to_float(raw: str) -> float:
-    text = raw.strip()
-    if text == "":
-        return math.nan
-    return float(text)
-
-
 def _load_numeric_csv(path: Path) -> tuple[list[str], dict[str, np.ndarray]]:
     with path.open("r", encoding="utf-8", newline="") as file_obj:
         reader = csv.DictReader(file_obj)
@@ -40,7 +33,13 @@ def _load_numeric_csv(path: Path) -> tuple[list[str], dict[str, np.ndarray]]:
     headers = [str(name) for name in reader.fieldnames]
     data: dict[str, np.ndarray] = {}
     for header in headers:
-        data[header] = np.asarray([_to_float(row.get(header, "")) for row in rows], dtype=np.float64)
+        data[header] = np.asarray(
+            [
+                math.nan if not (text := row.get(header, "").strip()) else float(text)
+                for row in rows
+            ],
+            dtype=np.float64,
+        )
     return headers, data
 
 

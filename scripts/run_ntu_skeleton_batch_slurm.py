@@ -12,6 +12,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from batch_common import is_nonempty_file, read_manifest_record, resolve_submit_path, write_json as _write_json
+
 
 @dataclass(frozen=True)
 class BatchTask:
@@ -29,22 +31,6 @@ class SubjectTask:
     output_npz_paths: tuple[Path, ...]
     log_path: Path
     summary_json_path: Path
-
-
-def _resolve_submit_path(raw: str | Path) -> Path:
-    path = Path(os.path.expandvars(str(raw))).expanduser()
-    if path.is_absolute():
-        return path.resolve()
-    repo_root = Path(__file__).resolve().parents[1]
-    candidates = [
-        (Path.cwd() / path).resolve(),
-        (repo_root / path).resolve(),
-        (Path.home() / path).resolve(),
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return candidates[0]
 
 
 def _resolve_converter_script(raw: str | None) -> Path:
@@ -65,10 +51,6 @@ def _performer_key(path: Path) -> str:
     if not match:
         return "Punknown"
     return f"P{int(match.group('performer')):03d}"
-
-
-def _is_ready(path: Path) -> bool:
-    return path.exists() and path.is_file() and path.stat().st_size > 0
 
 
 def _build_tasks(input_root: Path, output_root: Path, limit: int | None) -> list[BatchTask]:
@@ -354,19 +336,6 @@ def _write_subject_manifest(path: Path, tasks: list[SubjectTask], commands: list
             )
 
 
-def _read_manifest_record(manifest_path: Path, task_index: int) -> dict[str, object]:
-    with manifest_path.open("r", encoding="utf-8") as handle:
-        for idx, line in enumerate(handle):
-            if idx == task_index:
-                return json.loads(line)
-    raise IndexError(f"Task index {task_index} out of range: {manifest_path}")
-
-
-def _write_json(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-
-
 def _write_sbatch_script(args: argparse.Namespace, output_root: Path, manifest_path: Path, task_count: int) -> Path:
     repo_root = Path(__file__).resolve().parents[1]
     slurm_root = output_root / "slurm"
@@ -425,8 +394,8 @@ def _write_sbatch_script(args: argparse.Namespace, output_root: Path, manifest_p
 
 
 def _submit(args: argparse.Namespace) -> int:
-    input_root = _resolve_submit_path(args.input_root)
-    output_root = _resolve_submit_path(args.output_dir)
+    input_root = resolve_submit_path(args.input_root)
+    output_root = resolve_submit_path(args.output_dir)
     converter_script = _resolve_converter_script(args.converter_script)
     if not input_root.is_dir():
         raise NotADirectoryError(f"Input root not found or not a directory: {input_root}")
@@ -437,7 +406,7 @@ def _submit(args: argparse.Namespace) -> int:
     skipped = 0
     runnable: list[BatchTask] = []
     for task in tasks:
-        if args.skip_existing and _is_ready(task.output_npz_path):
+        if args.skip_existing and is_nonempty_file(task.output_npz_path):
             skipped += 1
         else:
             runnable.append(task)
@@ -496,8 +465,8 @@ def _submit(args: argparse.Namespace) -> int:
 
 
 def _submit_subjects(args: argparse.Namespace) -> int:
-    input_root = _resolve_submit_path(args.input_root)
-    output_root = _resolve_submit_path(args.output_dir)
+    input_root = resolve_submit_path(args.input_root)
+    output_root = resolve_submit_path(args.output_dir)
     converter_script = _resolve_converter_script(args.converter_script)
     if not input_root.is_dir():
         raise NotADirectoryError(f"Input root not found or not a directory: {input_root}")
@@ -508,7 +477,7 @@ def _submit_subjects(args: argparse.Namespace) -> int:
     skipped = 0
     runnable: list[SubjectTask] = []
     for task in tasks:
-        expected_ready = all(_is_ready(path) for path in task.output_npz_paths)
+        expected_ready = all(is_nonempty_file(path) for path in task.output_npz_paths)
         if args.skip_existing and expected_ready:
             skipped += 1
         else:
@@ -573,8 +542,8 @@ def _submit_subjects(args: argparse.Namespace) -> int:
 
 
 def _prefit_shapes(args: argparse.Namespace) -> int:
-    input_root = _resolve_submit_path(args.input_root)
-    output_root = _resolve_submit_path(args.output_dir)
+    input_root = resolve_submit_path(args.input_root)
+    output_root = resolve_submit_path(args.output_dir)
     converter_script = _resolve_converter_script(args.converter_script)
     if not input_root.is_dir():
         raise NotADirectoryError(f"Input root not found or not a directory: {input_root}")
@@ -605,13 +574,13 @@ def _worker(args: argparse.Namespace) -> int:
     if raw_index is None:
         raise ValueError("Need SLURM_ARRAY_TASK_ID or --task-index")
     task_index = int(raw_index) + int(args.task_index_offset)
-    record = _read_manifest_record(manifest_path, task_index)
+    record = read_manifest_record(manifest_path, task_index)
 
     if record.get("kind") == "subject":
         output_npz_paths = [Path(str(path)).resolve() for path in record["output_npz_paths"]]
         log_path = Path(str(record["log_path"])).resolve()
         result_path = manifest_path.parent / "results" / f"task_{task_index:06d}.json"
-        if args.skip_existing and output_npz_paths and all(_is_ready(path) for path in output_npz_paths):
+        if args.skip_existing and output_npz_paths and all(is_nonempty_file(path) for path in output_npz_paths):
             payload = {
                 "task_index": task_index,
                 "status": "skipped_existing",
@@ -664,7 +633,7 @@ def _worker(args: argparse.Namespace) -> int:
     log_path = Path(str(record["log_path"])).resolve()
     result_path = manifest_path.parent / "results" / f"task_{task_index:06d}.json"
 
-    if args.skip_existing and _is_ready(output_npz):
+    if args.skip_existing and is_nonempty_file(output_npz):
         payload = {
             "task_index": task_index,
             "status": "skipped_existing",
@@ -689,7 +658,7 @@ def _worker(args: argparse.Namespace) -> int:
         + proc.stderr,
         encoding="utf-8",
     )
-    status = "ok" if proc.returncode == 0 and _is_ready(output_npz) else "failed"
+    status = "ok" if proc.returncode == 0 and is_nonempty_file(output_npz) else "failed"
     payload = {
         "task_index": task_index,
         "status": status,

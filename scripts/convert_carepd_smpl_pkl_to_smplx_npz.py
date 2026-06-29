@@ -266,15 +266,6 @@ def _unwrap(value: Any) -> Any:
     return value
 
 
-def _to_float(value: Any, default: float) -> float:
-    if value is None:
-        return float(default)
-    try:
-        return float(_unwrap(value))
-    except Exception:
-        return float(default)
-
-
 def _to_gender(value: Any) -> str:
     if value is None:
         return "neutral"
@@ -403,7 +394,11 @@ def _extract_take_record(
         return None
 
     gender = _to_gender(get("gender", "sex"))
-    frame_rate_hz = _to_float(get("mocap_frame_rate", "mocap_framerate", "fps", "frame_rate"), fallback_frame_rate)
+    frame_rate_value = get("mocap_frame_rate", "mocap_framerate", "fps", "frame_rate")
+    try:
+        frame_rate_hz = float(fallback_frame_rate if frame_rate_value is None else _unwrap(frame_rate_value))
+    except Exception:
+        frame_rate_hz = float(fallback_frame_rate)
     betas = _normalize_betas(get("betas", "shape", "beta"), num_betas)
 
     trans_raw = get("trans", "transl", "translation")

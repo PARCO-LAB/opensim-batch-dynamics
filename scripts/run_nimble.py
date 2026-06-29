@@ -11,6 +11,8 @@ from xml.etree import ElementTree as ET
 
 import numpy as np
 
+from report_common import is_translational_dof
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -98,11 +100,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _is_translational_dof(dof_name: str) -> bool:
-    # OpenSim translational DOFs usually end with _tx/_ty/_tz.
-    return dof_name.endswith("_tx") or dof_name.endswith("_ty") or dof_name.endswith("_tz")
-
-
 def _load_csv_rows(csv_path: Path) -> tuple[list[dict[str, str]], bool]:
     with csv_path.open("r", encoding="utf-8") as file_obj:
         reader = csv.DictReader(file_obj)
@@ -111,15 +108,6 @@ def _load_csv_rows(csv_path: Path) -> tuple[list[dict[str, str]], bool]:
             raise ValueError(f"CSV has no data rows: {csv_path}")
         has_time = "time" in reader.fieldnames if reader.fieldnames else False
     return rows, bool(has_time)
-
-
-def _to_float(value: str, column_name: str, row_idx: int) -> float:
-    try:
-        return float(value)
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(
-            f"Invalid numeric value at row {row_idx + 1}, column '{column_name}': {value}"
-        ) from exc
 
 
 def _build_positions(
@@ -145,14 +133,24 @@ def _build_positions(
 
     for frame_idx, row in enumerate(rows):
         if has_time and time_values is not None:
-            time_values[frame_idx] = _to_float(row["time"], "time", frame_idx)
+            try:
+                time_values[frame_idx] = float(row["time"])
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(
+                    f"Invalid numeric value at row {frame_idx + 1}, column 'time': {row['time']}"
+                ) from exc
         for dof_idx, dof_name in enumerate(dof_names):
             if dof_name not in row:
                 continue
-            value = _to_float(row[dof_name], dof_name, frame_idx)
+            try:
+                value = float(row[dof_name])
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(
+                    f"Invalid numeric value at row {frame_idx + 1}, column '{dof_name}': {row[dof_name]}"
+                ) from exc
             # CSV positions use OpenSim units: rotational in degrees, translational in meters.
             # Nimble expects radians for rotational coordinates.
-            if not _is_translational_dof(dof_name):
+            if not is_translational_dof(dof_name):
                 value = value * math.pi / 180.0
             q_matrix[frame_idx, dof_idx] = value
 

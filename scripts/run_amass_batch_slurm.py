@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
-import re
 import shlex
 import subprocess
 import sys
@@ -13,17 +11,19 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from batch_common import (
+    BatchTask,
+    build_trial_name,
+    discover_amass_input_files,
+    is_nonempty_file,
+    read_manifest_record,
+    resolve_pipeline_script,
+    resolve_submit_path,
+    write_json as _write_json,
+)
+
 DEFAULT_HPC_INPUT_ROOT = "storage/emartini/AMASS/AMASS"
 DEFAULT_HPC_OUTPUT_DIR = "storage/emartini/AMASS_torque"
-
-
-@dataclass(frozen=True)
-class BatchTask:
-    input_path: Path
-    relative_path: Path
-    output_csv_path: Path
-    log_path: Path
-    trial_name: str
 
 
 @dataclass(frozen=True)
@@ -34,71 +34,8 @@ class SbatchChunk:
     task_count: int
 
 
-def _sanitize_component(text: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("._-")
-    return cleaned or "trial"
-
-
-def _build_trial_name(relative_npz_path: Path) -> str:
-    base = relative_npz_path.with_suffix("").as_posix()
-    prefix = _sanitize_component(base.replace("/", "__"))
-    digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:8]
-    trial_name = f"{prefix}_{digest}"
-    if len(trial_name) > 140:
-        trial_name = trial_name[:131] + "_" + digest
-    return trial_name
-
-
-def _resolve_pipeline_script(path_from_arg: str | None) -> Path:
-    if path_from_arg:
-        return Path(path_from_arg).resolve()
-    repo_root = Path(__file__).resolve().parents[1]
-    return (repo_root / "scripts" / "run_amass_to_bsm_csv.py").resolve()
-
-
-def _resolve_submit_path(path_from_arg: str) -> Path:
-    raw_path = Path(os.path.expandvars(path_from_arg)).expanduser()
-    if raw_path.is_absolute():
-        return raw_path.resolve()
-
-    repo_root = Path(__file__).resolve().parents[1]
-    home_candidate = (Path.home() / raw_path).resolve()
-    cwd_candidate = (Path.cwd() / raw_path).resolve()
-    repo_candidate = (repo_root / raw_path).resolve()
-
-    if raw_path.parts and raw_path.parts[0] == "storage":
-        candidates = [home_candidate, cwd_candidate, repo_candidate]
-    else:
-        candidates = [cwd_candidate, repo_candidate, home_candidate]
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return candidates[0]
-
-
-def _discover_npz_files(input_root: Path) -> list[Path]:
-    excluded_names = {
-        "shape.npz",
-        "neutral_stagei.npz",
-        "female_stagei.npz",
-        "male_stagei.npz",
-    }
-    files = [
-        path for path in input_root.rglob("*.npz") if path.is_file() and path.name.lower() not in excluded_names
-    ] + [
-        path for path in input_root.rglob("*.npy") if path.is_file() and path.name.lower() not in excluded_names
-    ]
-    files.sort()
-    return files
-
-
-def _is_existing_csv_ready(path: Path) -> bool:
-    return path.exists() and path.is_file() and path.stat().st_size > 0
-
-
 def _build_tasks(input_root: Path, output_root: Path, limit: int | None) -> list[BatchTask]:
-    files = _discover_npz_files(input_root)
+    files = discover_amass_input_files(input_root)
     if limit is not None:
         files = files[: max(0, limit)]
 
@@ -107,7 +44,7 @@ def _build_tasks(input_root: Path, output_root: Path, limit: int | None) -> list
         relative_path = input_path.relative_to(input_root)
         output_csv_path = (output_root / relative_path).with_suffix(".csv")
         log_path = (output_root / "logs" / relative_path).with_suffix(".log")
-        trial_name = _build_trial_name(relative_path)
+        trial_name = build_trial_name(relative_path)
         tasks.append(
             BatchTask(
                 input_path=input_path,
@@ -346,23 +283,6 @@ def _build_sbatch_chunks(
     return chunks
 
 
-def _read_manifest_record(manifest_path: Path, task_index: int) -> dict[str, object]:
-    if task_index < 0:
-        raise ValueError("Task index must be >= 0")
-    with manifest_path.open("r", encoding="utf-8") as handle:
-        for idx, line in enumerate(handle):
-            if idx == task_index:
-                return json.loads(line)
-    raise IndexError(
-        f"Task index {task_index} is out of range for manifest: {manifest_path}"
-    )
-
-
-def _write_json(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-
-
 def _should_retry_sbatch(stderr_text: str) -> bool:
     msg = (stderr_text or "").lower()
     return (
@@ -438,9 +358,9 @@ def _run_submit(args: argparse.Namespace) -> int:
             "pass the mounted local path to --input-root."
         )
 
-    input_root = _resolve_submit_path(args.input_root)
-    output_root = _resolve_submit_path(args.output_dir)
-    pipeline_script = _resolve_pipeline_script(args.pipeline_script)
+    input_root = resolve_submit_path(args.input_root, prefer_storage_home=True)
+    output_root = resolve_submit_path(args.output_dir, prefer_storage_home=True)
+    pipeline_script = resolve_pipeline_script(args.pipeline_script)
     if not input_root.exists():
         raise FileNotFoundError(f"Input root not found: {input_root}")
     if not input_root.is_dir():
@@ -456,7 +376,7 @@ def _run_submit(args: argparse.Namespace) -> int:
     skipped_previous_ok = 0
     runnable: list[BatchTask] = []
     for task in tasks:
-        if args.skip_existing and _is_existing_csv_ready(task.output_csv_path):
+        if args.skip_existing and is_nonempty_file(task.output_csv_path):
             skipped_existing += 1
             continue
         if args.skip_previously_ok and previous_status.get(task.relative_path.as_posix()) == "ok":
@@ -630,7 +550,9 @@ def _run_worker(args: argparse.Namespace) -> int:
         task_index = int(raw_idx)
     task_index += int(args.task_index_offset)
 
-    record = _read_manifest_record(manifest_path, task_index=task_index)
+    if task_index < 0:
+        raise ValueError("Task index must be >= 0")
+    record = read_manifest_record(manifest_path, task_index=task_index)
     command = [str(token) for token in record["command"]]  # type: ignore[index]
     relative_path = str(record["relative_path"])
     output_csv_path = Path(str(record["output_csv_path"])).resolve()
@@ -640,7 +562,7 @@ def _run_worker(args: argparse.Namespace) -> int:
     result_path = result_dir / f"task_{task_index:06d}.json"
     started_at = time.time()
 
-    if args.skip_existing and _is_existing_csv_ready(output_csv_path):
+    if args.skip_existing and is_nonempty_file(output_csv_path):
         payload = {
             "task_index": task_index,
             "relative_path": relative_path,
@@ -689,7 +611,7 @@ def _run_worker(args: argparse.Namespace) -> int:
         )
         return 1
 
-    if not _is_existing_csv_ready(output_csv_path):
+    if not is_nonempty_file(output_csv_path):
         payload = {
             "task_index": task_index,
             "relative_path": relative_path,

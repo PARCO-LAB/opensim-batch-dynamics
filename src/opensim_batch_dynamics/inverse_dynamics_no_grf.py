@@ -15,6 +15,7 @@ from .mot_to_csv import (
     extract_coordinate_names_from_osim,
     infer_cutoff_hz,
     parse_mot,
+    _lowpass_butterworth_4th,
 )
 
 
@@ -145,35 +146,6 @@ def _prepare_model_for_inverse_dynamics(
 def _project_point_to_plane(point: np.ndarray, up: np.ndarray, plane_offset: float) -> np.ndarray:
     """Project a 3D point to the plane {x | dot(x, up) = plane_offset}."""
     return point - (float(np.dot(point, up)) - plane_offset) * up
-
-
-def _lowpass_butterworth_4th(
-    values: np.ndarray,
-    sample_rate_hz: float,
-    cutoff_hz: float | None,
-) -> np.ndarray:
-    """
-    Apply a 4th-order zero-phase Butterworth low-pass filter.
-
-    If filtering is unavailable or not meaningful for the signal length, this
-    function returns a copy of the input.
-    """
-    if cutoff_hz is None:
-        return values.copy()
-    if values.size < 20:
-        return values.copy()
-
-    try:
-        from scipy.signal import butter, filtfilt
-    except ImportError:
-        return values.copy()
-
-    nyquist_hz = 0.5 * float(sample_rate_hz)
-    effective_cutoff = min(float(cutoff_hz), 0.95 * nyquist_hz)
-    if effective_cutoff <= 0.0:
-        return values.copy()
-    b, a = butter(4, effective_cutoff, btype="low", fs=float(sample_rate_hz))
-    return filtfilt(b, a, values)
 
 
 def _project_force_to_friction_cone(
@@ -384,6 +356,7 @@ def _estimate_contact_wrenches_from_kinematics(
             com_positions[:, axis],
             sample_rate_hz=sample_rate_hz,
             cutoff_hz=contact_force_cutoff_hz,
+            missing_scipy_returns_copy=True,
         )
     body_positions_filt = np.zeros_like(body_positions)
     for body_idx in range(len(contact_nodes)):
@@ -392,6 +365,7 @@ def _estimate_contact_wrenches_from_kinematics(
                 body_positions[body_idx, :, axis],
                 sample_rate_hz=sample_rate_hz,
                 cutoff_hz=contact_force_cutoff_hz,
+                missing_scipy_returns_copy=True,
             )
 
     marker_entries_by_group: dict[str, list[tuple[object, np.ndarray]]] = {
@@ -430,6 +404,7 @@ def _estimate_contact_wrenches_from_kinematics(
                     point_positions[point_idx, :, axis],
                     sample_rate_hz=sample_rate_hz,
                     cutoff_hz=contact_force_cutoff_hz,
+                    missing_scipy_returns_copy=True,
                 )
         detection_points_by_group[group_key] = point_positions_filt
 
@@ -455,6 +430,7 @@ def _estimate_contact_wrenches_from_kinematics(
             total_external_force[:, axis],
             sample_rate_hz=sample_rate_hz,
             cutoff_hz=contact_force_cutoff_hz,
+            missing_scipy_returns_copy=True,
         )
 
     force_per_body = np.zeros((len(contact_nodes), frames, 3), dtype=np.float64)

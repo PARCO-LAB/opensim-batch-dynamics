@@ -12,12 +12,15 @@ class BsmMarkerMapTest(unittest.TestCase):
         self.assertEqual(marker_map["RTOE"], 8480)
         self.assertNotEqual(marker_map["LTOE"], marker_map["RTOE"])
 
-    def test_default_bsm_toe_markers_match_asset_map(self) -> None:
+    def test_default_bsm_marker_map_matches_asset_map(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        asset_path = repo_root / "assets" / "smpl2ab" / "bsm_markers_smplx.yaml"
         asset_map = load_bsm_marker_map(Path("assets/smpl2ab/bsm_markers_smplx.yaml"))
         fallback_map = load_bsm_marker_map(None)
 
-        self.assertEqual(fallback_map["LTOE"], asset_map["LTOE"])
-        self.assertEqual(fallback_map["RTOE"], asset_map["RTOE"])
+        self.assertEqual(fallback_map, asset_map)
+        self.assertEqual(fallback_map, load_bsm_marker_map(asset_path))
+        self.assertIn("RWRB", fallback_map)
 
 
 if __name__ == "__main__":

@@ -104,6 +104,8 @@ conda env create -f environment.yml
 conda activate opensim-torque
 ```
 
+Optional realtime/RT tooling lives in `environment-rt.yml`.
+
 4. Install the SMPL-X trust-region optimizer inside the activated env:
 
 ```bash

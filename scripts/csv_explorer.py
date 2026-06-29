@@ -13,7 +13,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.backends.backend_pdf import PdfPages
+
+from report_common import (
+    add_text_page,
+    format_float as _format_float,
+    is_translational_dof as _is_translational_dof,
+    write_pdf_report,
+)
 
 
 @dataclass
@@ -68,16 +74,6 @@ def parse_args() -> argparse.Namespace:
         help="Warning threshold for root rotational residual magnitude in Nm (default: 25.0)",
     )
     return parser.parse_args()
-
-
-def _parse_float(value: str) -> float:
-    text = value.strip()
-    if not text:
-        return float("nan")
-    try:
-        return float(text)
-    except ValueError:
-        return float("nan")
 
 
 def _safe_nan_percentile(data: np.ndarray, q: float) -> float:
@@ -195,7 +191,11 @@ def load_motion_csv(path: str | Path) -> MotionCsvData:
         for row in reader:
             row_count += 1
             for col in columns:
-                storage[col].append(_parse_float(row.get(col, "")))
+                text = row.get(col, "").strip()
+                try:
+                    storage[col].append(float(text) if text else float("nan"))
+                except ValueError:
+                    storage[col].append(float("nan"))
 
     if row_count == 0:
         raise ValueError(f"CSV has no data rows: {csv_path}")
@@ -220,16 +220,6 @@ def load_motion_csv(path: str | Path) -> MotionCsvData:
         grf_bodies=grf_bodies,
         has_total_grf=has_total_grf,
     )
-
-
-def _format_float(value: float, digits: int = 3) -> str:
-    if value is None or not np.isfinite(value):
-        return "n/a"
-    return f"{value:.{digits}f}"
-
-
-def _is_translational_dof(name: str) -> bool:
-    return name.endswith("_tx") or name.endswith("_ty") or name.endswith("_tz")
 
 
 def _root_residual_summary(
@@ -424,28 +414,12 @@ def _rom_table_lines(data: MotionCsvData, limit: int = 15) -> list[str]:
     return lines
 
 
-def add_title_page(pdf: PdfPages, data: MotionCsvData, title: str | None) -> None:
-    fig = plt.figure(figsize=(11.69, 8.27))
-    fig.suptitle(title or "Motion CSV Explorer Report", fontsize=18, fontweight="bold", y=0.98)
-    ax = fig.add_subplot(111)
-    ax.axis("off")
-
-    lines = _summary_lines(data)
-    ax.text(
-        0.02,
-        0.95,
-        "\n".join(lines),
-        va="top",
-        ha="left",
-        fontsize=11,
-        family="monospace",
-    )
-    pdf.savefig(fig, bbox_inches="tight")
-    plt.close(fig)
+def add_title_page(pdf: object, data: MotionCsvData, title: str | None) -> None:
+    add_text_page(pdf, title or "Motion CSV Explorer Report", _summary_lines(data))
 
 
 def add_root_residual_page(
-    pdf: PdfPages,
+    pdf: object,
     data: MotionCsvData,
     force_warning_n: float,
     moment_warning_nm: float,
@@ -543,7 +517,7 @@ def add_root_residual_page(
     return warning_lines
 
 
-def add_overview_page(pdf: PdfPages, data: MotionCsvData) -> None:
+def add_overview_page(pdf: object, data: MotionCsvData) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(11.69, 8.27))
     fig.suptitle("Global Motion Overview", fontsize=16, fontweight="bold")
 
@@ -595,7 +569,7 @@ def add_overview_page(pdf: PdfPages, data: MotionCsvData) -> None:
     plt.close(fig)
 
 
-def add_dof_pages(pdf: PdfPages, data: MotionCsvData, max_dofs: int | None = None) -> int:
+def add_dof_pages(pdf: object, data: MotionCsvData, max_dofs: int | None = None) -> int:
     selected = data.dof_names if max_dofs is None else data.dof_names[: max(0, max_dofs)]
     plotted = 0
     for dof in selected:
@@ -676,7 +650,7 @@ def add_dof_pages(pdf: PdfPages, data: MotionCsvData, max_dofs: int | None = Non
     return plotted
 
 
-def add_grf_pages(pdf: PdfPages, data: MotionCsvData) -> int:
+def add_grf_pages(pdf: object, data: MotionCsvData) -> int:
     page_count = 0
 
     for body in data.grf_bodies:
@@ -785,18 +759,24 @@ def build_pdf_report(
     root_force_warning_n: float,
     root_moment_warning_nm: float,
 ) -> dict[str, object]:
-    output_pdf.parent.mkdir(parents=True, exist_ok=True)
-    with PdfPages(output_pdf) as pdf:
-        add_title_page(pdf, data, title=title)
-        add_overview_page(pdf, data)
-        root_warning_lines = add_root_residual_page(
-            pdf,
-            data,
-            force_warning_n=root_force_warning_n,
-            moment_warning_nm=root_moment_warning_nm,
-        )
-        dof_pages = add_dof_pages(pdf, data, max_dofs=max_dofs)
-        grf_pages = add_grf_pages(pdf, data)
+    page_results = write_pdf_report(
+        output_pdf,
+        [
+            lambda pdf: add_title_page(pdf, data, title=title),
+            lambda pdf: add_overview_page(pdf, data),
+            lambda pdf: add_root_residual_page(
+                pdf,
+                data,
+                force_warning_n=root_force_warning_n,
+                moment_warning_nm=root_moment_warning_nm,
+            ),
+            lambda pdf: add_dof_pages(pdf, data, max_dofs=max_dofs),
+            lambda pdf: add_grf_pages(pdf, data),
+        ],
+    )
+    root_warning_lines = page_results[2]
+    dof_pages = page_results[3]
+    grf_pages = page_results[4]
 
     return {
         "input_csv": str(data.path),

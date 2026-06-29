@@ -5,6 +5,11 @@ from pathlib import Path
 from unittest import mock
 from xml.etree import ElementTree as ET
 
+try:
+    import opensim  # noqa: F401
+except ImportError:
+    opensim = None
+
 from opensim_batch_dynamics.inverse_dynamics_no_grf import (
     _auto_contact_body_names,
     _prepare_model_for_inverse_dynamics,
@@ -12,6 +17,7 @@ from opensim_batch_dynamics.inverse_dynamics_no_grf import (
 )
 
 
+@unittest.skipUnless(opensim is not None, "opensim is not installed")
 class InverseDynamicsModelPrepTest(unittest.TestCase):
     def test_prepared_model_uses_z_up_gravity_for_pipeline_motion(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

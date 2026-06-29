@@ -345,16 +345,6 @@ def build_feature_names(bases: Sequence[str]) -> list[str]:
     return names
 
 
-def _to_float(raw: str) -> float:
-    text = raw.strip()
-    if not text:
-        return math.nan
-    try:
-        return float(text)
-    except ValueError:
-        return math.nan
-
-
 def read_sequence_csv(path: Path, feature_names: Sequence[str], fill_missing: bool = False) -> tuple[np.ndarray, np.ndarray]:
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.reader(handle)
@@ -384,12 +374,20 @@ def read_sequence_csv(path: Path, feature_names: Sequence[str], fill_missing: bo
                 if idx is None or idx >= len(row):
                     values.append(math.nan)
                 else:
-                    values.append(_to_float(row[idx]))
+                    text = row[idx].strip()
+                    try:
+                        values.append(float(text) if text else math.nan)
+                    except ValueError:
+                        values.append(math.nan)
             rows.append(values)
             if time_idx is None or time_idx >= len(row):
                 time_values.append(float(len(time_values)))
             else:
-                time_values.append(_to_float(row[time_idx]))
+                text = row[time_idx].strip()
+                try:
+                    time_values.append(float(text) if text else math.nan)
+                except ValueError:
+                    time_values.append(math.nan)
 
     if not rows:
         raise ValueError(f"CSV has no data rows: {path}")

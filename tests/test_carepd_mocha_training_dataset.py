@@ -27,6 +27,43 @@ def _write_motion_csv(path: Path, header: list[str], rows: list[list[float]]) ->
 
 
 class CarepdMochaTrainingDatasetTest(unittest.TestCase):
+    def test_build_dataset_treats_blank_numeric_cells_as_nan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            input_dir = root / "features"
+            output_dir = root / "out"
+            input_dir.mkdir()
+            labels_csv = root / "labels.csv"
+
+            _write_labels(labels_csv, [("Study__S01__a", 0)])
+            _write_motion_csv(
+                input_dir / "Study__S01__a.csv",
+                ["frame", "time", "hip", "hip_vel", "hip_acc"],
+                [
+                    [0, 0.0, 1.0, 2.0, 3.0],
+                    [1, 0.5, "", 4.0, 5.0],
+                ],
+            )
+
+            args = builder.parse_args(
+                [
+                    "--input-dir",
+                    str(input_dir),
+                    "--labels-csv",
+                    str(labels_csv),
+                    "--output-dir",
+                    str(output_dir),
+                ]
+            )
+            summary = builder.build_dataset(args)
+
+            self.assertEqual(summary["exported_samples"], 1)
+            with (output_dir / "manifest.csv").open(encoding="utf-8") as handle:
+                manifest_rows = list(csv.DictReader(handle))
+            with np.load(output_dir / manifest_rows[0]["input_npz"]) as npz:
+                self.assertEqual(npz["x"].shape, (2, 3))
+                self.assertTrue(np.isnan(npz["x"][1, 0]))
+
     def test_build_dataset_writes_manifest_sequences_and_stats(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

@@ -3,24 +3,22 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
-import hashlib
 import json
 import os
-import re
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-
-@dataclass(frozen=True)
-class BatchTask:
-    input_path: Path
-    relative_path: Path
-    output_csv_path: Path
-    log_path: Path
-    trial_name: str
+from batch_common import (
+    BatchTask,
+    build_trial_name,
+    discover_amass_input_files,
+    is_nonempty_file,
+    resolve_pipeline_script,
+    resolve_submit_path,
+)
 
 
 @dataclass(frozen=True)
@@ -143,49 +141,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--id-contact-speed-threshold-mps", type=float, default=0.5)
     return parser.parse_args()
 
-
-def _sanitize_component(text: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("._-")
-    return cleaned or "trial"
-
-
-def _build_trial_name(relative_npz_path: Path) -> str:
-    base = relative_npz_path.with_suffix("").as_posix()
-    prefix = _sanitize_component(base.replace("/", "__"))
-    digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:8]
-    trial_name = f"{prefix}_{digest}"
-    # Keep names bounded to avoid path-length issues on deep datasets.
-    if len(trial_name) > 140:
-        trial_name = trial_name[:131] + "_" + digest
-    return trial_name
-
-
-def _resolve_pipeline_script(path_from_arg: str | None) -> Path:
-    if path_from_arg:
-        return Path(path_from_arg).resolve()
-    repo_root = Path(__file__).resolve().parents[1]
-    return (repo_root / "scripts" / "run_amass_to_bsm_csv.py").resolve()
-
-
-def _discover_input_files(input_root: Path) -> list[Path]:
-    excluded_names = {
-        "shape.npz",
-        "neutral_stagei.npz",
-        "female_stagei.npz",
-        "male_stagei.npz",
-    }
-    files = [
-        path
-        for pattern in ("*.npz", "*.npy")
-        for path in input_root.rglob(pattern)
-        if path.is_file() and path.name.lower() not in excluded_names
-    ]
-    files.sort()
-    return files
-
-
 def _build_tasks(args: argparse.Namespace, input_root: Path, output_root: Path) -> list[BatchTask]:
-    files = _discover_input_files(input_root)
+    files = discover_amass_input_files(input_root)
     if args.limit is not None:
         files = files[: max(0, args.limit)]
 
@@ -194,7 +151,7 @@ def _build_tasks(args: argparse.Namespace, input_root: Path, output_root: Path) 
         relative_path = input_path.relative_to(input_root)
         output_csv_path = (output_root / relative_path).with_suffix(".csv")
         log_path = (output_root / "logs" / relative_path).with_suffix(".log")
-        trial_name = _build_trial_name(relative_path)
+        trial_name = build_trial_name(relative_path)
         tasks.append(
             BatchTask(
                 input_path=input_path,
@@ -256,17 +213,13 @@ def _build_single_run_cmd(
     return cmd
 
 
-def _is_existing_csv_ready(path: Path) -> bool:
-    return path.exists() and path.is_file() and path.stat().st_size > 0
-
-
 def _run_single_task(
     args: argparse.Namespace,
     pipeline_script: Path,
     output_root: Path,
     task: BatchTask,
 ) -> BatchTaskResult:
-    if args.skip_existing and _is_existing_csv_ready(task.output_csv_path):
+    if args.skip_existing and is_nonempty_file(task.output_csv_path):
         return BatchTaskResult(
             task=task,
             status="skipped",
@@ -402,9 +355,9 @@ def main() -> int:
             "to --input-root."
         )
 
-    input_root = Path(args.input_root).resolve()
-    output_root = Path(args.output_dir).resolve()
-    pipeline_script = _resolve_pipeline_script(args.pipeline_script)
+    input_root = resolve_submit_path(args.input_root, prefer_storage_home=True)
+    output_root = resolve_submit_path(args.output_dir, prefer_storage_home=True)
+    pipeline_script = resolve_pipeline_script(args.pipeline_script)
 
     if not input_root.exists():
         raise FileNotFoundError(f"Input root not found: {input_root}")
@@ -420,7 +373,7 @@ def main() -> int:
     print(f"Output root: {output_root}")
     print(f"Workers: {args.workers}")
     if args.skip_existing:
-        existing = sum(1 for task in tasks if _is_existing_csv_ready(task.output_csv_path))
+        existing = sum(1 for task in tasks if is_nonempty_file(task.output_csv_path))
         print(f"Skip existing CSVs: enabled ({existing} already present)")
     else:
         print("Skip existing CSVs: disabled")

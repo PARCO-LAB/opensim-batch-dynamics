@@ -173,6 +173,8 @@ def _lowpass_butterworth_4th(
     values: np.ndarray,
     sample_rate_hz: float,
     cutoff_hz: float | None,
+    *,
+    missing_scipy_returns_copy: bool = False,
 ) -> np.ndarray:
     """
     Apply 4th-order zero-phase Butterworth low-pass filter.
@@ -188,6 +190,8 @@ def _lowpass_butterworth_4th(
     try:
         from scipy.signal import butter, filtfilt
     except ImportError as exc:
+        if missing_scipy_returns_copy:
+            return values.copy()
         raise RuntimeError(
             "scipy is required for Butterworth filtering. "
             "Install it in your environment."
