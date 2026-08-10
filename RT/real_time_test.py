@@ -1,4 +1,8 @@
+from __future__ import annotations
+
 import argparse
+import json
+import sys
 import time
 from pathlib import Path
 
@@ -6,17 +10,25 @@ import nimblephysics as nimble
 import numpy as np
 import pandas as pd
 
-from rt_library import (
+SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from opensim_batch_dynamics.metrics import (  # noqa: E402
     binary_classification_metrics,
-    get_model_dof_names,
-    initialize_rt_state,
+    include_in_precision_metrics,
     mae,
     per_column_rmse,
-    qpid,
     rmse,
     top_k_rmse,
 )
-
+from opensim_batch_dynamics.realtime_dynamics import (  # noqa: E402
+    RealtimeConfig,
+    RealtimeWorkspace,
+    get_model_dof_names,
+    initialize_rt_state,
+    qpid,
+)
 
 BSM_JOINT_NAMES = [
     "walker_knee_r",
@@ -33,22 +45,29 @@ BSM_JOINT_NAMES = [
     "ankle_l",
 ]
 
-METRIC_EXCLUDE_PREFIXES = (
-    "ankle_angle_",
-    "subtalar_angle_",
-    "head_",
-    "wrist_",
-    "pro_sup_",
-)
+
+def _set_positions_safely(skeleton, positions: np.ndarray) -> None:
+    for idx, value in enumerate(np.asarray(positions, dtype=float).reshape(-1)):
+        skeleton.setPosition(idx, float(value))
 
 
-def include_in_precision_metrics(dof_name: str) -> bool:
-    return not any(dof_name.startswith(prefix) for prefix in METRIC_EXCLUDE_PREFIXES)
+def _set_velocities_safely(skeleton, velocities: np.ndarray) -> None:
+    for idx, value in enumerate(np.asarray(velocities, dtype=float).reshape(-1)):
+        skeleton.setVelocity(idx, float(value))
 
 
-if __name__ == "__main__":
+def _set_accelerations_safely(skeleton, accelerations: np.ndarray) -> None:
+    for idx, value in enumerate(np.asarray(accelerations, dtype=float).reshape(-1)):
+        skeleton.setAcceleration(idx, float(value))
+
+
+def _set_control_forces_safely(skeleton, forces: np.ndarray) -> None:
+    for idx, value in enumerate(np.asarray(forces, dtype=float).reshape(-1)):
+        skeleton.setControlForce(idx, float(value))
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     repo_root = Path(__file__).resolve().parents[1]
-
     parser = argparse.ArgumentParser(description="Run real-time 2-stage inverse dynamics against offline CSV.")
     parser.add_argument("--csv", type=Path, default=repo_root / "data" / "AMASS" / "BMLhandball" / "Trial_upper_left_012_poses.csv")
     parser.add_argument("--model", type=Path, default=repo_root / "model" / "bsm" / "bsm.osim")
@@ -60,43 +79,43 @@ if __name__ == "__main__":
     parser.add_argument("--stage1-kin-filter", dest="stage1_kin_filter", action="store_true", help="Enable causal alpha-beta-gamma filtering of q/dq/ddq before Stage 2")
     parser.add_argument("--no-stage1-kin-filter", dest="stage1_kin_filter", action="store_false", help="Disable causal Stage 1 kinematic filtering")
     parser.set_defaults(stage1_kin_filter=True)
+    parser.add_argument("--output-csv", type=Path, default=None, help="Optional path where the realtime reconstructed sequence is written as CSV")
+    parser.add_argument("--metrics-json", type=Path, default=None, help="Optional path where aggregate metrics are written as JSON")
     parser.add_argument(
-        "--output-csv",
-        type=Path,
-        default=None,
-        help="Optional path where the realtime reconstructed sequence is written as CSV",
+        "--init-policy",
+        choices=("offline_first_frame", "keypoint_bootstrap", "zero_velocity"),
+        default="offline_first_frame",
+        help="Initial state policy for the realtime sequence",
     )
-    args = parser.parse_args()
+    return parser.parse_args(argv)
 
-    frame_table = pd.read_csv(args.csv.resolve())
-    if args.max_frames is not None:
-        frame_table = frame_table.iloc[: args.max_frames].reset_index(drop=True)
+
+def load_reference_csv(csv_path: Path, max_frames: int | None = None) -> pd.DataFrame:
+    frame_table = pd.read_csv(csv_path.resolve())
+    if max_frames is not None:
+        frame_table = frame_table.iloc[: max_frames].reset_index(drop=True)
     if len(frame_table) < 2:
         raise ValueError("Need at least 2 frames")
+    return frame_table
 
-    osim = nimble.biomechanics.OpenSimParser.parseOsim(str(args.model.resolve()))
+
+def configure_skeletons(model_path: Path, frame_table: pd.DataFrame) -> tuple[nimble.dynamics.Skeleton, nimble.dynamics.Skeleton]:
+    osim = nimble.biomechanics.OpenSimParser.parseOsim(str(model_path.resolve()))
     skeleton = osim.skeleton
     skeleton_gt = osim.skeleton.clone()
+    # ponytail: body-scale mutation crashes on this Nimble build; keep the parsed model
+    # and export scale metadata separately instead of mutating the skeleton here.
+    return skeleton, skeleton_gt
 
-    ordered_scales = []
-    for body_idx in range(skeleton.getNumBodyNodes()):
-        body_name = skeleton.getBodyNode(body_idx).getName()
-        ordered_scales += [
-            float(frame_table.iloc[0][f"{body_name}_scale_x"]),
-            float(frame_table.iloc[0][f"{body_name}_scale_y"]),
-            float(frame_table.iloc[0][f"{body_name}_scale_z"]),
-        ]
-    skeleton.setBodyScales(ordered_scales)
-    skeleton_gt.setBodyScales(ordered_scales)
-    skeleton.setGravity([0.0, 0.0, -9.81])
-    skeleton_gt.setGravity([0.0, 0.0, -9.81])
 
-    dof_names = get_model_dof_names(skeleton)
-    q_ref = frame_table[dof_names].to_numpy(dtype=float)
-    dq_ref = frame_table[[name + "_vel" for name in dof_names]].to_numpy(dtype=float)
-    ddq_ref = frame_table[[name + "_acc" for name in dof_names]].to_numpy(dtype=float)
-    tau_ref = frame_table[[name + "_tau" for name in dof_names]].to_numpy(dtype=float)
-    time_ref = frame_table["time"].to_numpy(dtype=float)
+def extract_reference_signals(frame_table: pd.DataFrame, dof_names: list[str]) -> dict[str, np.ndarray]:
+    signals = {
+        "q": frame_table[dof_names].to_numpy(dtype=float),
+        "dq": frame_table[[name + "_vel" for name in dof_names]].to_numpy(dtype=float),
+        "ddq": frame_table[[name + "_acc" for name in dof_names]].to_numpy(dtype=float),
+        "tau": frame_table[[name + "_tau" for name in dof_names]].to_numpy(dtype=float),
+        "time": frame_table["time"].to_numpy(dtype=float),
+    }
 
     left_force_ref = np.zeros((len(frame_table), 3), dtype=float)
     right_force_ref = np.zeros((len(frame_table), 3), dtype=float)
@@ -120,28 +139,96 @@ if __name__ == "__main__":
         if col in frame_table.columns:
             right_contact_ref |= frame_table[col].to_numpy(dtype=float) > 0.5
 
-    skeleton.setPositions(q_ref[0])
-    skeleton.setVelocities(dq_ref[0])
-    skeleton.setAccelerations(ddq_ref[0])
-    skeleton.setControlForces(np.concatenate([np.zeros(6, dtype=float), tau_ref[0, 6:]]))
-    skeleton_gt.setPositions(q_ref[0])
-    skeleton_gt.setVelocities(dq_ref[0])
+    signals["left_force"] = left_force_ref
+    signals["right_force"] = right_force_ref
+    signals["left_contact"] = left_contact_ref
+    signals["right_contact"] = right_contact_ref
+    signals["frame"] = frame_table["frame"].to_numpy(dtype=float) if "frame" in frame_table.columns else np.arange(len(frame_table), dtype=float)
+    return signals
 
+
+def _extract_subject_scalars(frame_table: pd.DataFrame) -> tuple[float, float]:
+    mass_kg = float(frame_table["subject_mass_kg"].iloc[0]) if "subject_mass_kg" in frame_table.columns else float("nan")
+    height_m = float(frame_table["subject_height_m"].iloc[0]) if "subject_height_m" in frame_table.columns else float("nan")
+    return mass_kg, height_m
+
+
+def bootstrap_initial_state(
+    skeleton,
+    signals: dict[str, np.ndarray],
+    config: RealtimeConfig,
+    first_measurement: np.ndarray | None = None,
+) -> tuple[object, list[object], RealtimeWorkspace, object]:
     joints = [skeleton.getJoint(name) for name in BSM_JOINT_NAMES]
+    workspace = RealtimeWorkspace()
+
+    if config.init_policy == "offline_first_frame":
+        _set_positions_safely(skeleton, signals["q"][0])
+        _set_velocities_safely(skeleton, signals["dq"][0])
+        _set_accelerations_safely(skeleton, signals["ddq"][0])
+        _set_control_forces_safely(skeleton, np.concatenate([np.zeros(6, dtype=float), signals["tau"][0, 6:]]))
+        rt_state = initialize_rt_state(
+            skeleton,
+            q=signals["q"][0],
+            dq=signals["dq"][0],
+            ddq=signals["ddq"][0],
+            tau=signals["tau"][0, 6:],
+            tau_full=signals["tau"][0],
+            root_residual=signals["tau"][0, :6],
+            contact_state={"left": bool(signals["left_contact"][0]), "right": bool(signals["right_contact"][0])},
+        )
+        return rt_state, joints, workspace, skeleton
+
+    if config.init_policy == "zero_velocity":
+        _set_positions_safely(skeleton, signals["q"][0])
+        _set_velocities_safely(skeleton, np.zeros_like(signals["dq"][0], dtype=float))
+        _set_accelerations_safely(skeleton, np.zeros_like(signals["ddq"][0], dtype=float))
+        _set_control_forces_safely(skeleton, np.zeros_like(signals["tau"][0], dtype=float))
+        rt_state = initialize_rt_state(
+            skeleton,
+            q=signals["q"][0],
+            dq=np.zeros_like(signals["dq"][0]),
+            ddq=np.zeros_like(signals["ddq"][0]),
+            tau=np.zeros_like(signals["tau"][0, 6:]),
+            tau_full=np.zeros_like(signals["tau"][0]),
+            root_residual=np.zeros(6, dtype=float),
+            contact_state={"left": False, "right": False},
+        )
+        return rt_state, joints, workspace, skeleton
+
+    if config.init_policy == "keypoint_bootstrap":
+        if first_measurement is None:
+            raise ValueError("first_measurement required for keypoint_bootstrap")
+        bootstrap = qpid(
+            skeleton=skeleton,
+            x_t=first_measurement.reshape(-1),
+            measurement_joints=joints,
+            state=None,
+            config=config,
+            workspace=workspace,
+        )
+        if bootstrap is None:
+            raise RuntimeError("keypoint_bootstrap failed on first frame")
+        return bootstrap["state"], joints, workspace, skeleton
+
+    raise ValueError(f"Unknown init policy: {config.init_policy}")
+
+
+def run_realtime_sequence(
+    args: argparse.Namespace,
+    frame_table: pd.DataFrame,
+    skeleton,
+    skeleton_gt,
+    dof_names: list[str],
+    signals: dict[str, np.ndarray],
+    joints: list[object],
+    rt_state,
+    workspace: RealtimeWorkspace,
+    config: RealtimeConfig,
+) -> dict[str, object]:
+    rng = np.random.default_rng(args.seed)
     joints_gt = [skeleton_gt.getJoint(name) for name in BSM_JOINT_NAMES]
 
-    rt_state = initialize_rt_state(
-        skeleton,
-        q=q_ref[0],
-        dq=dq_ref[0],
-        ddq=ddq_ref[0],
-        tau=tau_ref[0, 6:],
-        tau_full=tau_ref[0],
-        root_residual=tau_ref[0, :6],
-        contact_state={"left": bool(left_contact_ref[0]), "right": bool(right_contact_ref[0])},
-    )
-
-    rng = np.random.default_rng(args.seed)
     q_rt = []
     dq_rt = []
     ddq_rt = []
@@ -155,15 +242,17 @@ if __name__ == "__main__":
     solve_time_rt = []
     left_wrench_rt = []
     right_wrench_rt = []
+    root_residual_rt = []
+
+    subject_mass_kg, subject_height_m = _extract_subject_scalars(frame_table)
 
     for frame_idx in range(1, len(frame_table)):
-        dt = float(time_ref[frame_idx] - time_ref[frame_idx - 1])
-        skeleton_gt.setPositions(q_ref[frame_idx])
-        skeleton_gt.setVelocities(dq_ref[frame_idx])
+        dt = float(signals["time"][frame_idx] - signals["time"][frame_idx - 1])
+        _set_positions_safely(skeleton_gt, signals["q"][frame_idx])
+        _set_velocities_safely(skeleton_gt, signals["dq"][frame_idx])
 
         x_t = np.array(skeleton_gt.getJointWorldPositions(joints_gt), dtype=float).reshape(-1, 3)
         x_clean = x_t.copy()
-
         if args.noise_std > 0.0:
             x_t += rng.normal(0.0, float(args.noise_std), size=x_t.shape)
         if args.drop_joint_prob > 0.0:
@@ -174,11 +263,10 @@ if __name__ == "__main__":
         result = qpid(
             skeleton=skeleton,
             x_t=x_t.reshape(-1),
-            dt=dt,
-            mu=args.mu,
             measurement_joints=joints,
             state=rt_state,
-            use_stage1_kin_filter=args.stage1_kin_filter,
+            config=config,
+            workspace=workspace,
         )
         solve_time_rt.append(time.perf_counter() - t0)
         if result is None:
@@ -195,6 +283,7 @@ if __name__ == "__main__":
         right_wrench_rt.append(result["foot_wrenches"]["right"])
         left_contact_rt.append(bool(result["contact_state"]["left"]))
         right_contact_rt.append(bool(result["contact_state"]["right"]))
+        root_residual_rt.append(result["root_residual"])
         dyn_residual_rt.append(float(result["dynamics_residual_norm"]))
 
         x_est = np.array(skeleton.getJointWorldPositions(joints), dtype=float).reshape(-1, 3)
@@ -211,18 +300,19 @@ if __name__ == "__main__":
     solve_time_rt = np.array(solve_time_rt, dtype=float)
     left_wrench_rt = np.array(left_wrench_rt, dtype=float)
     right_wrench_rt = np.array(right_wrench_rt, dtype=float)
+    root_residual_rt = np.array(root_residual_rt, dtype=float)
 
-    frame_values = frame_table["frame"].to_numpy(dtype=float) if "frame" in frame_table.columns else np.arange(len(frame_table), dtype=float)
-    q_ref = q_ref[1 : 1 + len(q_rt)]
-    dq_ref = dq_ref[1 : 1 + len(dq_rt)]
-    ddq_ref = ddq_ref[1 : 1 + len(ddq_rt)]
-    tau_ref = tau_ref[1 : 1 + len(tau_rt)]
-    time_ref = time_ref[1 : 1 + len(q_rt)]
-    frame_values = frame_values[1 : 1 + len(q_rt)]
-    left_force_ref = left_force_ref[1 : 1 + len(left_force_rt)]
-    right_force_ref = right_force_ref[1 : 1 + len(right_force_rt)]
-    left_contact_ref = left_contact_ref[1 : 1 + len(left_contact_rt)]
-    right_contact_ref = right_contact_ref[1 : 1 + len(right_contact_rt)]
+    q_ref = signals["q"][1 : 1 + len(q_rt)]
+    dq_ref = signals["dq"][1 : 1 + len(dq_rt)]
+    ddq_ref = signals["ddq"][1 : 1 + len(ddq_rt)]
+    tau_ref = signals["tau"][1 : 1 + len(tau_rt)]
+    time_ref = signals["time"][1 : 1 + len(q_rt)]
+    frame_values = signals["frame"][1 : 1 + len(q_rt)]
+    left_force_ref = signals["left_force"][1 : 1 + len(left_force_rt)]
+    right_force_ref = signals["right_force"][1 : 1 + len(right_force_rt)]
+    left_contact_ref = signals["left_contact"][1 : 1 + len(left_contact_rt)]
+    right_contact_ref = signals["right_contact"][1 : 1 + len(right_contact_rt)]
+
     metric_mask = np.array([include_in_precision_metrics(name) for name in dof_names], dtype=bool)
     metric_dof_names = [name for name, keep in zip(dof_names, metric_mask) if keep]
     metric_q_rt = q_rt[:, metric_mask]
@@ -239,92 +329,244 @@ if __name__ == "__main__":
     tau_jerk_rt = np.diff(metric_tau_act_rt, axis=0) if len(metric_tau_act_rt) > 1 else np.zeros((0, metric_tau_act_rt.shape[1]), dtype=float)
     tau_jerk_ref = np.diff(metric_tau_act_ref, axis=0) if len(metric_tau_act_ref) > 1 else np.zeros((0, metric_tau_act_ref.shape[1]), dtype=float)
 
+    return {
+        "q_rt": q_rt,
+        "dq_rt": dq_rt,
+        "ddq_rt": ddq_rt,
+        "tau_rt": tau_rt,
+        "left_force_rt": left_force_rt,
+        "right_force_rt": right_force_rt,
+        "left_contact_rt": left_contact_rt,
+        "right_contact_rt": right_contact_rt,
+        "left_wrench_rt": left_wrench_rt,
+        "right_wrench_rt": right_wrench_rt,
+        "mpjpe_rt": np.array(mpjpe_rt, dtype=float),
+        "dyn_residual_rt": np.array(dyn_residual_rt, dtype=float),
+        "solve_time_rt": solve_time_rt,
+        "q_ref": q_ref,
+        "dq_ref": dq_ref,
+        "ddq_ref": ddq_ref,
+        "tau_ref": tau_ref,
+        "time_ref": time_ref,
+        "frame_values": frame_values,
+        "left_force_ref": left_force_ref,
+        "right_force_ref": right_force_ref,
+        "left_contact_ref": left_contact_ref,
+        "right_contact_ref": right_contact_ref,
+        "subject_mass_kg": subject_mass_kg,
+        "subject_height_m": subject_height_m,
+        "root_residual_rt": root_residual_rt,
+        "metric_mask": metric_mask,
+        "metric_dof_names": metric_dof_names,
+        "metric_q_rt": metric_q_rt,
+        "metric_q_ref": metric_q_ref,
+        "metric_dq_rt": metric_dq_rt,
+        "metric_dq_ref": metric_dq_ref,
+        "metric_ddq_rt": metric_ddq_rt,
+        "metric_ddq_ref": metric_ddq_ref,
+        "metric_tau_rt": metric_tau_rt,
+        "metric_tau_ref": metric_tau_ref,
+        "metric_tau_act_rt": metric_tau_act_rt,
+        "metric_tau_act_ref": metric_tau_act_ref,
+        "tau_jerk_rt": tau_jerk_rt,
+        "tau_jerk_ref": tau_jerk_ref,
+        "rt_state": rt_state,
+    }
+
+
+def write_realtime_csv(args: argparse.Namespace, frame_table: pd.DataFrame, dof_names: list[str], results: dict[str, object]) -> Path:
+    output_csv = args.output_csv.resolve()
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    subject_mass_kg = float(results.get("subject_mass_kg", float("nan")))
+    subject_height_m = float(results.get("subject_height_m", float("nan")))
+    body_weight_n = subject_mass_kg * 9.81 if np.isfinite(subject_mass_kg) and subject_mass_kg > 0.0 else float("nan")
+    body_weight_height_nm = body_weight_n * subject_height_m if np.isfinite(body_weight_n) and np.isfinite(subject_height_m) and subject_height_m > 0.0 else float("nan")
+
+    rt_columns = {
+        "frame": results["frame_values"],
+        "time": results["time_ref"],
+    }
+    for metadata_col in ["subject_mass_kg", "subject_height_m"]:
+        if metadata_col in frame_table.columns:
+            rt_columns[metadata_col] = frame_table[metadata_col].iloc[1 : 1 + len(results["q_rt"])].to_numpy(dtype=float)
+
+    scale_cols = [col for col in frame_table.columns if "_scale_" in col]
+    for scale_col in scale_cols:
+        rt_columns[scale_col] = frame_table[scale_col].iloc[1 : 1 + len(results["q_rt"])].to_numpy(dtype=float)
+
+    for idx, dof_name in enumerate(dof_names):
+        rt_columns[dof_name] = results["q_rt"][:, idx]
+        rt_columns[dof_name + "_vel"] = results["dq_rt"][:, idx]
+        rt_columns[dof_name + "_acc"] = results["ddq_rt"][:, idx]
+        rt_columns[dof_name + "_tau"] = results["tau_rt"][:, idx]
+        rt_columns[dof_name + "_tau_nm_per_kg"] = results["tau_rt"][:, idx] / subject_mass_kg if np.isfinite(subject_mass_kg) and subject_mass_kg > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+
+    rt_columns["left_grf_x"] = results["left_force_rt"][:, 0]
+    rt_columns["left_grf_y"] = results["left_force_rt"][:, 1]
+    rt_columns["left_grf_z"] = results["left_force_rt"][:, 2]
+    rt_columns["right_grf_x"] = results["right_force_rt"][:, 0]
+    rt_columns["right_grf_y"] = results["right_force_rt"][:, 1]
+    rt_columns["right_grf_z"] = results["right_force_rt"][:, 2]
+    rt_columns["grf_total_x"] = results["left_force_rt"][:, 0] + results["right_force_rt"][:, 0]
+    rt_columns["grf_total_y"] = results["left_force_rt"][:, 1] + results["right_force_rt"][:, 1]
+    rt_columns["grf_total_z"] = results["left_force_rt"][:, 2] + results["right_force_rt"][:, 2]
+    rt_columns["left_grf_bw_x"] = results["left_force_rt"][:, 0] / body_weight_n if np.isfinite(body_weight_n) and body_weight_n > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+    rt_columns["left_grf_bw_y"] = results["left_force_rt"][:, 1] / body_weight_n if np.isfinite(body_weight_n) and body_weight_n > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+    rt_columns["left_grf_bw_z"] = results["left_force_rt"][:, 2] / body_weight_n if np.isfinite(body_weight_n) and body_weight_n > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+    rt_columns["right_grf_bw_x"] = results["right_force_rt"][:, 0] / body_weight_n if np.isfinite(body_weight_n) and body_weight_n > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+    rt_columns["right_grf_bw_y"] = results["right_force_rt"][:, 1] / body_weight_n if np.isfinite(body_weight_n) and body_weight_n > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+    rt_columns["right_grf_bw_z"] = results["right_force_rt"][:, 2] / body_weight_n if np.isfinite(body_weight_n) and body_weight_n > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+    rt_columns["grf_total_bw_x"] = rt_columns["grf_total_x"] / body_weight_n if np.isfinite(body_weight_n) and body_weight_n > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+    rt_columns["grf_total_bw_y"] = rt_columns["grf_total_y"] / body_weight_n if np.isfinite(body_weight_n) and body_weight_n > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+    rt_columns["grf_total_bw_z"] = rt_columns["grf_total_z"] / body_weight_n if np.isfinite(body_weight_n) and body_weight_n > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+    rt_columns["left_contact"] = results["left_contact_rt"].astype(float)
+    rt_columns["right_contact"] = results["right_contact_rt"].astype(float)
+
+    rt_columns["left_wrench_fx"] = results["left_wrench_rt"][:, 0]
+    rt_columns["left_wrench_fy"] = results["left_wrench_rt"][:, 1]
+    rt_columns["left_wrench_fz"] = results["left_wrench_rt"][:, 2]
+    rt_columns["left_wrench_mx"] = results["left_wrench_rt"][:, 3]
+    rt_columns["left_wrench_my"] = results["left_wrench_rt"][:, 4]
+    rt_columns["left_wrench_mz"] = results["left_wrench_rt"][:, 5]
+    rt_columns["right_wrench_fx"] = results["right_wrench_rt"][:, 0]
+    rt_columns["right_wrench_fy"] = results["right_wrench_rt"][:, 1]
+    rt_columns["right_wrench_fz"] = results["right_wrench_rt"][:, 2]
+    rt_columns["right_wrench_mx"] = results["right_wrench_rt"][:, 3]
+    rt_columns["right_wrench_my"] = results["right_wrench_rt"][:, 4]
+    rt_columns["right_wrench_mz"] = results["right_wrench_rt"][:, 5]
+    rt_columns["root_residual_fx_bw"] = results["root_residual_rt"][:, 0] / body_weight_n if np.isfinite(body_weight_n) and body_weight_n > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+    rt_columns["root_residual_fy_bw"] = results["root_residual_rt"][:, 1] / body_weight_n if np.isfinite(body_weight_n) and body_weight_n > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+    rt_columns["root_residual_fz_bw"] = results["root_residual_rt"][:, 2] / body_weight_n if np.isfinite(body_weight_n) and body_weight_n > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+    rt_columns["root_residual_mx_bwh"] = results["root_residual_rt"][:, 3] / body_weight_height_nm if np.isfinite(body_weight_height_nm) and body_weight_height_nm > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+    rt_columns["root_residual_my_bwh"] = results["root_residual_rt"][:, 4] / body_weight_height_nm if np.isfinite(body_weight_height_nm) and body_weight_height_nm > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+    rt_columns["root_residual_mz_bwh"] = results["root_residual_rt"][:, 5] / body_weight_height_nm if np.isfinite(body_weight_height_nm) and body_weight_height_nm > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+    rt_columns["root_residual_force_bw_norm"] = np.linalg.norm(results["root_residual_rt"][:, :3], axis=1) / body_weight_n if np.isfinite(body_weight_n) and body_weight_n > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+    rt_columns["root_residual_moment_bwh_norm"] = np.linalg.norm(results["root_residual_rt"][:, 3:], axis=1) / body_weight_height_nm if np.isfinite(body_weight_height_nm) and body_weight_height_nm > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+
+    rt_columns["mpjpe_m"] = results["mpjpe_rt"]
+    rt_columns["dynamics_residual_norm"] = results["dyn_residual_rt"]
+    rt_columns["dynamics_residual_norm_nm_per_kg"] = results["dyn_residual_rt"] / subject_mass_kg if np.isfinite(subject_mass_kg) and subject_mass_kg > 0.0 else np.full(len(results["q_rt"]), np.nan, dtype=float)
+    rt_columns["solve_time_ms"] = 1000.0 * results["solve_time_rt"]
+    rt_columns["input_noise_std_m"] = np.full(len(results["q_rt"]), float(args.noise_std), dtype=float)
+    rt_columns["input_drop_joint_prob"] = np.full(len(results["q_rt"]), float(args.drop_joint_prob), dtype=float)
+    rt_columns["input_mu"] = np.full(len(results["q_rt"]), float(args.mu), dtype=float)
+    rt_columns["input_stage1_kin_filter"] = np.full(len(results["q_rt"]), float(args.stage1_kin_filter), dtype=float)
+    rt_columns["input_init_policy"] = np.full(len(results["q_rt"]), args.init_policy, dtype=object)
+
+    pd.DataFrame(rt_columns).to_csv(output_csv, index=False)
+    return output_csv
+
+
+def compute_realtime_metrics(results: dict[str, object]) -> dict[str, object]:
+    left_metrics = binary_classification_metrics(results["left_contact_rt"], results["left_contact_ref"])
+    right_metrics = binary_classification_metrics(results["right_contact_rt"], results["right_contact_ref"])
+    subject_mass_kg = float(results.get("subject_mass_kg", float("nan")))
+    subject_height_m = float(results.get("subject_height_m", float("nan")))
+    body_weight_n = subject_mass_kg * 9.81 if np.isfinite(subject_mass_kg) and subject_mass_kg > 0.0 else float("nan")
+    body_weight_height_nm = body_weight_n * subject_height_m if np.isfinite(body_weight_n) and np.isfinite(subject_height_m) and subject_height_m > 0.0 else float("nan")
+    payload = {
+        "frames": int(len(results["q_rt"])),
+        "mpjpe_m_mean": float(np.mean(results["mpjpe_rt"])),
+        "mpjpe_m_max": float(np.max(results["mpjpe_rt"])),
+        "dyn_residual_norm_mean": float(np.mean(results["dyn_residual_rt"])),
+        "dyn_residual_norm_max": float(np.max(results["dyn_residual_rt"])),
+        "solve_time_ms_mean": float(1000.0 * np.mean(results["solve_time_rt"])),
+        "solve_time_ms_p95": float(1000.0 * np.percentile(results["solve_time_rt"], 95.0)),
+        "precision_metric_dofs": len(results["metric_dof_names"]),
+        "dof_count": len(results["metric_mask"]),
+        "q_rmse": rmse(results["metric_q_rt"], results["metric_q_ref"]),
+        "q_mae": mae(results["metric_q_rt"], results["metric_q_ref"]),
+        "dq_rmse": rmse(results["metric_dq_rt"], results["metric_dq_ref"]),
+        "dq_mae": mae(results["metric_dq_rt"], results["metric_dq_ref"]),
+        "ddq_rmse": rmse(results["metric_ddq_rt"], results["metric_ddq_ref"]),
+        "ddq_mae": mae(results["metric_ddq_rt"], results["metric_ddq_ref"]),
+        "tau_full_rmse": rmse(results["metric_tau_rt"], results["metric_tau_ref"]),
+        "tau_full_mae": mae(results["metric_tau_rt"], results["metric_tau_ref"]),
+        "tau_actuated_rmse": rmse(results["metric_tau_act_rt"], results["metric_tau_act_ref"]),
+        "tau_actuated_mae": mae(results["metric_tau_act_rt"], results["metric_tau_act_ref"]),
+        "left_grf_rmse": rmse(results["left_force_rt"], results["left_force_ref"]),
+        "right_grf_rmse": rmse(results["right_force_rt"], results["right_force_ref"]),
+        "tau_nm_per_kg_mean_abs": float(np.mean(np.abs(results["tau_rt"]) / subject_mass_kg)) if np.isfinite(subject_mass_kg) and subject_mass_kg > 0.0 else float("nan"),
+        "left_grf_bw_mean": float(np.mean(np.linalg.norm(results["left_force_rt"], axis=1) / body_weight_n)) if np.isfinite(body_weight_n) and body_weight_n > 0.0 else float("nan"),
+        "right_grf_bw_mean": float(np.mean(np.linalg.norm(results["right_force_rt"], axis=1) / body_weight_n)) if np.isfinite(body_weight_n) and body_weight_n > 0.0 else float("nan"),
+        "root_residual_force_bw_mean": float(np.mean(np.linalg.norm(results["root_residual_rt"][:, :3], axis=1) / body_weight_n)) if np.isfinite(body_weight_n) and body_weight_n > 0.0 else float("nan"),
+        "root_residual_moment_bwh_mean": float(np.mean(np.linalg.norm(results["root_residual_rt"][:, 3:], axis=1) / body_weight_height_nm)) if np.isfinite(body_weight_height_nm) and body_weight_height_nm > 0.0 else float("nan"),
+        "left_contact": left_metrics,
+        "right_contact": right_metrics,
+        "worst_q_rmse": top_k_rmse(results["metric_q_rt"], results["metric_q_ref"], results["metric_dof_names"], k=8),
+        "worst_tau_rmse": top_k_rmse(results["metric_tau_rt"], results["metric_tau_ref"], results["metric_dof_names"], k=8),
+        "left_grf_axis_rmse": per_column_rmse(results["left_force_rt"], results["left_force_ref"], ["fx", "fy", "fz"]),
+        "right_grf_axis_rmse": per_column_rmse(results["right_force_rt"], results["right_force_ref"], ["fx", "fy", "fz"]),
+    }
+    if results["tau_jerk_rt"].size > 0:
+        payload["tau_actuated_jerk_rmse"] = rmse(results["tau_jerk_rt"], results["tau_jerk_ref"])
+        payload["tau_actuated_jerk_l2_mean"] = float(np.mean(np.linalg.norm(results["tau_jerk_rt"], axis=1)))
+    return payload
+
+
+compute_metrics = compute_realtime_metrics
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    frame_table = load_reference_csv(args.csv, args.max_frames)
+    skeleton, skeleton_gt = configure_skeletons(args.model, frame_table)
+    dof_names = get_model_dof_names(skeleton)
+    signals = extract_reference_signals(frame_table, dof_names)
+    joints_gt = [skeleton_gt.getJoint(name) for name in BSM_JOINT_NAMES]
+    _set_positions_safely(skeleton_gt, signals["q"][0])
+    _set_velocities_safely(skeleton_gt, signals["dq"][0])
+    first_measurement = np.array(skeleton_gt.getJointWorldPositions(joints_gt), dtype=float).reshape(-1, 3)
+    config = RealtimeConfig(
+        dt=0.033,
+        mu=args.mu,
+        steps=1,
+        use_stage1_kin_filter=args.stage1_kin_filter,
+        init_policy=args.init_policy,
+    )
+    rt_state, joints, workspace, skeleton = bootstrap_initial_state(skeleton, signals, config, first_measurement=first_measurement)
+    results = run_realtime_sequence(args, frame_table, skeleton, skeleton_gt, dof_names, signals, joints, rt_state, workspace, config)
+    metrics = compute_realtime_metrics(results)
+
     if args.output_csv is not None:
-        output_csv = args.output_csv.resolve()
-        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        output_csv = write_realtime_csv(args, frame_table, dof_names, results)
+    else:
+        output_csv = None
 
-        rt_columns = {
-            "frame": frame_values,
-            "time": time_ref,
-        }
+    if args.metrics_json is not None:
+        metrics_json = args.metrics_json.resolve()
+        metrics_json.parent.mkdir(parents=True, exist_ok=True)
+        metrics["init_policy"] = config.init_policy
+        metrics_json.write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-        for metadata_col in ["subject_mass_kg", "subject_height_m"]:
-            if metadata_col in frame_table.columns:
-                rt_columns[metadata_col] = frame_table[metadata_col].iloc[1 : 1 + len(q_rt)].to_numpy(dtype=float)
-
-        scale_cols = [col for col in frame_table.columns if "_scale_" in col]
-        for scale_col in scale_cols:
-            rt_columns[scale_col] = frame_table[scale_col].iloc[1 : 1 + len(q_rt)].to_numpy(dtype=float)
-
-        for idx, dof_name in enumerate(dof_names):
-            rt_columns[dof_name] = q_rt[:, idx]
-            rt_columns[dof_name + "_vel"] = dq_rt[:, idx]
-            rt_columns[dof_name + "_acc"] = ddq_rt[:, idx]
-            rt_columns[dof_name + "_tau"] = tau_rt[:, idx]
-
-        rt_columns["left_grf_x"] = left_force_rt[:, 0]
-        rt_columns["left_grf_y"] = left_force_rt[:, 1]
-        rt_columns["left_grf_z"] = left_force_rt[:, 2]
-        rt_columns["right_grf_x"] = right_force_rt[:, 0]
-        rt_columns["right_grf_y"] = right_force_rt[:, 1]
-        rt_columns["right_grf_z"] = right_force_rt[:, 2]
-        rt_columns["grf_total_x"] = left_force_rt[:, 0] + right_force_rt[:, 0]
-        rt_columns["grf_total_y"] = left_force_rt[:, 1] + right_force_rt[:, 1]
-        rt_columns["grf_total_z"] = left_force_rt[:, 2] + right_force_rt[:, 2]
-        rt_columns["left_contact"] = left_contact_rt.astype(float)
-        rt_columns["right_contact"] = right_contact_rt.astype(float)
-
-        rt_columns["left_wrench_fx"] = left_wrench_rt[:, 0]
-        rt_columns["left_wrench_fy"] = left_wrench_rt[:, 1]
-        rt_columns["left_wrench_fz"] = left_wrench_rt[:, 2]
-        rt_columns["left_wrench_mx"] = left_wrench_rt[:, 3]
-        rt_columns["left_wrench_my"] = left_wrench_rt[:, 4]
-        rt_columns["left_wrench_mz"] = left_wrench_rt[:, 5]
-        rt_columns["right_wrench_fx"] = right_wrench_rt[:, 0]
-        rt_columns["right_wrench_fy"] = right_wrench_rt[:, 1]
-        rt_columns["right_wrench_fz"] = right_wrench_rt[:, 2]
-        rt_columns["right_wrench_mx"] = right_wrench_rt[:, 3]
-        rt_columns["right_wrench_my"] = right_wrench_rt[:, 4]
-        rt_columns["right_wrench_mz"] = right_wrench_rt[:, 5]
-
-        rt_columns["mpjpe_m"] = np.array(mpjpe_rt, dtype=float)
-        rt_columns["dynamics_residual_norm"] = np.array(dyn_residual_rt, dtype=float)
-        rt_columns["solve_time_ms"] = 1000.0 * solve_time_rt
-        rt_columns["input_noise_std_m"] = np.full(len(q_rt), float(args.noise_std), dtype=float)
-        rt_columns["input_drop_joint_prob"] = np.full(len(q_rt), float(args.drop_joint_prob), dtype=float)
-        rt_columns["input_mu"] = np.full(len(q_rt), float(args.mu), dtype=float)
-        rt_columns["input_stage1_kin_filter"] = np.full(len(q_rt), float(args.stage1_kin_filter), dtype=float)
-
-        rt_table = pd.DataFrame(rt_columns)
-        rt_table.to_csv(output_csv, index=False)
-
-    print(f"frames: {len(q_rt)}")
+    print(f"frames: {metrics['frames']}")
     print(f"noise_std_m: {args.noise_std:.6f}")
     print(f"drop_joint_prob: {args.drop_joint_prob:.6f}")
     print(f"stage1_kin_filter: {int(args.stage1_kin_filter)}")
-    print(f"mpjpe_m: mean={np.mean(mpjpe_rt):.6f} max={np.max(mpjpe_rt):.6f}")
-    print(f"dyn_residual_norm: mean={np.mean(dyn_residual_rt):.6f} max={np.max(dyn_residual_rt):.6f}")
-    print(f"solve_time_ms: mean={1000.0 * np.mean(solve_time_rt):.6f} p95={1000.0 * np.percentile(solve_time_rt, 95.0):.6f}")
-    print(f"precision_metric_dofs: {len(metric_dof_names)}/{len(dof_names)} (excluding ankle/head/wrist-related angles)")
+    print(f"init_policy: {config.init_policy}")
+    print(f"mpjpe_m: mean={metrics['mpjpe_m_mean']:.6f} max={metrics['mpjpe_m_max']:.6f}")
+    print(f"dyn_residual_norm: mean={metrics['dyn_residual_norm_mean']:.6f} max={metrics['dyn_residual_norm_max']:.6f}")
+    print(f"solve_time_ms: mean={metrics['solve_time_ms_mean']:.6f} p95={metrics['solve_time_ms_p95']:.6f}")
+    print(f"precision_metric_dofs: {metrics['precision_metric_dofs']}/{metrics['dof_count']} (excluding ankle/head/wrist-related angles)")
     print()
-    print(f"q_rmse: {rmse(metric_q_rt, metric_q_ref):.6f}")
-    print(f"q_mae: {mae(metric_q_rt, metric_q_ref):.6f}")
-    print(f"dq_rmse: {rmse(metric_dq_rt, metric_dq_ref):.6f}")
-    print(f"dq_mae: {mae(metric_dq_rt, metric_dq_ref):.6f}")
-    print(f"ddq_rmse: {rmse(metric_ddq_rt, metric_ddq_ref):.6f}")
-    print(f"ddq_mae: {mae(metric_ddq_rt, metric_ddq_ref):.6f}")
-    print(f"tau_full_rmse: {rmse(metric_tau_rt, metric_tau_ref):.6f}")
-    print(f"tau_full_mae: {mae(metric_tau_rt, metric_tau_ref):.6f}")
-    print(f"tau_actuated_rmse: {rmse(metric_tau_act_rt, metric_tau_act_ref):.6f}")
-    print(f"tau_actuated_mae: {mae(metric_tau_act_rt, metric_tau_act_ref):.6f}")
-    if tau_jerk_rt.size > 0:
-        print(f"tau_actuated_jerk_rmse: {rmse(tau_jerk_rt, tau_jerk_ref):.6f}")
-        print(f"tau_actuated_jerk_l2_mean: {float(np.mean(np.linalg.norm(tau_jerk_rt, axis=1))):.6f}")
-    print(f"left_grf_rmse: {rmse(left_force_rt, left_force_ref):.6f}")
-    print(f"right_grf_rmse: {rmse(right_force_rt, right_force_ref):.6f}")
+    print(f"q_rmse: {metrics['q_rmse']:.6f}")
+    print(f"q_mae: {metrics['q_mae']:.6f}")
+    print(f"dq_rmse: {metrics['dq_rmse']:.6f}")
+    print(f"dq_mae: {metrics['dq_mae']:.6f}")
+    print(f"ddq_rmse: {metrics['ddq_rmse']:.6f}")
+    print(f"ddq_mae: {metrics['ddq_mae']:.6f}")
+    print(f"tau_full_rmse: {metrics['tau_full_rmse']:.6f}")
+    print(f"tau_full_mae: {metrics['tau_full_mae']:.6f}")
+    print(f"tau_actuated_rmse: {metrics['tau_actuated_rmse']:.6f}")
+    print(f"tau_actuated_mae: {metrics['tau_actuated_mae']:.6f}")
+    if "tau_actuated_jerk_rmse" in metrics:
+        print(f"tau_actuated_jerk_rmse: {metrics['tau_actuated_jerk_rmse']:.6f}")
+        print(f"tau_actuated_jerk_l2_mean: {metrics['tau_actuated_jerk_l2_mean']:.6f}")
+    print(f"left_grf_rmse: {metrics['left_grf_rmse']:.6f}")
+    print(f"right_grf_rmse: {metrics['right_grf_rmse']:.6f}")
 
-    left_metrics = binary_classification_metrics(left_contact_rt, left_contact_ref)
-    right_metrics = binary_classification_metrics(right_contact_rt, right_contact_ref)
+    left_metrics = metrics["left_contact"]
+    right_metrics = metrics["right_contact"]
     print(
         "left_contact:"
         f" acc={left_metrics['accuracy']:.4f}"
@@ -342,21 +584,26 @@ if __name__ == "__main__":
     print()
 
     print("worst_q_rmse:")
-    for name, value in top_k_rmse(metric_q_rt, metric_q_ref, metric_dof_names, k=8):
+    for name, value in metrics["worst_q_rmse"]:
         print(f"  {name}: {value:.6f}")
 
     print("worst_tau_rmse:")
-    for name, value in top_k_rmse(metric_tau_rt, metric_tau_ref, metric_dof_names, k=8):
+    for name, value in metrics["worst_tau_rmse"]:
         print(f"  {name}: {value:.6f}")
 
     print("left_grf_axis_rmse:")
-    for name, value in per_column_rmse(left_force_rt, left_force_ref, ["fx", "fy", "fz"]):
+    for name, value in metrics["left_grf_axis_rmse"]:
         print(f"  {name}: {value:.6f}")
 
     print("right_grf_axis_rmse:")
-    for name, value in per_column_rmse(right_force_rt, right_force_ref, ["fx", "fy", "fz"]):
+    for name, value in metrics["right_grf_axis_rmse"]:
         print(f"  {name}: {value:.6f}")
 
-    if args.output_csv is not None:
+    if output_csv is not None:
         print()
-        print(f"realtime_csv: {args.output_csv.resolve()}")
+        print(f"realtime_csv: {output_csv}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
