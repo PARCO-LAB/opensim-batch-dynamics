@@ -3,19 +3,24 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
+import fcntl
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 from batch_common import (
     BatchTask,
     build_trial_name,
     discover_amass_input_files,
     is_nonempty_file,
+    is_valid_groundlink_csv,
     resolve_pipeline_script,
     resolve_submit_path,
 )
@@ -28,6 +33,21 @@ class BatchTaskResult:
     return_code: int
     duration_s: float
     error: str | None
+
+
+@contextlib.contextmanager
+def _batch_lock(output_root: Path) -> Iterator[None]:
+    """Prevent two batches from writing the same output tree concurrently."""
+    output_root.mkdir(parents=True, exist_ok=True)
+    with (output_root / ".batch.lock").open("w", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(f"Another batch is already using {output_root}") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,6 +104,11 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Do not skip existing CSVs.",
     )
+    parser.add_argument(
+        "--rerun-walking",
+        action="store_true",
+        help="Recompute walk trials even when --skip-existing-csv is enabled.",
+    )
     # Backward-compatible aliases.
     parser.add_argument(
         "--skip-existing",
@@ -122,6 +147,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bsm-model", default="model/bsm/bsm.osim")
     parser.add_argument("--addbio-root", default=None)
     parser.add_argument("--sex", choices=["neutral", "male", "female"], default=None)
+    parser.add_argument("--subject-mass-kg", type=float, default=None)
+    parser.add_argument("--subject-height-m", type=float, default=None)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--skip-inverse-dynamics", action="store_true")
     parser.add_argument(
@@ -135,10 +162,26 @@ def parse_args() -> argparse.Namespace:
         default="estimated",
         choices=["estimated", "none"],
     )
-    parser.add_argument("--id-contact-bodies", default="all")
+    parser.add_argument(
+        "--id-contact-bodies",
+        default="calcn_l,toes_l,calcn_r,toes_r",
+        help="Contact bodies for GRF estimation (default: calcn/toes on both sides).",
+    )
     parser.add_argument("--id-friction-coeff", type=float, default=0.8)
     parser.add_argument("--id-contact-height-threshold-m", type=float, default=0.04)
     parser.add_argument("--id-contact-speed-threshold-mps", type=float, default=0.5)
+    parser.add_argument(
+        "--walking-contact-height-threshold-m",
+        type=float,
+        default=None,
+        help="Override contact height threshold for walk trials only.",
+    )
+    parser.add_argument(
+        "--walking-contact-speed-threshold-mps",
+        type=float,
+        default=None,
+        help="Override contact speed threshold for walk trials only.",
+    )
     return parser.parse_args()
 
 def _build_tasks(args: argparse.Namespace, input_root: Path, output_root: Path) -> list[BatchTask]:
@@ -200,10 +243,25 @@ def _build_single_run_cmd(
         "--id-contact-speed-threshold-mps",
         str(args.id_contact_speed_threshold_mps),
     ]
+    if "_walk_" in task.relative_path.stem.lower():
+        if args.walking_contact_height_threshold_m is not None:
+            cmd[-4:-2] = [
+                "--id-contact-height-threshold-m",
+                str(args.walking_contact_height_threshold_m),
+            ]
+        if args.walking_contact_speed_threshold_mps is not None:
+            cmd[-2:] = [
+                "--id-contact-speed-threshold-mps",
+                str(args.walking_contact_speed_threshold_mps),
+            ]
     if args.addbio_root:
         cmd.extend(["--addbio-root", args.addbio_root])
     if args.sex:
         cmd.extend(["--sex", args.sex])
+    if args.subject_mass_kg is not None:
+        cmd.extend(["--subject-mass-kg", str(args.subject_mass_kg)])
+    if args.subject_height_m is not None:
+        cmd.extend(["--subject-height-m", str(args.subject_height_m)])
     if args.id_cutoff_hz is not None:
         cmd.extend(["--id-cutoff-hz", str(args.id_cutoff_hz)])
     if args.skip_inverse_dynamics:
@@ -219,7 +277,10 @@ def _run_single_task(
     output_root: Path,
     task: BatchTask,
 ) -> BatchTaskResult:
-    if args.skip_existing and is_nonempty_file(task.output_csv_path):
+    is_walking = "_walk_" in task.relative_path.stem.lower()
+    if args.skip_existing and not (args.rerun_walking and is_walking) and is_valid_groundlink_csv(
+        task.output_csv_path
+    ):
         return BatchTaskResult(
             task=task,
             status="skipped",
@@ -227,6 +288,12 @@ def _run_single_task(
             duration_s=0.0,
             error=None,
         )
+
+    # ponytail: failed AddBiomechanics runs leave a partial trial directory;
+    # remove only this exact retry target so stale Geometry folders cannot block it.
+    stale_trial_dir = (output_root / task.trial_name).resolve()
+    if stale_trial_dir.parent == output_root.resolve() and stale_trial_dir.exists():
+        shutil.rmtree(stale_trial_dir)
 
     task.output_csv_path.parent.mkdir(parents=True, exist_ok=True)
     task.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -255,7 +322,7 @@ def _run_single_task(
             duration_s=duration,
             error=f"Pipeline failed (exit code {proc.returncode}). See log: {task.log_path}",
         )
-    if not task.output_csv_path.exists():
+    if not is_nonempty_file(task.output_csv_path):
         return BatchTaskResult(
             task=task,
             status="failed",
@@ -292,7 +359,18 @@ def _run_parallel(
         completed = 0
         for future in concurrent.futures.as_completed(future_to_index):
             completed += 1
-            result = future.result()
+            task_index = future_to_index[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                task = tasks[task_index]
+                result = BatchTaskResult(
+                    task=task,
+                    status="failed",
+                    return_code=1,
+                    duration_s=0.0,
+                    error=f"Batch worker error: {type(exc).__name__}: {exc}",
+                )
             results.append(result)
             label = f"[{completed}/{total}]"
             rel = result.task.relative_path.as_posix()
@@ -373,7 +451,7 @@ def main() -> int:
     print(f"Output root: {output_root}")
     print(f"Workers: {args.workers}")
     if args.skip_existing:
-        existing = sum(1 for task in tasks if is_nonempty_file(task.output_csv_path))
+        existing = sum(1 for task in tasks if is_valid_groundlink_csv(task.output_csv_path))
         print(f"Skip existing CSVs: enabled ({existing} already present)")
     else:
         print("Skip existing CSVs: disabled")
@@ -387,8 +465,9 @@ def main() -> int:
         return 0
 
     start = time.time()
-    results = _run_parallel(args, pipeline_script, output_root, tasks)
-    summary_path = _write_summary(output_root, args, input_root, results)
+    with _batch_lock(output_root):
+        results = _run_parallel(args, pipeline_script, output_root, tasks)
+        summary_path = _write_summary(output_root, args, input_root, results)
     elapsed = time.time() - start
 
     ok = sum(1 for r in results if r.status == "ok")

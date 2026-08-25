@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import errno
+import csv
 import json
+import math
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -81,7 +85,31 @@ def read_manifest_record(manifest_path: Path, task_index: int) -> dict[str, obje
 
 
 def is_nonempty_file(path: Path) -> bool:
-    return path.exists() and path.is_file() and path.stat().st_size > 0
+    # ponytail: NAS stat calls can transiently return EAGAIN/ESTALE; retry here
+    # so one filesystem hiccup does not abort an otherwise independent batch job.
+    for attempt in range(4):
+        try:
+            info = path.stat()
+            return path.is_file() and info.st_size > 0
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            if exc.errno not in (errno.EAGAIN, errno.ESTALE) or attempt == 3:
+                return False
+            time.sleep(0.25 * (attempt + 1))
+    return False
+
+
+def is_valid_groundlink_csv(path: Path) -> bool:
+    """Return true only for a non-empty CSV with finite subject metadata."""
+    if not is_nonempty_file(path):
+        return False
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            row = next(csv.DictReader(handle))
+        return all(math.isfinite(float(row[name])) for name in ("subject_mass_kg", "subject_height_m"))
+    except (StopIteration, OSError, KeyError, TypeError, ValueError):
+        return False
 
 
 def discover_amass_input_files(input_root: Path) -> list[Path]:

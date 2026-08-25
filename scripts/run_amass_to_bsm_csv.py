@@ -60,6 +60,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional sex override for SMPL-X and AddBiomechanics metadata",
     )
+    parser.add_argument("--subject-mass-kg", type=float, default=None)
+    parser.add_argument("--subject-height-m", type=float, default=None)
     parser.add_argument(
         "--device",
         default="cpu",
@@ -90,10 +92,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--id-contact-bodies",
-        default="all",
+        default="calcn_l,toes_l,calcn_r,toes_r",
         help=(
             "Comma-separated contact body names used to estimate GRF. "
-            "Use 'all' (default) to consider all non-ground body nodes."
+            "Defaults to calcn/toes on both sides. Use 'all' only for exploratory runs."
         ),
     )
     parser.add_argument(
@@ -259,6 +261,8 @@ def _run_single_trial_pipeline(
         smplx_model_dir=assets.smplx_model_dir,
         sex_override=args.sex,
         device=args.device,
+        subject_mass_kg=args.subject_mass_kg,
+        subject_height_m=args.subject_height_m,
     )
     subject_folder = build_addbiomechanics_subject_folder(
         subject_root=trial_root,

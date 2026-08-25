@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from batch_common import is_nonempty_file, read_manifest_record  # noqa: E402
+from batch_common import is_nonempty_file, is_valid_groundlink_csv, read_manifest_record  # noqa: E402
 
 
 class BatchCommonTest(unittest.TestCase):
@@ -48,6 +48,21 @@ class BatchCommonTest(unittest.TestCase):
 
             path.write_text("value\n1\n", encoding="utf-8")
             self.assertTrue(is_nonempty_file(path))
+
+    def test_is_valid_groundlink_csv_rejects_nonfinite_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "output.csv"
+            path.write_text(
+                "subject_mass_kg,subject_height_m\n66.68,nan\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(is_valid_groundlink_csv(path))
+
+            path.write_text(
+                "subject_mass_kg,subject_height_m\n66.68,1.70\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(is_valid_groundlink_csv(path))
 
 
 if __name__ == "__main__":

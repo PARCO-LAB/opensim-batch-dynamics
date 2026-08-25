@@ -34,6 +34,7 @@ def run_smplx_forward(
     sex_override: str | None = None,
     device: str = "cpu",
     num_betas: int = 16,
+    return_vertices: bool = True,
 ) -> SMPLXForwardResult:
     """Run SMPL-X forward pass and return vertices + joints for each frame."""
     try:
@@ -96,12 +97,16 @@ def run_smplx_forward(
         "reye_pose": torch.as_tensor(sequence.reye_pose, dtype=t, device=device),
         "transl": torch.as_tensor(sequence.trans, dtype=t, device=device),
         "betas": betas,
-        "return_verts": True,
+        "return_verts": return_vertices,
     }
 
     with torch.no_grad():
         output = model(**kwargs)
 
-    vertices = output.vertices.detach().cpu().numpy().astype(np.float32)
+    vertices = (
+        output.vertices.detach().cpu().numpy().astype(np.float32)
+        if return_vertices
+        else np.empty((n_frames, 0, 3), dtype=np.float32)
+    )
     joints = output.joints.detach().cpu().numpy().astype(np.float32)
     return SMPLXForwardResult(vertices=vertices, joints=joints)

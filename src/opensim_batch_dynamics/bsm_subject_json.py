@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -119,14 +120,25 @@ def build_subject_json(
     smplx_model_dir: str | Path,
     sex_override: str | None = None,
     device: str = "cpu",
+    subject_mass_kg: float | None = None,
+    subject_height_m: float | None = None,
 ) -> dict[str, object]:
     """Create the minimal AddBiomechanics subject JSON for a custom skeleton."""
-    measurements = estimate_subject_measurements(
-        sequence=sequence,
-        smplx_model_dir=smplx_model_dir,
-        sex_override=sex_override,
-        device=device,
-    )
+    if subject_mass_kg is None or subject_height_m is None:
+        estimated = estimate_subject_measurements(
+            sequence=sequence,
+            smplx_model_dir=smplx_model_dir,
+            sex_override=sex_override,
+            device=device,
+        )
+        measurements = SubjectMeasurementEstimate(
+            estimated.mass_kg if subject_mass_kg is None else subject_mass_kg,
+            estimated.height_m if subject_height_m is None else subject_height_m,
+        )
+    else:
+        measurements = SubjectMeasurementEstimate(subject_mass_kg, subject_height_m)
+    if not all(math.isfinite(value) and value > 0 for value in (measurements.mass_kg, measurements.height_m)):
+        raise ValueError("Subject mass and height must be finite positive values.")
     return {
         "sex": _normalize_sex(sex_override or sequence.sex),
         "massKg": float(measurements.mass_kg),

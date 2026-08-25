@@ -408,6 +408,8 @@ def _estimate_contact_wrenches_from_kinematics(
                 )
         detection_points_by_group[group_key] = point_positions_filt
 
+    # Calibrate contact detection to the model's foot-marker frame.  GroundLink
+    # CoP coordinates use the global z=0 plane, so keep output CoP on that plane.
     detection_heights = [
         (point_positions @ up).reshape(-1)
         for point_positions in detection_points_by_group.values()
@@ -417,7 +419,8 @@ def _estimate_contact_wrenches_from_kinematics(
         heights_for_floor = np.concatenate(detection_heights)
     else:
         heights_for_floor = (body_positions_filt @ up).reshape(-1)
-    ground_height = float(np.percentile(heights_for_floor, 1.0))
+    contact_ground_height = float(np.percentile(heights_for_floor, 1.0))
+    cop_ground_height = 0.0
 
     com_acc = np.gradient(
         np.gradient(com_positions_filt, timestamps, axis=0),
@@ -440,7 +443,9 @@ def _estimate_contact_wrenches_from_kinematics(
     for body_idx in range(len(contact_nodes)):
         for frame_idx in range(frames):
             point = body_positions_filt[body_idx, frame_idx, :]
-            cop_per_body[body_idx, frame_idx, :] = _project_point_to_plane(point, up, ground_height)
+            cop_per_body[body_idx, frame_idx, :] = _project_point_to_plane(
+                point, up, cop_ground_height
+            )
 
     median_dt = float(np.median(np.diff(timestamps)))
     min_contact_run_frames = max(1, int(round(0.08 / median_dt)))
@@ -451,7 +456,7 @@ def _estimate_contact_wrenches_from_kinematics(
     for group_idx, group_key in enumerate(group_keys):
         point_positions = detection_points_by_group[group_key]
         point_heights = point_positions @ up
-        low_height = np.min(point_heights - ground_height, axis=0)
+        low_height = np.min(point_heights - contact_ground_height, axis=0)
         centroid = np.mean(point_positions, axis=0)
         centroid_velocity = np.gradient(centroid, timestamps, axis=0)
         centroid_speed = np.linalg.norm(centroid_velocity, axis=1)
@@ -486,7 +491,9 @@ def _estimate_contact_wrenches_from_kinematics(
             + (support_scale * support_scale * support_scale) * tangential_force_target
         )
 
-        com_proj = _project_point_to_plane(com_positions_filt[frame_idx, :], up, ground_height)
+        com_proj = _project_point_to_plane(
+            com_positions_filt[frame_idx, :], up, cop_ground_height
+        )
         weights = np.zeros((len(contact_nodes),), dtype=np.float64)
         for group_idx, group_key in enumerate(group_keys):
             activation = float(group_activation[group_idx, frame_idx])
@@ -618,6 +625,98 @@ def _estimate_contact_wrenches_from_kinematics(
     return grf_mot_path, external_loads_xml_path, contact_wrench_csv_path
 
 
+def run_inverse_dynamics_with_measured_grf(
+    model_path: str | Path,
+    ik_mot_path: str | Path,
+    output_dir: str | Path,
+    trial_name: str,
+    timestamps: np.ndarray,
+    grf_n: np.ndarray,
+    cop_m: np.ndarray,
+    contact_body_names: tuple[str, str] = ("calcn_l", "calcn_r"),
+    cutoff_hz: float = 12.0,
+) -> tuple[Path, Path, Path, Path, Path]:
+    """Run ID with measured GroundLink GRF/CoP and zero free moment."""
+    try:
+        import nimblephysics as nimble
+        import opensim
+    except ImportError as exc:
+        raise RuntimeError("OpenSim and NimblePhysics are required for measured-GRF ID.") from exc
+
+    timestamps = np.asarray(timestamps, dtype=float).reshape(-1)
+    grf_n = np.asarray(grf_n, dtype=float)
+    cop_m = np.asarray(cop_m, dtype=float)
+    if grf_n.shape != cop_m.shape or grf_n.shape != (timestamps.size, 2, 3):
+        raise ValueError("Measured GRF/CoP must have shape (T, 2, 3), matching timestamps.")
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    grf_mot = output_dir / f"{trial_name}_grf_measured.mot"
+    external_xml = output_dir / f"{trial_name}_external_forces_measured.xml"
+    wrench_csv = output_dir / f"{trial_name}_contact_wrenches_measured.csv"
+    labels = ["time"]
+    for body in contact_body_names:
+        labels.extend([f"ground_force_{body}_v{axis}" for axis in "xyz"])
+        labels.extend([f"ground_force_{body}_p{axis}" for axis in "xyz"])
+        labels.extend([f"ground_force_{body}_m{axis}" for axis in "xyz"])
+    with grf_mot.open("w", encoding="utf-8") as handle:
+        handle.write(f"name {trial_name}_grf_measured\n")
+        handle.write(f"datacolumns {len(labels)}\n")
+        handle.write(f"datarows {timestamps.size}\n")
+        handle.write(f"range {timestamps[0]:.8f} {timestamps[-1]:.8f}\nendheader\n")
+        handle.write(" ".join(labels) + "\n")
+        for i, timestamp in enumerate(timestamps):
+            row = [timestamp]
+            for foot in range(2):
+                row.extend(grf_n[i, foot].tolist())
+                row.extend(cop_m[i, foot].tolist())
+                row.extend((0.0, 0.0, 0.0))
+            handle.write(" ".join(f"{value:.10g}" for value in row) + "\n")
+    with wrench_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        header = ["frame", "time"]
+        for body in contact_body_names:
+            header.extend([f"{body}_cop_{axis}" for axis in "xyz"])
+            header.extend([f"{body}_force_{axis}" for axis in "xyz"])
+            header.extend([f"{body}_moment_{axis}" for axis in "xyz"])
+        writer.writerow(header)
+        for i, timestamp in enumerate(timestamps):
+            row: list[float | int] = [i, timestamp]
+            for foot in range(2):
+                row.extend(cop_m[i, foot].tolist())
+                row.extend(grf_n[i, foot].tolist())
+                row.extend((0.0, 0.0, 0.0))
+            writer.writerow(row)
+    osim_model = nimble.biomechanics.OpenSimParser.parseOsim(str(model_path), "", True)
+    contact_nodes = []
+    for body in contact_body_names:
+        node = osim_model.skeleton.getBodyNode(body)
+        if node is None:
+            raise ValueError(f"Measured-GRF body not found in model: {body}")
+        contact_nodes.append(node)
+    nimble.biomechanics.OpenSimParser.saveOsimInverseDynamicsProcessedForcesXMLFile(
+        trial_name, contact_nodes, grf_mot.name, str(external_xml)
+    )
+    id_model = _prepare_model_for_inverse_dynamics(Path(model_path).resolve(), output_dir, trial_name)
+    setup = output_dir / f"Setup_ID_measuredGRF_{trial_name}.xml"
+    sto = output_dir / f"{trial_name}_id_measuredGRF.sto"
+    opensim.Logger.setLevelString("error")
+    tool = opensim.InverseDynamicsTool()
+    tool.setName(f"{trial_name}_measuredGRF")
+    tool.setModelFileName(str(id_model))
+    tool.setCoordinatesFileName(str(Path(ik_mot_path).resolve()))
+    tool.setExternalLoadsFileName(str(external_xml))
+    tool.setStartTime(float(timestamps[0]))
+    tool.setEndTime(float(timestamps[-1]))
+    tool.setLowpassCutoffFrequency(float(cutoff_hz))
+    tool.setResultsDir(str(output_dir))
+    tool.setOutputGenForceFileName(sto.name)
+    tool.printToXML(str(setup))
+    _run_opensim_tool(setup)
+    if not sto.exists():
+        raise FileNotFoundError(f"Measured-GRF ID output not found: {sto}")
+    return setup, sto, grf_mot, external_xml, wrench_csv
+
+
 def _infer_time_window_from_mot(ik_mot_path: Path) -> tuple[float, float]:
     labels, rows = parse_mot(ik_mot_path)
     lookup = {_canonical_label(label): idx for idx, label in enumerate(labels)}
@@ -711,7 +810,7 @@ def run_inverse_dynamics_with_estimated_grf(
     trial_name: str,
     filter_mode: str = "auto",
     cutoff_hz: float | None = None,
-    contact_body_names: tuple[str, ...] = ("all",),
+    contact_body_names: tuple[str, ...] = ("calcn_l", "toes_l", "calcn_r", "toes_r"),
     friction_coeff: float = 0.8,
     contact_height_threshold_m: float = 0.04,
     contact_speed_threshold_mps: float = 0.5,
@@ -858,7 +957,7 @@ def run_inverse_dynamics_and_export_torque_csv(
     filter_mode: str = "auto",
     cutoff_hz: float | None = None,
     grf_mode: str = "estimated",
-    contact_body_names: tuple[str, ...] = ("all",),
+    contact_body_names: tuple[str, ...] = ("calcn_l", "toes_l", "calcn_r", "toes_r"),
     friction_coeff: float = 0.8,
     contact_height_threshold_m: float = 0.04,
     contact_speed_threshold_mps: float = 0.5,

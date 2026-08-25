@@ -246,6 +246,7 @@ def export_final_csv(
 
     contact_body_names: list[str] = []
     aligned_grf: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    aligned_cop: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
     if contact_wrench_csv_path is not None:
         contact_csv = Path(contact_wrench_csv_path).resolve()
@@ -257,12 +258,21 @@ def export_final_csv(
                 fy = _align_series(contact_data["time"], contact_data[f"{body_name}_force_y"], time_values)
                 fz = _align_series(contact_data["time"], contact_data[f"{body_name}_force_z"], time_values)
                 aligned_grf[body_name] = (fx, fy, fz)
+                aligned_cop[body_name] = tuple(
+                    _align_series(contact_data["time"], contact_data[f"{body_name}_cop_{axis}"], time_values)
+                    for axis in "xyz"
+                )
 
     if not contact_body_names:
         contact_body_names = [name for name in fallback_contact_bodies]
         for body_name in contact_body_names:
             zeros = np.zeros((frames,), dtype=np.float64)
             aligned_grf[body_name] = (zeros.copy(), zeros.copy(), zeros.copy())
+            aligned_cop[body_name] = (
+                np.full((frames,), math.nan),
+                np.full((frames,), math.nan),
+                np.full((frames,), math.nan),
+            )
 
     total_fx = np.zeros((frames,), dtype=np.float64)
     total_fy = np.zeros((frames,), dtype=np.float64)
@@ -296,6 +306,9 @@ def export_final_csv(
         for body_name in contact_body_names:
             header.extend(
                 [
+                    f"{body_name}_cop_x",
+                    f"{body_name}_cop_y",
+                    f"{body_name}_cop_z",
                     f"{body_name}_grf_x",
                     f"{body_name}_grf_y",
                     f"{body_name}_grf_z",
@@ -320,6 +333,8 @@ def export_final_csv(
                 row.append(float(aligned_torque[f"{dof_name}_tau"][frame_idx]))
             for body_name in contact_body_names:
                 fx, fy, fz = aligned_grf[body_name]
+                cop_x, cop_y, cop_z = aligned_cop[body_name]
+                row.extend([float(cop_x[frame_idx]), float(cop_y[frame_idx]), float(cop_z[frame_idx])])
                 row.append(float(fx[frame_idx]))
                 row.append(float(fy[frame_idx]))
                 row.append(float(fz[frame_idx]))

@@ -40,6 +40,44 @@ def resolve_addbio_root(addbio_root: str | Path | None = None) -> Path:
     return root
 
 
+def _merge_segment_mots(segment_paths: list[Path], output_path: Path) -> Path:
+    """Merge AddBiomechanics segment MOTs when no combined MOT was emitted."""
+    if not segment_paths:
+        raise FileNotFoundError("No AddBiomechanics IK segment files found.")
+    first = segment_paths[0].read_text(encoding="utf-8")
+    marker = "endheader"
+    if marker not in first:
+        raise ValueError(f"Invalid MOT header: {segment_paths[0]}")
+    header, first_data = first.split(marker, 1)
+    data_sections = [first_data.strip().splitlines()]
+    for path in segment_paths[1:]:
+        text = path.read_text(encoding="utf-8")
+        if marker not in text:
+            raise ValueError(f"Invalid MOT header: {path}")
+        _, data = text.split(marker, 1)
+        lines = data.strip().splitlines()
+        data_sections.append(lines)
+    labels = data_sections[0][0]
+    rows: list[str] = []
+    for section in data_sections:
+        if not section or section[0] != labels:
+            raise ValueError(f"MOT segment labels do not match: {segment_paths[0]}")
+        rows.extend(section[1:])
+    header_lines = header.splitlines()
+    header_lines = [
+        line for line in header_lines
+        if not line.startswith("datarows ") and not line.startswith("range ")
+    ]
+    times = [float(row.split()[0]) for row in rows]
+    header_lines.extend((f"datarows {len(rows)}", f"range {times[0]:.8f} {times[-1]:.8f}"))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        "\n".join(header_lines + [marker, labels, *rows]) + "\n",
+        encoding="utf-8",
+    )
+    return output_path
+
+
 def run_addbiomechanics_engine(
     subject_root: str | Path,
     addbio_root: str | Path | None = None,
@@ -107,7 +145,10 @@ def run_addbiomechanics_engine(
     if not final_mot_path.exists():
         segment_candidates = sorted(ik_dir.glob(f"{subject_root.name}_segment_*_ik.mot"))
         if segment_candidates:
-            final_mot_path = segment_candidates[0]
+            final_mot_path = _merge_segment_mots(
+                segment_candidates,
+                ik_dir / f"{subject_root.name}_ik.mot",
+            )
         else:
             any_candidate = sorted(ik_dir.glob("*_ik.mot"))
             if any_candidate:

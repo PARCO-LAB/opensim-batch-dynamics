@@ -10,10 +10,26 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from opensim_batch_dynamics.addbio_csv_export import export_addbiomechanics_csv  # noqa: E402
+from opensim_batch_dynamics.addbio_runner import _merge_segment_mots  # noqa: E402
 from opensim_batch_dynamics.mot_to_csv import extract_coordinate_names_from_osim  # noqa: E402
 
 
 class AddBiomechanicsCsvExportTest(unittest.TestCase):
+    def test_merge_segment_mots_keeps_one_label_row_and_updates_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            first = root / "segment_0.mot"
+            second = root / "segment_1.mot"
+            body = "name x\ndatacolumns 2\ndatarows 1\nrange 0 0\nendheader\ntime q\n"
+            first.write_text(body + "0 1\n", encoding="utf-8")
+            second.write_text(body.replace("range 0 0", "range 1 1") + "1 2\n", encoding="utf-8")
+            merged = _merge_segment_mots([first, second], root / "merged.mot")
+            text = merged.read_text(encoding="utf-8")
+        self.assertIn("datarows 2", text)
+        self.assertIn("range 0.00000000 1.00000000", text)
+        self.assertEqual(text.count("time q"), 1)
+        self.assertIn("0 1\n1 2", text)
+
     def test_export_addbiomechanics_csv_keeps_model_order_and_nan_fills_missing_dofs(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         model_path = repo_root / "model" / "bsm" / "bsm.osim"
