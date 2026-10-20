@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import csv
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from validate_groundlink import (  # noqa: E402
+    EXCLUDED_MOTIONS,
+    EXCLUDED_TRIALS,
     _aggregate_side_cop,
     _physics_residual,
+    discover_pairs,
     evaluate_signals,
     load_groundlink_force,
     write_manifest,
@@ -18,6 +23,73 @@ from validate_groundlink import (  # noqa: E402
 
 
 class GroundLinkValidatorTest(unittest.TestCase):
+    def test_chair_is_excluded_as_unmodelled_external_contact(self) -> None:
+        self.assertIn("chair", EXCLUDED_MOTIONS)
+
+    def test_confirmed_invalid_kinematic_fit_is_excluded(self) -> None:
+        self.assertEqual(
+            EXCLUDED_TRIALS[("s002", "jumpingjack_3")],
+            "invalid_pelvis_kinematics",
+        )
+
+    def test_nonballistic_ballet_jump_is_excluded(self) -> None:
+        self.assertEqual(
+            EXCLUDED_TRIALS[("s002", "balletsmalljump_1")],
+            "nonballistic_flight_kinematics",
+        )
+
+    def test_manifest_does_not_load_force_for_excluded_trial(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            motion = Path(tmpdir) / "motion_stageii.npz"
+            force = Path(tmpdir) / "force.npy"
+            motion.write_bytes(b"placeholder")
+            force.write_bytes(b"placeholder")
+            pair = SimpleNamespace(
+                subject="s002",
+                trial="balletsmalljump_1",
+                motion_path=motion,
+                force_path=force,
+                frames=10,
+                exclusion="nonballistic_flight_kinematics",
+            )
+            manifest = write_manifest([pair], Path(tmpdir) / "manifest.csv")
+            with manifest.open(newline="", encoding="utf-8") as handle:
+                row = next(iter(csv.DictReader(handle)))
+        self.assertEqual(row["status"], "excluded")
+        self.assertEqual(row["force_frames"], "")
+
+    def test_discover_pairs_derives_force_path_without_directory_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "moshpp" / "s002"
+            force_root = Path(tmpdir) / "force" / "s002"
+            root.mkdir(parents=True)
+            force_root.mkdir(parents=True)
+            motion = root / "s002_20220520_balletsmalljump_1_stageii.npz"
+            np.savez(motion, trans=np.zeros((4, 2, 3)))
+            force = force_root / "s002_20220520_balletsmalljump_1.npy"
+            force.write_bytes(b"not loaded")
+
+            pairs = discover_pairs(root, force_root, "s002")
+
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0].force_path, force)
+        self.assertEqual(pairs[0].frames, 4)
+
+    def test_fast_discovery_skips_motion_array_shape_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "moshpp" / "s002"
+            force_root = Path(tmpdir) / "force" / "s002"
+            root.mkdir(parents=True)
+            force_root.mkdir(parents=True)
+            motion = root / "s002_20220520_balletsmalljump_1_stageii.npz"
+            np.savez(motion, trans=np.zeros((4, 2, 3)))
+            force = force_root / "s002_20220520_balletsmalljump_1.npy"
+            force.write_bytes(b"not loaded")
+
+            pairs = discover_pairs(root, force_root, "s002", read_motion_frames=False)
+
+        self.assertEqual(pairs[0].frames, None)
+
     def test_metrics_identical_delayed_and_without_contact(self) -> None:
         ref = np.zeros((4, 3), dtype=float)
         ref[:, 2] = (50.0, 100.0, 150.0, 200.0)

@@ -15,7 +15,18 @@ from typing import Any
 import numpy as np
 
 WALKING = {"walk_1": 1078, "walk_2": 967, "walk_3": 1028}
-EXCLUDED_MOTIONS = {"dog", "ballethighleg", "idling"}
+# These trials violate the foot-ground-only external-contact model. In
+# particular, chair trials include an unmeasured seat reaction.
+EXCLUDED_MOTIONS = {"dog", "ballethighleg", "idling", "chair"}
+# Dataset-specific kinematic fit failures confirmed with a rotation-invariant
+# pelvis angular-speed check. These trials are not suitable for dynamics.
+EXCLUDED_TRIALS = {
+    ("s002", "jumpingjack_3"): "invalid_pelvis_kinematics",
+    # The markerless root trajectory is non-ballistic during the six airborne
+    # phases (the no-GRF ID requires a nonzero external force while both feet
+    # are unsupported).  A foot-only dynamics run would therefore invent GRF.
+    ("s002", "balletsmalljump_1"): "nonballistic_flight_kinematics",
+}
 
 
 def _numpy(value: Any) -> np.ndarray:
@@ -87,10 +98,11 @@ def discover_pairs(
     root: str | Path,
     force_root: str | Path | None = None,
     subject: str | None = None,
+    *,
+    read_motion_frames: bool = True,
 ) -> list[Pair]:
     root = Path(root)
     force_root = Path(force_root) if force_root is not None else root
-    force_files = {_subject_trial(p)[1]: p for p in force_root.glob("*.npy")}
     motion_files = {
         _subject_trial(p)[1]: p
         for p in root.glob("*_stageii.npz")
@@ -102,13 +114,28 @@ def discover_pairs(
     for trial, motion in sorted(motion_files.items()):
         detected_subject = _subject_trial(motion)[0]
         motion_key = trial
-        excluded = next((x for x in EXCLUDED_MOTIONS if motion_key.startswith(x)), "")
-        force = force_files.get(trial)
+        pair_subject = subject or detected_subject
+        excluded = EXCLUDED_TRIALS.get(
+            (pair_subject, motion_key),
+            next((x for x in EXCLUDED_MOTIONS if motion_key.startswith(x)), ""),
+        )
+        # Derive the force filename from the motion filename instead of
+        # scanning the entire force directory.  On the NAS, listing a large
+        # directory can block for minutes even when individual files are
+        # available.  ``*_full_stageii`` motions use the non-``_full`` force
+        # recording when present.
+        motion_stem = motion.stem
+        if motion_stem.endswith("_stageii"):
+            motion_stem = motion_stem[: -len("_stageii")]
+        force_candidates = [force_root / f"{motion_stem}.npy"]
+        if motion_stem.endswith("_full"):
+            force_candidates.append(force_root / f"{motion_stem[:-len('_full')]}.npy")
+        force = next((candidate for candidate in force_candidates if candidate.is_file()), None)
         frames = None
-        shape = _npz_array_shape(motion, "trans")
+        shape = _npz_array_shape(motion, "trans") if read_motion_frames else None
         if shape:
             frames = int(shape[0])
-        pairs.append(Pair(subject or detected_subject, motion_key, motion, force, frames, excluded))
+        pairs.append(Pair(pair_subject, motion_key, motion, force, frames, excluded))
     return pairs
 
 
@@ -119,7 +146,12 @@ def _git_commit() -> str:
         return "unknown"
 
 
-def write_manifest(pairs: list[Pair], output: str | Path) -> Path:
+def write_manifest(
+    pairs: list[Pair],
+    output: str | Path,
+    *,
+    validate_force_frames: bool = True,
+) -> Path:
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     fields = ["subject", "trial", "motion_path", "force_path", "frames", "force_frames", "status", "exclusion"]
@@ -129,7 +161,14 @@ def write_manifest(pairs: list[Pair], output: str | Path) -> Path:
         for pair in pairs:
             force_frames = ""
             status = "excluded" if pair.exclusion else "missing_force" if pair.force_path is None else "ok"
-            if pair.force_path is not None:
+            # An excluded trial must never be loaded just to validate a force
+            # array that will not enter staging or E4.  This is especially
+            # important for large jump recordings on the NAS.
+            if (
+                validate_force_frames
+                and pair.force_path is not None
+                and not pair.exclusion
+            ):
                 try:
                     force_frames = str(load_groundlink_force(pair.force_path)[0].shape[0])
                     if pair.frames is not None and int(force_frames) != pair.frames:
@@ -378,7 +417,7 @@ def _prediction_csv(root: Path, pair: Pair) -> Path:
 
 def _force_target_csv(root: Path, pair: Pair) -> Path | None:
     matches = sorted(root.glob(f"{pair.motion_path.stem}_*/results/ID_estimatedGRF/*_contact_wrenches_estimated.csv"))
-    return matches[0] if matches else None
+    return max(matches, key=lambda path: path.stat().st_mtime, default=None)
 
 
 def write_metrics(records: list[dict[str, str | float]], output_dir: Path) -> tuple[Path, Path]:
@@ -415,9 +454,23 @@ def main() -> int:
     parser.add_argument("--method-name", default="pipeline", help="Label for predictions in --pipeline-dir.")
     parser.add_argument("--com-reference-dir", type=Path, default=None, help="Optional CSV directory supplying common com_acc_* for physics_residual.")
     parser.add_argument("--force-target-dir", type=Path, default=None, help="Optional pipeline directory containing COM-derived contact-wrench targets.")
+    parser.add_argument(
+        "--skip-force-validation",
+        action="store_true",
+        help="Do not load every force array while writing the audit manifest.",
+    )
     args = parser.parse_args()
-    pairs = discover_pairs(args.input_root, args.force_root, args.subject)
-    manifest = write_manifest(pairs, args.output_dir / "manifest.csv")
+    pairs = discover_pairs(
+        args.input_root,
+        args.force_root,
+        args.subject,
+        read_motion_frames=not args.skip_force_validation,
+    )
+    manifest = write_manifest(
+        pairs,
+        args.output_dir / "manifest.csv",
+        validate_force_frames=not args.skip_force_validation,
+    )
     excluded = sum(bool(p.exclusion) for p in pairs)
     missing = sum(p.force_path is None and not p.exclusion for p in pairs)
     force_pairs = sum(p.force_path is not None for p in pairs)

@@ -13,9 +13,14 @@ import numpy as np
 
 from .mot_to_csv import (
     extract_coordinate_names_from_osim,
-    infer_cutoff_hz,
+    effective_cutoff_hz,
     parse_mot,
     _lowpass_butterworth_4th,
+)
+from .segments import (
+    discover_segment_mot_paths,
+    merge_csv_segments,
+    merge_storage_segments,
 )
 
 
@@ -154,12 +159,12 @@ def _project_force_to_friction_cone(
     friction_coeff: float,
 ) -> np.ndarray:
     """Project a force onto a linearized Coulomb friction cone with normal +up."""
-    normal_force = float(np.dot(force, up))
-    normal_force = max(0.0, normal_force)
-    tangential = force - normal_force * up
+    signed_normal_force = float(np.dot(force, up))
+    tangential = force - signed_normal_force * up
+    normal_force = max(0.0, signed_normal_force)
     tangential_norm = float(np.linalg.norm(tangential))
     tangential_limit = float(friction_coeff) * normal_force
-    if tangential_norm > tangential_limit > 0.0:
+    if tangential_norm > tangential_limit and tangential_norm > 0.0:
         tangential = tangential * (tangential_limit / tangential_norm)
     return tangential + normal_force * up
 
@@ -245,6 +250,59 @@ def _interpolate_short_weight_gaps(weights: np.ndarray, max_gap_frames: int) -> 
     return out
 
 
+def _contact_force_target_and_activation(
+    raw_force_target: np.ndarray,
+    activation: np.ndarray,
+    low_height: np.ndarray,
+    up: np.ndarray,
+    mass_kg: float,
+    gravity_norm: float,
+    fallback_height_threshold_m: float = 0.04,
+    low_speed: np.ndarray | None = None,
+    fallback_speed_threshold_mps: float | None = None,
+) -> tuple[np.ndarray | None, np.ndarray, bool]:
+    """Keep net COM force intact and resolve only transient contact gaps.
+
+    A previous fallback assigned a required force to the lowest foot whenever
+    activation was zero.  During airborne phases that created a fictitious
+    foot GRF.  Fallback is now limited to frames whose lowest contact point is
+    still within the configured contact-height band.  When contact-point
+    speeds are supplied, it is also limited to low-speed points; a fast foot
+    passing close to the ground during a jump is not treated as support.
+    """
+    resolved = np.asarray(activation, dtype=np.float64).copy()
+    up_component = float(np.dot(raw_force_target, up))
+    if float(np.sum(resolved)) <= 1e-12:
+        if up_component <= 0.05 * mass_kg * gravity_norm:
+            return None, resolved, False
+        finite_heights = np.asarray(low_height, dtype=np.float64)
+        finite_heights = finite_heights[np.isfinite(finite_heights)]
+        if (
+            finite_heights.size == 0
+            or float(np.min(finite_heights)) > float(fallback_height_threshold_m)
+        ):
+            return None, resolved, False
+        lowest_index = int(np.argmin(low_height))
+        if (
+            low_speed is not None
+            and fallback_speed_threshold_mps is not None
+            and (
+                not np.isfinite(low_speed[lowest_index])
+                or float(low_speed[lowest_index])
+                > float(fallback_speed_threshold_mps)
+            )
+        ):
+            return None, resolved, False
+        resolved[lowest_index] = 1.0
+        return np.asarray(raw_force_target, dtype=np.float64).copy(), resolved, True
+    # Foot contacts can push but cannot supply a tensile normal force.  If the
+    # OpenSim target is downward, leave the frame as unsupported instead of
+    # applying an unphysical negative GRF.
+    if up_component <= 0.0:
+        return None, resolved, False
+    return np.asarray(raw_force_target, dtype=np.float64).copy(), resolved, False
+
+
 def _estimate_contact_wrenches_from_kinematics(
     model_path: Path,
     ik_mot_path: Path,
@@ -255,13 +313,17 @@ def _estimate_contact_wrenches_from_kinematics(
     contact_height_threshold_m: float,
     contact_speed_threshold_mps: float,
     force_cutoff_hz: float | None,
+    force_target_id_sto_path: Path | None = None,
 ) -> tuple[Path, Path, Path]:
     """
     Estimate multi-body contact wrenches from kinematics and export OpenSim GRF artifacts.
 
-    This implementation enforces linear COM dynamics:
-        sum(F_contacts) ~= m * (a_com - g)
-    and distributes the force over active contact bodies with geometric heuristics.
+    When ``force_target_id_sto_path`` is supplied, the net force comes from an
+    OpenSim no-GRF ID pass and therefore uses the same filtered dynamics as the
+    final ID. The COM-acceleration calculation remains as a standalone fallback.
+    The net force is distributed over active contact bodies with geometric
+    heuristics without changing its net value; the friction-cone helper is
+    retained for diagnostics but is not allowed to break COM/ID balance.
     """
     try:
         import nimblephysics as nimble
@@ -294,10 +356,14 @@ def _estimate_contact_wrenches_from_kinematics(
         None if force_cutoff_hz is None else min(float(force_cutoff_hz), 12.0)
     )
 
-    gravity = np.asarray(skel.getGravity(), dtype=np.float64).reshape(3)
-    gravity_norm = float(np.linalg.norm(gravity))
+    source_gravity = np.asarray(skel.getGravity(), dtype=np.float64).reshape(3)
+    gravity_norm = float(np.linalg.norm(source_gravity))
     if gravity_norm < 1e-8:
         raise ValueError("Model gravity magnitude is near zero; cannot estimate GRFs.")
+    # AddBiomechanics' BSM model is Y-up, while this pipeline's converted IK,
+    # force files, and the model prepared for OpenSim ID are Z-up.  Contact
+    # geometry and friction must use the same gravity frame as that final ID.
+    gravity = np.array([0.0, 0.0, -gravity_norm], dtype=np.float64)
     up = -gravity / gravity_norm
     mass_kg = float(skel.getMass())
 
@@ -422,18 +488,28 @@ def _estimate_contact_wrenches_from_kinematics(
     contact_ground_height = float(np.percentile(heights_for_floor, 1.0))
     cop_ground_height = 0.0
 
-    com_acc = np.gradient(
-        np.gradient(com_positions_filt, timestamps, axis=0),
-        timestamps,
-        axis=0,
-    )
-    total_external_force = mass_kg * (com_acc - gravity.reshape(1, 3))
-    for axis in range(3):
-        total_external_force[:, axis] = _lowpass_butterworth_4th(
-            total_external_force[:, axis],
-            sample_rate_hz=sample_rate_hz,
-            cutoff_hz=contact_force_cutoff_hz,
-            missing_scipy_returns_copy=True,
+    if force_target_id_sto_path is None:
+        com_acc = np.gradient(
+            np.gradient(com_positions_filt, timestamps, axis=0),
+            timestamps,
+            axis=0,
+        )
+        total_external_force = mass_kg * (com_acc - gravity.reshape(1, 3))
+        for axis in range(3):
+            total_external_force[:, axis] = _lowpass_butterworth_4th(
+                total_external_force[:, axis],
+                sample_rate_hz=sample_rate_hz,
+                cutoff_hz=contact_force_cutoff_hz,
+                missing_scipy_returns_copy=True,
+            )
+    else:
+        # Use the root translation forces from an OpenSim no-GRF inverse-
+        # dynamics pass. This pass uses the exact same model, IK trajectory,
+        # time window, and cutoff as the final ID, so its required net force is
+        # consistent with OpenSim's own filtering and differentiation.
+        total_external_force = _root_force_target_from_id_sto(
+            force_target_id_sto_path,
+            timestamps,
         )
 
     force_per_body = np.zeros((len(contact_nodes), frames, 3), dtype=np.float64)
@@ -453,13 +529,17 @@ def _estimate_contact_wrenches_from_kinematics(
     transition_frames = max(1, int(round(0.08 / median_dt)))
     group_keys = list(contact_group_indices.keys())
     group_activation = np.zeros((len(group_keys), frames), dtype=np.float64)
+    group_low_height = np.full((len(group_keys), frames), np.inf, dtype=np.float64)
+    group_low_speed = np.full((len(group_keys), frames), np.inf, dtype=np.float64)
     for group_idx, group_key in enumerate(group_keys):
         point_positions = detection_points_by_group[group_key]
         point_heights = point_positions @ up
         low_height = np.min(point_heights - contact_ground_height, axis=0)
+        group_low_height[group_idx, :] = low_height
         centroid = np.mean(point_positions, axis=0)
         centroid_velocity = np.gradient(centroid, timestamps, axis=0)
         centroid_speed = np.linalg.norm(centroid_velocity, axis=1)
+        group_low_speed[group_idx, :] = centroid_speed
         raw_mask = (low_height <= contact_height_threshold_m) & (
             centroid_speed <= contact_speed_threshold_mps
         )
@@ -471,32 +551,42 @@ def _estimate_contact_wrenches_from_kinematics(
             max_gap_frames=max(1, int(round(0.05 / median_dt))),
         )
 
+    activation_sum = np.zeros((frames,), dtype=np.float64)
+    contact_fallback = np.zeros((frames,), dtype=bool)
     for frame_idx in range(frames):
         raw_force_target = total_external_force[frame_idx, :].copy()
-        support_scale = min(1.0, float(np.sum(group_activation[:, frame_idx])))
-        if support_scale <= 0.0:
-            continue
-        up_component = float(np.dot(raw_force_target, up))
-        min_normal_force = support_scale * 0.25 * mass_kg * gravity_norm
-        normal_magnitude = max(up_component, min_normal_force)
-        normal_force_target = normal_magnitude * up
-        raw_tangential_force = raw_force_target - up_component * up
-        if min_normal_force > 1e-8:
-            tangential_reliability = min(1.0, max(0.0, up_component / min_normal_force))
-        else:
-            tangential_reliability = 1.0
-        tangential_force_target = tangential_reliability * raw_tangential_force
-        force_target = (
-            support_scale * normal_force_target
-            + (support_scale * support_scale * support_scale) * tangential_force_target
+        frame_activation = group_activation[:, frame_idx].copy()
+        activation_sum[frame_idx] = float(np.sum(frame_activation))
+        force_target, frame_activation, used_fallback = _contact_force_target_and_activation(
+            raw_force_target,
+            frame_activation,
+            group_low_height[:, frame_idx],
+            up,
+            mass_kg,
+            gravity_norm,
+            fallback_height_threshold_m=contact_height_threshold_m,
+            low_speed=group_low_speed[:, frame_idx],
+            fallback_speed_threshold_mps=contact_speed_threshold_mps,
         )
+        contact_fallback[frame_idx] = used_fallback
+        if force_target is None:
+            # Report only contacts that actually receive a wrench.  In
+            # particular, a negative-normal target is deliberately rejected
+            # below the contact allocator and must not make an airborne frame
+            # look eligible to downstream E4 masking.
+            activation_sum[frame_idx] = 0.0
+            continue
+        # Include fallback activations in the diagnostic CSV.  The value was
+        # initially computed from the raw detector mask, before a short gap
+        # could be resolved to a low-speed foot.
+        activation_sum[frame_idx] = float(np.sum(frame_activation))
 
         com_proj = _project_point_to_plane(
             com_positions_filt[frame_idx, :], up, cop_ground_height
         )
         weights = np.zeros((len(contact_nodes),), dtype=np.float64)
         for group_idx, group_key in enumerate(group_keys):
-            activation = float(group_activation[group_idx, frame_idx])
+            activation = float(frame_activation[group_idx])
             if activation <= 0.0:
                 continue
             for body_idx in contact_group_indices[group_key]:
@@ -509,31 +599,16 @@ def _estimate_contact_wrenches_from_kinematics(
         if weight_sum <= 1e-12:
             continue
         weights /= weight_sum
-        active_indices = [i for i in range(len(contact_nodes)) if weights[i] > 0.0]
-
+        # The no-GRF OpenSim pass is the authoritative net external-force
+        # target.  Preserve that vector exactly when splitting it over active
+        # foot bodies; projecting each share into a friction cone would change
+        # the net force and reintroduce the COM/ID residual that this estimator
+        # is meant to remove.  ``friction_coeff`` remains part of the public
+        # API and the projection helper is retained for diagnostics/tests.
         for body_idx in range(len(contact_nodes)):
             if weights[body_idx] <= 0.0:
                 continue
-            force = weights[body_idx] * force_target
-            force_per_body[body_idx, frame_idx, :] = _project_force_to_friction_cone(
-                force=force,
-                up=up,
-                friction_coeff=friction_coeff,
-            )
-
-        # Project-distribute iterations: try to match net force while staying in friction cones.
-        for _ in range(3):
-            achieved = np.sum(force_per_body[:, frame_idx, :], axis=0)
-            delta = force_target - achieved
-            if float(np.linalg.norm(delta)) < 1e-6:
-                break
-            for body_idx in active_indices:
-                candidate = force_per_body[body_idx, frame_idx, :] + weights[body_idx] * delta
-                force_per_body[body_idx, frame_idx, :] = _project_force_to_friction_cone(
-                    force=candidate,
-                    up=up,
-                    friction_coeff=friction_coeff,
-                )
+            force_per_body[body_idx, frame_idx, :] = weights[body_idx] * force_target
 
     # Write a transparent per-frame debug CSV for inspection.
     with contact_wrench_csv_path.open("w", newline="", encoding="utf-8") as file_obj:
@@ -548,6 +623,8 @@ def _estimate_contact_wrenches_from_kinematics(
             "achieved_force_y",
             "achieved_force_z",
             "force_balance_residual_norm",
+            "contact_activation_sum",
+            "contact_fallback",
         ]
         for body_name in selected_names:
             header.extend(
@@ -578,6 +655,8 @@ def _estimate_contact_wrenches_from_kinematics(
                 float(achieved[1]),
                 float(achieved[2]),
                 residual,
+                float(activation_sum[frame_idx]),
+                int(contact_fallback[frame_idx]),
             ]
             for body_idx in range(len(selected_names)):
                 row.extend(float(x) for x in cop_per_body[body_idx, frame_idx, :])
@@ -741,6 +820,39 @@ def _resolve_id_column(dof_name: str, lookup: dict[str, int]) -> int | None:
     return None
 
 
+def _root_force_target_from_id_sto(
+    id_sto_path: str | Path,
+    target_times: np.ndarray,
+) -> np.ndarray:
+    """Load the net external force required to replace no-GRF root forces."""
+    labels, rows = parse_mot(Path(id_sto_path).resolve())
+    lookup = {_canonical_label(label): idx for idx, label in enumerate(labels)}
+    time_idx = lookup.get("time")
+    if time_idx is None:
+        raise ValueError(f"Could not find 'time' column in ID output: {id_sto_path}")
+    source_times = np.asarray([float(row[time_idx]) for row in rows], dtype=float)
+    if source_times.size < 2 or np.any(np.diff(source_times) <= 0.0):
+        raise ValueError(f"Non-increasing time column in ID output: {id_sto_path}")
+
+    target_times = np.asarray(target_times, dtype=float).reshape(-1)
+    target = np.zeros((target_times.size, 3), dtype=float)
+    for axis_index, dof_name in enumerate(("pelvis_tx", "pelvis_ty", "pelvis_tz")):
+        column = _resolve_id_column(dof_name, lookup)
+        if column is None:
+            raise ValueError(
+                f"Could not find root translation force '{dof_name}' in {id_sto_path}"
+            )
+        values = np.asarray([float(row[column]) for row in rows], dtype=float)
+        target[:, axis_index] = np.interp(
+            target_times,
+            source_times,
+            values,
+            left=values[0],
+            right=values[-1],
+        )
+    return target
+
+
 def run_inverse_dynamics_no_grf(
     model_path: str | Path,
     ik_mot_path: str | Path,
@@ -775,7 +887,7 @@ def run_inverse_dynamics_no_grf(
     start_time, end_time = _infer_time_window_from_mot(ik_mot_path)
     effective_cutoff = cutoff_hz
     if effective_cutoff is None:
-        effective_cutoff = infer_cutoff_hz(filter_mode=filter_mode, mot_path=ik_mot_path)
+        effective_cutoff = effective_cutoff_hz(filter_mode, ik_mot_path)
 
     id_setup_path = output_dir / f"Setup_ID_noGRF_{trial_name}.xml"
     id_sto_path = output_dir / f"{trial_name}_id_noGRF.sto"
@@ -838,7 +950,20 @@ def run_inverse_dynamics_with_estimated_grf(
     start_time, end_time = _infer_time_window_from_mot(ik_mot_path)
     effective_cutoff = cutoff_hz
     if effective_cutoff is None:
-        effective_cutoff = infer_cutoff_hz(filter_mode=filter_mode, mot_path=ik_mot_path)
+        effective_cutoff = effective_cutoff_hz(filter_mode, ik_mot_path)
+
+    # A no-GRF pass provides the exact root translation forces required by
+    # OpenSim after its own low-pass filtering and coordinate differentiation.
+    # Replacing those forces with foot contacts eliminates the previous
+    # mismatch against a separately filtered, twice-differentiated COM path.
+    _, force_target_id_sto_path, _ = run_inverse_dynamics_no_grf(
+        model_path=model_path,
+        ik_mot_path=ik_mot_path,
+        output_dir=output_dir,
+        trial_name=f"{trial_name}_force_target",
+        filter_mode=filter_mode,
+        cutoff_hz=effective_cutoff,
+    )
 
     grf_mot_path, external_loads_xml_path, contact_wrench_csv_path = (
         _estimate_contact_wrenches_from_kinematics(
@@ -851,6 +976,7 @@ def run_inverse_dynamics_with_estimated_grf(
             contact_height_threshold_m=contact_height_threshold_m,
             contact_speed_threshold_mps=contact_speed_threshold_mps,
             force_cutoff_hz=effective_cutoff,
+            force_target_id_sto_path=force_target_id_sto_path,
         )
     )
 
@@ -963,6 +1089,94 @@ def run_inverse_dynamics_and_export_torque_csv(
     contact_speed_threshold_mps: float = 0.5,
 ) -> InverseDynamicsNoGrfSummary:
     """High-level helper: run ID (no GRF) and export DOF torque CSV."""
+    model_path = Path(model_path).resolve()
+    ik_mot_path = Path(ik_mot_path).resolve()
+    output_dir = Path(output_dir).resolve()
+    torque_csv_path = Path(torque_csv_path).resolve()
+    segment_paths = discover_segment_mot_paths(ik_mot_path)
+    if len(segment_paths) > 1:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        segment_summaries: list[InverseDynamicsNoGrfSummary] = []
+        for segment_index, segment_path in enumerate(segment_paths):
+            segment_trial = f"{trial_name}_segment_{segment_index}"
+            segment_dir = output_dir / "segments" / f"segment_{segment_index}"
+            segment_summaries.append(
+                run_inverse_dynamics_and_export_torque_csv(
+                    model_path=model_path,
+                    ik_mot_path=segment_path,
+                    output_dir=segment_dir,
+                    trial_name=segment_trial,
+                    torque_csv_path=segment_dir / f"{segment_trial}_torques.csv",
+                    filter_mode=filter_mode,
+                    cutoff_hz=cutoff_hz,
+                    grf_mode=grf_mode,
+                    contact_body_names=contact_body_names,
+                    friction_coeff=friction_coeff,
+                    contact_height_threshold_m=contact_height_threshold_m,
+                    contact_speed_threshold_mps=contact_speed_threshold_mps,
+                )
+            )
+
+        _, frames = merge_csv_segments(
+            [summary.torque_csv_path for summary in segment_summaries],
+            torque_csv_path,
+        )
+        grf_mode_normalized = grf_mode.strip().lower()
+        suffix = "estimatedGRF" if grf_mode_normalized == "estimated" else "noGRF"
+        id_sto_path = output_dir / f"{trial_name}_id_{suffix}.sto"
+        merge_storage_segments(
+            [summary.id_sto_path for summary in segment_summaries],
+            id_sto_path,
+        )
+
+        grf_mot_path: Path | None = None
+        external_loads_xml_path: Path | None = None
+        contact_wrench_csv_path: Path | None = None
+        if grf_mode_normalized == "estimated":
+            grf_paths = [summary.grf_mot_path for summary in segment_summaries]
+            wrench_paths = [summary.contact_wrench_csv_path for summary in segment_summaries]
+            if any(path is None for path in (*grf_paths, *wrench_paths)):
+                raise RuntimeError("Segmented estimated-GRF run did not produce all artifacts.")
+            grf_mot_path = output_dir / f"{trial_name}_grf_estimated.mot"
+            merge_storage_segments(
+                [path for path in grf_paths if path is not None],
+                grf_mot_path,
+            )
+            contact_wrench_csv_path = output_dir / f"{trial_name}_contact_wrenches_estimated.csv"
+            merge_csv_segments(
+                [path for path in wrench_paths if path is not None],
+                contact_wrench_csv_path,
+            )
+            first_external = segment_summaries[0].external_loads_xml_path
+            first_grf = segment_summaries[0].grf_mot_path
+            if first_external is not None and first_grf is not None:
+                external_loads_xml_path = output_dir / f"{trial_name}_external_forces_estimated.xml"
+                external_text = first_external.read_text(encoding="utf-8")
+                external_loads_xml_path.write_text(
+                    external_text.replace(first_grf.name, grf_mot_path.name),
+                    encoding="utf-8",
+                )
+
+        first = segment_summaries[0]
+        missing_dofs = tuple(
+            sorted({name for summary in segment_summaries for name in summary.missing_dofs})
+        )
+        return InverseDynamicsNoGrfSummary(
+            model_path=model_path,
+            ik_mot_path=ik_mot_path,
+            id_setup_path=first.id_setup_path,
+            id_sto_path=id_sto_path,
+            torque_csv_path=torque_csv_path,
+            dof_names=first.dof_names,
+            frames=frames,
+            cutoff_hz=first.cutoff_hz,
+            missing_dofs=missing_dofs,
+            grf_mode=grf_mode_normalized,
+            grf_mot_path=grf_mot_path,
+            external_loads_xml_path=external_loads_xml_path,
+            contact_wrench_csv_path=contact_wrench_csv_path,
+        )
+
     ik_labels, ik_rows = parse_mot(ik_mot_path)
     ik_lookup = {_canonical_label(label): idx for idx, label in enumerate(ik_labels)}
     ik_time_idx = ik_lookup.get("time")

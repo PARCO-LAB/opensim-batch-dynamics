@@ -5,6 +5,7 @@ import math
 import sys
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -29,6 +30,30 @@ class AddBiomechanicsCsvExportTest(unittest.TestCase):
         self.assertIn("range 0.00000000 1.00000000", text)
         self.assertEqual(text.count("time q"), 1)
         self.assertIn("0 1\n1 2", text)
+
+    def test_merge_segment_mots_warns_on_pelvis_jump(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            first = root / "trial_segment_0_ik.mot"
+            second = root / "trial_segment_1_ik.mot"
+            header = "name x\nendheader\ntime pelvis_tx pelvis_ty pelvis_tz\n"
+            first.write_text(header + "0.00 0 0 0\n0.01 0 0 0\n", encoding="utf-8")
+            second.write_text(header + "0.02 0.02 0 0\n0.03 0.02 0 0\n", encoding="utf-8")
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                _merge_segment_mots([first, second], root / "merged.mot")
+        self.assertTrue(any("pelvis jump" in str(item.message) for item in caught))
+
+    def test_merge_segment_mots_rejects_non_increasing_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            first = root / "trial_segment_0_ik.mot"
+            second = root / "trial_segment_1_ik.mot"
+            body = "name x\nendheader\ntime q\n"
+            first.write_text(body + "0 1\n1 1\n", encoding="utf-8")
+            second.write_text(body + "1 2\n2 2\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "non-increasing"):
+                _merge_segment_mots([first, second], root / "merged.mot")
 
     def test_export_addbiomechanics_csv_keeps_model_order_and_nan_fills_missing_dofs(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

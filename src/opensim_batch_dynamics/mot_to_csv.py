@@ -169,6 +169,19 @@ def infer_cutoff_hz(filter_mode: str, mot_path: Path) -> float | None:
     return 30.0
 
 
+def effective_cutoff_hz(filter_mode: str, mot_path: Path, cutoff_hz: float | None = None) -> float | None:
+    """Return a cutoff valid for the actual MOT sample rate."""
+    requested = cutoff_hz if cutoff_hz is not None else infer_cutoff_hz(filter_mode, mot_path)
+    if requested is None:
+        return None
+    labels, rows = parse_mot(mot_path)
+    time_idx = _build_column_lookup(labels).get("time")
+    if time_idx is None:
+        return requested
+    rate = _infer_sample_rate(np.asarray(rows, dtype=np.float64)[:, time_idx])
+    return min(float(requested), 0.8 * 0.5 * rate)
+
+
 def _lowpass_butterworth_4th(
     values: np.ndarray,
     sample_rate_hz: float,
@@ -241,9 +254,7 @@ def convert_mot_to_model_csv(
     time_values = row_matrix[:, lookup["time"]]
     sample_rate_hz = _infer_sample_rate(time_values)
 
-    inferred_cutoff = cutoff_hz
-    if inferred_cutoff is None:
-        inferred_cutoff = infer_cutoff_hz(filter_mode=filter_mode, mot_path=mot_path)
+    inferred_cutoff = effective_cutoff_hz(filter_mode, mot_path, cutoff_hz)
 
     # Build one-time mapping DOF -> source column index (or None if missing).
     dof_to_col: dict[str, int | None] = {}

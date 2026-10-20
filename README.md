@@ -423,6 +423,12 @@ Useful options:
 - `--skip-existing-csv` (default) skips files when the destination CSV already exists and is non-empty
 - `--no-skip-existing-csv` to force re-run even when output CSV already exists
 - `--no-cleanup-intermediate` to keep intermediate artifacts
+- `--engine-work-root PATH` controls the local scratch directory used by
+  AddBiomechanics/OpenSim (default `/tmp/groundlink-engine-work`). This keeps
+  expensive engine I/O off CIFS/NAS; retained artifacts are copied to the
+  output tree after a successful trial.
+- `--engine-timeout-s SECONDS` limits one AddBiomechanics run (default `7200`; use
+  `0` to disable the timeout).
 
 Note on SMB paths:
 
@@ -540,7 +546,8 @@ For HumanML3D `joints/*.npy` input, prepend:
 - `--addbio-root /path/to/AddBiomechanics`
 - `--id-grf-mode {estimated,none}` (default: `estimated`)
 - `--id-contact-bodies all` (default; uses all model body nodes as contact candidates)
-- `--id-friction-coeff 0.8` (default)
+- `--id-friction-coeff 0.8` (compatibility/diagnostic parameter; the OpenSim
+  net-force target is preserved rather than clipped)
 - `--id-filter-mode {auto,walking,dynamic,none}` (default: `auto`)
 - `--id-cutoff-hz <float>` (optional custom cutoff)
 - `--final-csv-path /custom/output.csv` (optional)

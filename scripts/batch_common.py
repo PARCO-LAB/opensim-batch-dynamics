@@ -8,6 +8,7 @@ import math
 import os
 import re
 import time
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +18,20 @@ EXCLUDED_INPUT_NAMES = {
     "female_stagei.npz",
     "male_stagei.npz",
 }
+
+# Trials whose kinematics violate the foot-contact-only dynamics model.  Keep
+# this list in the batch layer as well as the validator so a full rerun does
+# not spend hours regenerating outputs that must be excluded from E4.
+EXCLUDED_TRIALS = {
+    ("s002", "jumpingjack_3"): "invalid_pelvis_kinematics",
+    ("s002", "balletsmalljump_1"): "nonballistic_flight_kinematics",
+}
+
+# Bump this whenever an existing CSV must not be reused by --skip-existing.
+# Version 7 additionally records the post-fallback contact activation used by
+# E4 eligibility, so airborne/negative-normal frames cannot be reused as valid
+# contact comparisons.
+DYNAMICS_PIPELINE_VERSION = "opensim_root_force_target_zup_v7"
 
 
 @dataclass(frozen=True)
@@ -41,6 +56,19 @@ def build_trial_name(relative_npz_path: Path) -> str:
     if len(trial_name) > 140:
         trial_name = trial_name[:131] + "_" + digest
     return trial_name
+
+
+def excluded_trial_reason(relative_path: Path) -> str | None:
+    """Return the dataset exclusion reason for an AMASS relative path."""
+    stem = relative_path.stem.replace("_stageii", "")
+    parts = stem.split("_")
+    if len(parts) < 3 or not parts[0].startswith("s"):
+        return None
+    subject = parts[0]
+    trial = "_".join(parts[2:])
+    if trial.endswith("_full"):
+        trial = trial[:-5]
+    return EXCLUDED_TRIALS.get((subject, trial))
 
 
 def resolve_pipeline_script(path_from_arg: str | None) -> Path:
@@ -76,6 +104,13 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def current_git_commit() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
 def read_manifest_record(manifest_path: Path, task_index: int) -> dict[str, object]:
     with manifest_path.open("r", encoding="utf-8") as handle:
         for idx, line in enumerate(handle):
@@ -98,6 +133,21 @@ def is_nonempty_file(path: Path) -> bool:
                 return False
             time.sleep(0.25 * (attempt + 1))
     return False
+
+
+def is_quality_pass(path: Path) -> bool:
+    """Return whether an output passed with the current dynamics algorithm."""
+    if not is_nonempty_file(path):
+        return False
+    sidecar = path.with_suffix(path.suffix + ".quality.json")
+    try:
+        report = json.loads(sidecar.read_text(encoding="utf-8"))
+        return (
+            report.get("status") == "ok"
+            and report.get("dynamics_pipeline_version") == DYNAMICS_PIPELINE_VERSION
+        )
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def is_valid_groundlink_csv(path: Path) -> bool:

@@ -1,9 +1,25 @@
 from __future__ import annotations
 
+import errno
 import math
 from pathlib import Path
+import time
 
 import numpy as np
+
+
+def _mkdir_parents_resilient(path: Path) -> None:
+    """Create a parent tree while tolerating transient NAS metadata races."""
+    for attempt in range(8):
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return
+        except OSError as exc:
+            if exc.errno not in (errno.EEXIST, errno.ENOENT, errno.ESTALE, errno.EBUSY):
+                raise
+            if attempt == 7:
+                raise
+            time.sleep(0.1 * (attempt + 1))
 
 
 def _axis_rotation_matrix(axis: str, angle_deg: float) -> np.ndarray:
@@ -88,7 +104,7 @@ def write_trc(
         data[:, :, 1] += float(-vertical_offset + 0.01)
 
     output = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_parents_resilient(output.parent)
 
     num_frames, num_markers, _ = data.shape
     with output.open("w", encoding="utf-8") as f:

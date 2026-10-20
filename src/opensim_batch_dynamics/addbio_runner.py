@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import statistics
 import subprocess
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
+
+from .mot_to_csv import parse_mot
 
 
 @dataclass(frozen=True)
@@ -22,6 +27,96 @@ class AddBiomechanicsRunResult:
     errors_path: Path
     stdout: str
     stderr: str
+
+
+def _segment_seam_issues(segment_paths: list[Path]) -> list[str]:
+    """Return timestamp and pelvis-translation continuity problems at IK seams."""
+    parsed = [parse_mot(path) for path in segment_paths]
+    issues: list[str] = []
+    for index, ((left_labels, left_rows), (right_labels, right_rows)) in enumerate(
+        zip(parsed, parsed[1:])
+    ):
+        if left_labels != right_labels:
+            issues.append(f"segment {index}/{index + 1}: labels differ")
+            continue
+        time_idx = left_labels.index("time")
+        left_tail = left_rows[-11:]
+        right_head = right_rows[:11]
+        left_dt = [
+            row_b[time_idx] - row_a[time_idx]
+            for row_a, row_b in zip(left_tail, left_tail[1:])
+        ]
+        right_dt = [
+            row_b[time_idx] - row_a[time_idx]
+            for row_a, row_b in zip(right_head, right_head[1:])
+        ]
+        positive_dt = [value for value in (*left_dt, *right_dt) if value > 0.0]
+        seam_dt = right_rows[0][time_idx] - left_rows[-1][time_idx]
+        if seam_dt <= 0.0:
+            issues.append(f"segment {index}/{index + 1}: non-increasing seam time")
+        elif positive_dt:
+            nominal_dt = statistics.median(positive_dt)
+            if not 0.5 * nominal_dt <= seam_dt <= 1.5 * nominal_dt:
+                issues.append(
+                    f"segment {index}/{index + 1}: seam dt {seam_dt:.6g}s "
+                    f"differs from nominal {nominal_dt:.6g}s"
+                )
+
+        pelvis_cols = [
+            left_labels.index(name)
+            for name in ("pelvis_tx", "pelvis_ty", "pelvis_tz")
+            if name in left_labels
+        ]
+        if len(pelvis_cols) != 3:
+            continue
+        seam_jump = math.sqrt(
+            sum((right_rows[0][col] - left_rows[-1][col]) ** 2 for col in pelvis_cols)
+        )
+        local_steps: list[float] = []
+        for rows in (left_rows[-11:], right_rows[:11]):
+            local_steps.extend(
+                math.sqrt(sum((row_b[col] - row_a[col]) ** 2 for col in pelvis_cols))
+                for row_a, row_b in zip(rows, rows[1:])
+            )
+        typical_step = statistics.median(local_steps) if local_steps else 0.0
+        if seam_jump > max(0.005, 10.0 * typical_step):
+            issues.append(
+                f"segment {index}/{index + 1}: pelvis jump {seam_jump:.6g}m "
+                f"vs local step {typical_step:.6g}m"
+            )
+        if positive_dt and left_dt and right_dt and seam_dt > 0.0:
+            nominal_dt = statistics.median(positive_dt)
+            typical_speed = typical_step / nominal_dt
+            seam_speed = seam_jump / seam_dt
+            if seam_speed > max(1.0, 10.0 * typical_speed):
+                issues.append(
+                    f"segment {index}/{index + 1}: implied pelvis seam speed "
+                    f"{seam_speed:.6g}m/s vs local {typical_speed:.6g}m/s"
+                )
+            incoming_velocity = [
+                (left_rows[-1][col] - left_rows[-2][col]) / left_dt[-1]
+                for col in pelvis_cols
+            ]
+            outgoing_velocity = [
+                (right_rows[1][col] - right_rows[0][col]) / right_dt[0]
+                for col in pelvis_cols
+            ]
+            seam_velocity = [
+                (right_rows[0][col] - left_rows[-1][col]) / seam_dt
+                for col in pelvis_cols
+            ]
+            seam_acceleration = max(
+                math.sqrt(sum((a - b) ** 2 for a, b in zip(seam_velocity, incoming_velocity)))
+                / max(0.5 * (seam_dt + left_dt[-1]), 1e-12),
+                math.sqrt(sum((a - b) ** 2 for a, b in zip(outgoing_velocity, seam_velocity)))
+                / max(0.5 * (seam_dt + right_dt[0]), 1e-12),
+            )
+            if seam_acceleration > 50.0:
+                issues.append(
+                    f"segment {index}/{index + 1}: implied pelvis seam acceleration "
+                    f"{seam_acceleration:.6g}m/s^2"
+                )
+    return issues
 
 
 def resolve_addbio_root(addbio_root: str | Path | None = None) -> Path:
@@ -69,6 +164,16 @@ def _merge_segment_mots(segment_paths: list[Path], output_path: Path) -> Path:
         if not line.startswith("datarows ") and not line.startswith("range ")
     ]
     times = [float(row.split()[0]) for row in rows]
+    if any(right <= left for left, right in zip(times, times[1:])):
+        raise ValueError("Cannot merge IK segments with non-increasing timestamps.")
+    seam_issues = _segment_seam_issues(segment_paths)
+    if seam_issues:
+        warnings.warn(
+            "IK segment seam validation found discontinuities; downstream dynamics "
+            "must run per segment: " + "; ".join(seam_issues),
+            RuntimeWarning,
+            stacklevel=2,
+        )
     header_lines.extend((f"datarows {len(rows)}", f"range {times[0]:.8f} {times[-1]:.8f}"))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
@@ -83,6 +188,7 @@ def run_addbiomechanics_engine(
     addbio_root: str | Path | None = None,
     output_name: str = "results",
     href: str = "",
+    timeout_s: float | None = 7200.0,
 ) -> AddBiomechanicsRunResult:
     """Run the local AddBiomechanics engine over a prepared subject folder."""
     root = resolve_addbio_root(addbio_root)
@@ -110,13 +216,27 @@ def run_addbiomechanics_engine(
         f"{python_bin_dir}{os.pathsep}{existing_path}" if existing_path else python_bin_dir
     )
 
-    result = subprocess.run(
-        command,
-        cwd=engine_src,
-        capture_output=True,
-        text=True,
-        env=run_env,
-    )
+    if timeout_s is not None and timeout_s <= 0.0:
+        raise ValueError("timeout_s must be positive or None")
+    try:
+        result = subprocess.run(
+            command,
+            cwd=engine_src,
+            capture_output=True,
+            text=True,
+            env=run_env,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        raise RuntimeError(
+            "AddBiomechanics engine timed out.\n"
+            f"Timeout: {timeout_s}s\n"
+            f"Command: {' '.join(command)}\n"
+            f"stdout:\n{stdout}\n"
+            f"stderr:\n{stderr}"
+        ) from exc
 
     output_root = subject_root / output_name
     final_model_path = output_root / "Models" / "match_markers_but_ignore_physics.osim"

@@ -7,9 +7,10 @@ import contextlib
 import fcntl
 import json
 import os
-import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,12 +18,16 @@ from typing import Iterator
 
 from batch_common import (
     BatchTask,
+    DYNAMICS_PIPELINE_VERSION,
     build_trial_name,
     discover_amass_input_files,
+    excluded_trial_reason,
     is_nonempty_file,
+    is_quality_pass,
     is_valid_groundlink_csv,
     resolve_pipeline_script,
     resolve_submit_path,
+    write_json,
 )
 
 
@@ -109,6 +114,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Recompute walk trials even when --skip-existing-csv is enabled.",
     )
+    parser.add_argument(
+        "--require-intermediate-artifacts",
+        action="store_true",
+        help=(
+            "When skipping existing CSVs, require a retained OpenSim results directory; "
+            "otherwise rerun the trial."
+        ),
+    )
     # Backward-compatible aliases.
     parser.add_argument(
         "--skip-existing",
@@ -146,6 +159,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smplx-model-dir", default="model/smpl")
     parser.add_argument("--bsm-model", default="model/bsm/bsm.osim")
     parser.add_argument("--addbio-root", default=None)
+    parser.add_argument(
+        "--engine-work-root",
+        default="/tmp/groundlink-engine-work",
+        help="Local scratch root for AddBiomechanics/OpenSim work (default: /tmp/groundlink-engine-work).",
+    )
+    parser.add_argument(
+        "--engine-timeout-s",
+        type=float,
+        default=7200.0,
+        help="Maximum AddBiomechanics engine runtime in seconds (default: 7200; 0 disables).",
+    )
     parser.add_argument("--sex", choices=["neutral", "male", "female"], default=None)
     parser.add_argument("--subject-mass-kg", type=float, default=None)
     parser.add_argument("--subject-height-m", type=float, default=None)
@@ -212,14 +236,16 @@ def _build_single_run_cmd(
     pipeline_script: Path,
     task: BatchTask,
     output_root: Path,
+    child_trial_name: str | None = None,
 ) -> list[str]:
+    trial_name = child_trial_name or task.trial_name
     cmd = [
         args.python_exe,
         str(pipeline_script),
         "--input",
         str(task.input_path),
         "--trial",
-        task.trial_name,
+        trial_name,
         "--output-dir",
         str(output_root),
         "--final-csv-path",
@@ -256,6 +282,11 @@ def _build_single_run_cmd(
             ]
     if args.addbio_root:
         cmd.extend(["--addbio-root", args.addbio_root])
+    engine_work_root = getattr(args, "engine_work_root", None)
+    if engine_work_root:
+        cmd.extend(["--engine-work-root", engine_work_root])
+    engine_timeout_s = getattr(args, "engine_timeout_s", 7200.0)
+    cmd.extend(["--engine-timeout-s", str(engine_timeout_s)])
     if args.sex:
         cmd.extend(["--sex", args.sex])
     if args.subject_mass_kg is not None:
@@ -277,10 +308,34 @@ def _run_single_task(
     output_root: Path,
     task: BatchTask,
 ) -> BatchTaskResult:
+    exclusion = excluded_trial_reason(task.relative_path)
+    if exclusion:
+        # Do not leave an old successful sidecar next to a trial that is now
+        # intentionally excluded from the foot-contact dynamics model.  The
+        # marker is useful to resume/audit tooling and makes stale CSVs
+        # unambiguously ineligible without spending hours regenerating them.
+        write_json(
+            task.output_csv_path.with_suffix(task.output_csv_path.suffix + ".quality.json"),
+            {
+                "status": "excluded",
+                "reason": exclusion,
+                "trial": task.trial_name,
+                "dynamics_pipeline_version": DYNAMICS_PIPELINE_VERSION,
+            },
+        )
+        return BatchTaskResult(
+            task=task,
+            status="excluded",
+            return_code=0,
+            duration_s=0.0,
+            error=exclusion,
+        )
     is_walking = "_walk_" in task.relative_path.stem.lower()
-    if args.skip_existing and not (args.rerun_walking and is_walking) and is_valid_groundlink_csv(
-        task.output_csv_path
-    ):
+    has_quality = is_quality_pass(task.output_csv_path)
+    artifact_pattern = f"{task.output_csv_path.stem}_*/results"
+    has_artifacts = any(path.is_dir() for path in output_root.glob(artifact_pattern))
+    can_skip = has_quality and (not args.require_intermediate_artifacts or has_artifacts)
+    if args.skip_existing and not (args.rerun_walking and is_walking) and can_skip:
         return BatchTaskResult(
             task=task,
             status="skipped",
@@ -289,29 +344,51 @@ def _run_single_task(
             error=None,
         )
 
-    # ponytail: failed AddBiomechanics runs leave a partial trial directory;
-    # remove only this exact retry target so stale Geometry folders cannot block it.
-    stale_trial_dir = (output_root / task.trial_name).resolve()
-    if stale_trial_dir.parent == output_root.resolve() and stale_trial_dir.exists():
-        shutil.rmtree(stale_trial_dir)
-
     task.output_csv_path.parent.mkdir(parents=True, exist_ok=True)
     task.log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd = _build_single_run_cmd(args, pipeline_script, task, output_root)
     start = time.time()
 
     with task.log_path.open("w", encoding="utf-8") as log_file:
-        log_file.write("COMMAND:\n")
-        log_file.write(" ".join(cmd) + "\n\n")
-        log_file.flush()
-        proc = subprocess.run(
-            cmd,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
+        if args.cleanup_intermediate:
+            # Cleanup mode can safely use local scratch because no downstream
+            # report needs the OpenSim artifacts after the CSV is published.
+            with tempfile.TemporaryDirectory(prefix="groundlink-batch-", dir="/tmp") as scratch:
+                cmd = _build_single_run_cmd(args, pipeline_script, task, Path(scratch))
+                log_file.write("COMMAND:\n")
+                log_file.write(" ".join(cmd) + "\n\n")
+                log_file.flush()
+                proc = subprocess.run(
+                    cmd,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                )
+        else:
+            # E4 needs IK, models, ID sto and contact-wrench artifacts after
+            # the batch exits.  Keep them on the output NAS under a unique
+            # trial directory, avoiding stale-directory races between reruns.
+            unique_trial_name = (
+                f"{task.trial_name}_{os.getpid()}_{threading.get_ident()}_{time.time_ns()}"
+            )
+            cmd = _build_single_run_cmd(
+                args,
+                pipeline_script,
+                task,
+                output_root,
+                child_trial_name=unique_trial_name,
+            )
+            log_file.write("COMMAND:\n")
+            log_file.write(" ".join(cmd) + "\n\n")
+            log_file.flush()
+            proc = subprocess.run(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
 
     duration = time.time() - start
     if proc.returncode != 0:
@@ -351,19 +428,18 @@ def _run_parallel(
         return results
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
-        future_to_index = {
-            executor.submit(_run_single_task, args, pipeline_script, output_root, task): index
-            for index, task in enumerate(tasks, start=1)
+        future_to_task = {
+            executor.submit(_run_single_task, args, pipeline_script, output_root, task): task
+            for task in tasks
         }
 
         completed = 0
-        for future in concurrent.futures.as_completed(future_to_index):
+        for future in concurrent.futures.as_completed(future_to_task):
             completed += 1
-            task_index = future_to_index[future]
+            task = future_to_task[future]
             try:
                 result = future.result()
             except Exception as exc:
-                task = tasks[task_index]
                 result = BatchTaskResult(
                     task=task,
                     status="failed",
@@ -381,6 +457,8 @@ def _run_parallel(
                 )
             elif result.status == "skipped":
                 print(f"{label} SKIP {rel} (existing CSV)")
+            elif result.status == "excluded":
+                print(f"{label} EXCLUDE {rel} ({result.error})")
             else:
                 print(
                     f"{label} FAIL {rel} ({result.duration_s:.1f}s) "
@@ -401,10 +479,12 @@ def _write_summary(
         "input_root": str(input_root),
         "output_root": str(output_root),
         "workers": args.workers,
+        "engine_work_root": getattr(args, "engine_work_root", None),
         "total_tasks": len(results),
         "ok": sum(1 for r in results if r.status == "ok"),
         "failed": sum(1 for r in results if r.status == "failed"),
         "skipped": sum(1 for r in results if r.status == "skipped"),
+        "excluded": sum(1 for r in results if r.status == "excluded"),
         "results": [
             {
                 "relative_path": r.task.relative_path.as_posix(),
@@ -473,8 +553,10 @@ def main() -> int:
     ok = sum(1 for r in results if r.status == "ok")
     failed = sum(1 for r in results if r.status == "failed")
     skipped = sum(1 for r in results if r.status == "skipped")
+    excluded = sum(1 for r in results if r.status == "excluded")
     print(
-        f"Batch completed in {elapsed:.1f}s - ok: {ok}, failed: {failed}, skipped: {skipped}."
+        f"Batch completed in {elapsed:.1f}s - ok: {ok}, failed: {failed}, "
+        f"skipped: {skipped}, excluded: {excluded}."
     )
     print(f"Summary: {summary_path}")
     return 1 if failed > 0 else 0

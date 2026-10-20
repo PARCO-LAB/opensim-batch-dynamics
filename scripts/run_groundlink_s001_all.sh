@@ -33,10 +33,13 @@ BSM_MODEL="$2"
 ADDBIO_ROOT="${3:-${ADDBIO_ENGINE_ROOT:-/tmp/AddBiomechanics}}"
 GROUNDLINK_ROOT="${GROUNDLINK_ROOT:-/home/emartini/nas/MAEVE/dataset/GroundLink}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/home/emartini/nas/MAEVE/HUMAN_MODEL/GroundLink_torque}"
+ENGINE_WORK_ROOT="${ENGINE_WORK_ROOT:-/tmp/groundlink-engine-work}"
+ENGINE_TIMEOUT_S="${ENGINE_TIMEOUT_S:-7200}"
 WORKERS="${WORKERS:-2}"
 MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-/tmp/mamba-root}"
 MICROMAMBA="${MICROMAMBA:-/tmp/micromamba-extract/bin/micromamba}"
 ENV_NAME="${ENV_NAME:-opensim-torque}"
+PYTHON_BIN="${PYTHON_BIN:-}"
 
 if [[ ! -d "$SMPLX_MODEL_DIR" || ! -f "$BSM_MODEL" || ! -d "$GROUNDLINK_ROOT/moshpp" || ! -d "$GROUNDLINK_ROOT/force" ]]; then
   echo "Missing SMPL-X directory, BSM model, or GroundLink moshpp/force roots." >&2
@@ -51,8 +54,12 @@ STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/groundlink-all-stage.XXXXXX")"
 trap 'rm -rf "$STAGE_DIR"' EXIT
 
 run_python() {
-  env MAMBA_ROOT_PREFIX="$MAMBA_ROOT_PREFIX" PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT/scripts" \
-    "$MICROMAMBA" run -n "$ENV_NAME" python "$@"
+  if [[ -n "$PYTHON_BIN" ]]; then
+    env PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT/scripts" "$PYTHON_BIN" "$@"
+  else
+    env MAMBA_ROOT_PREFIX="$MAMBA_ROOT_PREFIX" PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT/scripts" \
+      "$MICROMAMBA" run -n "$ENV_NAME" python "$@"
+  fi
 }
 
 subject_config() {
@@ -88,6 +95,7 @@ for subject in "${SUBJECTS[@]}"; do
       --mass-kg "$mass" \
       --height-m "$height" \
       --output-dir "$audit_subject_dir" \
+      --skip-force-validation \
       --mode audit; then
     echo "Warning: $subject has invalid trials; continuing with valid trials." >&2
   fi
@@ -112,27 +120,40 @@ for subject in "${SUBJECTS[@]}"; do
   else
     skip_existing_arg="--no-skip-existing-csv"
   fi
+  batch_args=(
+    --input-root "$stage_subject_dir"
+    --output-dir "$pipeline_subject_dir"
+    --workers "$WORKERS"
+    --require-intermediate-artifacts
+    --no-cleanup-intermediate
+    --smplx-model-dir "$SMPLX_MODEL_DIR"
+    --bsm-model "$BSM_MODEL"
+    --addbio-root "$ADDBIO_ROOT"
+    --engine-work-root "$ENGINE_WORK_ROOT"
+    --engine-timeout-s "$ENGINE_TIMEOUT_S"
+    --sex "$sex"
+    --subject-mass-kg "$mass"
+    --subject-height-m "$height"
+    --id-cutoff-hz 12
+    --walking-contact-height-threshold-m 0.025
+    --walking-contact-speed-threshold-mps 0.35
+    --id-contact-bodies calcn_l,toes_l,calcn_r,toes_r
+  )
+  [[ "$RERUN_WALKING" -eq 1 ]] && batch_args+=(--rerun-walking)
   if run_python "$REPO_ROOT/scripts/run_amass_batch_parallel.py" \
-      --input-root "$stage_subject_dir" \
-      --output-dir "$pipeline_subject_dir" \
-      --workers "$WORKERS" \
-      "$skip_existing_arg" \
-      $([[ "$RERUN_WALKING" -eq 1 ]] && echo "--rerun-walking") \
-      --no-cleanup-intermediate \
-      --smplx-model-dir "$SMPLX_MODEL_DIR" \
-      --bsm-model "$BSM_MODEL" \
-      --addbio-root "$ADDBIO_ROOT" \
-      --sex "$sex" \
-      --subject-mass-kg "$mass" \
-      --subject-height-m "$height" \
-      --id-cutoff-hz 12 \
-      --walking-contact-height-threshold-m 0.025 \
-      --walking-contact-speed-threshold-mps 0.35 \
-      --id-contact-bodies calcn_l,toes_l,calcn_r,toes_r; then
+      "${batch_args[@]}" "$skip_existing_arg"; then
     :
   else
-    BATCH_FAILURES=1
-    echo "Warning: $subject has failed batch trials; continuing with remaining subjects." >&2
+    # A failed trial may have left complete AddBiomechanics artifacts but
+    # failed only during post-processing (for example a short segment edge
+    # trim).  Retry once with --skip-existing-csv so successful trials are
+    # reused and only failed/stale trials are recomputed.
+    echo "Warning: $subject has failed batch trials; retrying failed/stale trials once." >&2
+    if ! run_python "$REPO_ROOT/scripts/run_amass_batch_parallel.py" \
+        "${batch_args[@]}" --skip-existing-csv; then
+      BATCH_FAILURES=1
+      echo "Warning: $subject still has failed batch trials; continuing with remaining subjects." >&2
+    fi
   fi
 
   echo "[3/3] Evaluating $subject GRF, CoP, and contact"

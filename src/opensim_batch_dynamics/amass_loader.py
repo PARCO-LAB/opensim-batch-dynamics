@@ -365,7 +365,14 @@ def _motionx_322_fields(source: Path, motion: np.ndarray) -> dict[str, Any]:
         )
     n_frames = motion.shape[0]
     pose_eye = np.zeros((n_frames, 6), dtype=np.float32)
-    trans = motion[:, 309:312] @ _MOTIONX_Y_UP_TO_Z_UP_MATRIX.T
+    # Motion-X AIST stores translations in centimetres with a mirrored Z axis.
+    # Apply this at load time so every caller (including HPC workers) sees the
+    # corrected sequence; never mutate the source array on disk.
+    translation = motion[:, 309:312].astype(np.float32, copy=True)
+    if "aist" in {part.lower() for part in source.parts}:
+        translation /= 94.0
+        translation[:, 2] *= -1.0
+    trans = translation @ _MOTIONX_Y_UP_TO_Z_UP_MATRIX.T
     return {
         "surface_model_type": "smplx",
         "gender": "neutral",

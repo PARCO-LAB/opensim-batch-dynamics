@@ -15,7 +15,9 @@ from batch_common import (
     BatchTask,
     build_trial_name,
     discover_amass_input_files,
+    excluded_trial_reason,
     is_nonempty_file,
+    is_quality_pass,
     read_manifest_record,
     resolve_pipeline_script,
     resolve_submit_path,
@@ -101,6 +103,9 @@ def _build_single_run_cmd(
     ]
     if args.addbio_root:
         cmd.extend(["--addbio-root", args.addbio_root])
+    if args.engine_work_root:
+        cmd.extend(["--engine-work-root", args.engine_work_root])
+    cmd.extend(["--engine-timeout-s", str(args.engine_timeout_s)])
     if args.sex:
         cmd.extend(["--sex", args.sex])
     if args.id_cutoff_hz is not None:
@@ -374,9 +379,13 @@ def _run_submit(args: argparse.Namespace) -> int:
     previous_status = _load_previous_result_statuses(output_root=output_root)
     skipped_existing = 0
     skipped_previous_ok = 0
+    skipped_excluded = 0
     runnable: list[BatchTask] = []
     for task in tasks:
-        if args.skip_existing and is_nonempty_file(task.output_csv_path):
+        if excluded_trial_reason(task.relative_path):
+            skipped_excluded += 1
+            continue
+        if args.skip_existing and is_quality_pass(task.output_csv_path):
             skipped_existing += 1
             continue
         if args.skip_previously_ok and previous_status.get(task.relative_path.as_posix()) == "ok":
@@ -393,6 +402,7 @@ def _run_submit(args: argparse.Namespace) -> int:
     print(f"Discovered {len(tasks)} .npz files under: {input_root}")
     print(f"Skip existing CSVs: {'enabled' if args.skip_existing else 'disabled'}")
     print(f"Already present CSVs skipped at submit-time: {skipped_existing}")
+    print(f"Excluded kinematic trials skipped at submit-time: {skipped_excluded}")
     print(
         "Previously successful tasks skipped at submit-time: "
         f"{skipped_previous_ok} (from {output_root / 'slurm' / 'results'})"
@@ -415,6 +425,7 @@ def _run_submit(args: argparse.Namespace) -> int:
                 "total_discovered": len(tasks),
                 "skipped_existing": skipped_existing,
                 "skipped_previous_ok": skipped_previous_ok,
+                "skipped_excluded": skipped_excluded,
                 "pending_before_cap": total_runnable,
                 "scheduled_tasks": 0,
                 "sbatch_script": None,
@@ -449,6 +460,7 @@ def _run_submit(args: argparse.Namespace) -> int:
             "total_discovered": len(tasks),
             "skipped_existing": skipped_existing,
             "skipped_previous_ok": skipped_previous_ok,
+            "skipped_excluded": skipped_excluded,
             "pending_before_cap": total_runnable,
             "scheduled_tasks": len(runnable),
             "manifest_path": str(manifest_path),
@@ -562,7 +574,23 @@ def _run_worker(args: argparse.Namespace) -> int:
     result_path = result_dir / f"task_{task_index:06d}.json"
     started_at = time.time()
 
-    if args.skip_existing and is_nonempty_file(output_csv_path):
+    exclusion = excluded_trial_reason(Path(relative_path))
+    if exclusion:
+        payload = {
+            "task_index": task_index,
+            "relative_path": relative_path,
+            "status": "excluded",
+            "return_code": 0,
+            "duration_s": 0.0,
+            "log_path": str(log_path),
+            "output_csv_path": str(output_csv_path),
+            "error": exclusion,
+        }
+        _write_json(result_path, payload)
+        print(f"[SLURM {task_index}] EXCLUDE {relative_path} ({exclusion})")
+        return 0
+
+    if args.skip_existing and is_quality_pass(output_csv_path):
         payload = {
             "task_index": task_index,
             "relative_path": relative_path,
@@ -653,6 +681,17 @@ def _add_pipeline_forwarded_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--smplx-model-dir", default="model/smpl")
     parser.add_argument("--bsm-model", default="model/bsm/bsm.osim")
     parser.add_argument("--addbio-root", default=None)
+    parser.add_argument(
+        "--engine-work-root",
+        default="/tmp/groundlink-engine-work",
+        help="Local scratch root for AddBiomechanics/OpenSim work (default: /tmp/groundlink-engine-work).",
+    )
+    parser.add_argument(
+        "--engine-timeout-s",
+        type=float,
+        default=7200.0,
+        help="Maximum AddBiomechanics engine runtime in seconds (default: 7200; 0 disables).",
+    )
     parser.add_argument("--sex", choices=["neutral", "male", "female"], default=None)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--skip-inverse-dynamics", action="store_true")
@@ -667,7 +706,11 @@ def _add_pipeline_forwarded_args(parser: argparse.ArgumentParser) -> None:
         default="estimated",
         choices=["estimated", "none"],
     )
-    parser.add_argument("--id-contact-bodies", default="all")
+    parser.add_argument(
+        "--id-contact-bodies",
+        default="all",
+        help="Comma-separated contact body names (default: all).",
+    )
     parser.add_argument("--id-friction-coeff", type=float, default=0.8)
     parser.add_argument("--id-contact-height-threshold-m", type=float, default=0.04)
     parser.add_argument("--id-contact-speed-threshold-mps", type=float, default=0.5)
@@ -773,7 +816,7 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Do not use previous SLURM worker results for submit-time filtering.",
     )
-    submit.set_defaults(skip_previously_ok=True)
+    submit.set_defaults(skip_previously_ok=False)
     submit.add_argument("--slurm-job-name", default="amass_bsm")
     submit.add_argument("--slurm-partition", default=None)
     submit.add_argument("--slurm-account", default=None)

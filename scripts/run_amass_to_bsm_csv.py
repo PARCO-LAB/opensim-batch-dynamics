@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import re
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 # On macOS, torch/nimble/OpenSim stacks can load multiple OpenMP runtimes.
@@ -53,6 +55,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--addbio-root",
         default=None,
         help="Path to the local AddBiomechanics checkout or use $ADDBIO_ENGINE_ROOT",
+    )
+    parser.add_argument(
+        "--engine-work-root",
+        default="/tmp/groundlink-engine-work",
+        help=(
+            "Local scratch root for AddBiomechanics/OpenSim work. The final CSV is still "
+            "written to --final-csv-path; use 'none' to work directly in --output-dir."
+        ),
+    )
+    parser.add_argument(
+        "--engine-timeout-s",
+        type=float,
+        default=7200.0,
+        help="Maximum AddBiomechanics engine runtime in seconds (default: 7200). Use 0 to disable.",
     )
     parser.add_argument(
         "--sex",
@@ -102,7 +118,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--id-friction-coeff",
         type=float,
         default=0.8,
-        help="Friction coefficient for GRF estimation (default: 0.8)",
+        help=(
+            "Friction coefficient retained for estimator compatibility; the "
+            "OpenSim net-force target is not clipped (default: 0.8)"
+        ),
     )
     parser.add_argument(
         "--id-contact-height-threshold-m",
@@ -184,6 +203,23 @@ def _fallback_contact_bodies_for_csv(contact_body_names: tuple[str, ...]) -> tup
     return ("calcn_l", "calcn_r")
 
 
+def _publish_trial_artifacts(source_root: Path, target_root: Path) -> None:
+    """Copy retained artifacts without copying the large local Geometry tree."""
+    target_root.mkdir(parents=True, exist_ok=True)
+    for source in source_root.iterdir():
+        # Geometry is either a symlink or a large static model tree. It is not
+        # needed by E4 once the final model has been produced, and copying it
+        # back to a CIFS/NAS share defeats the local-engine staging purpose.
+        if source.name == "Geometry":
+            continue
+        target = target_root / source.name
+        if source.is_dir() and not source.is_symlink():
+            shutil.copytree(source, target, dirs_exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target, follow_symlinks=False)
+
+
 def _run_single_trial_pipeline(
     args: argparse.Namespace,
     sequence,
@@ -210,6 +246,12 @@ def _run_single_trial_pipeline(
         run_inverse_dynamics_and_export_torque_csv,
     )
     from opensim_batch_dynamics.final_csv_export import export_final_csv
+    from opensim_batch_dynamics.quality import (
+        assess_csv,
+        leading_pelvis_transient_frames,
+        write_quality,
+    )
+    from batch_common import DYNAMICS_PIPELINE_VERSION
 
     repo_root = Path(__file__).resolve().parents[1]
 
@@ -218,8 +260,19 @@ def _run_single_trial_pipeline(
         return path if path.is_absolute() else (repo_root / path)
 
     output_root = Path(args.output_dir).resolve()
-    trial_root = output_root / trial_name
-    trial_root.mkdir(parents=True, exist_ok=True)
+    published_trial_root = output_root / trial_name
+    stage_parent: Path | None = None
+    if args.engine_work_root and str(args.engine_work_root).lower() != "none":
+        engine_work_root = Path(args.engine_work_root).expanduser().resolve()
+        engine_work_root.mkdir(parents=True, exist_ok=True)
+        stage_parent = Path(
+            tempfile.mkdtemp(prefix=f"{_sanitize_trial_name(trial_name, 'trial')}_", dir=engine_work_root)
+        )
+        trial_root = stage_parent / trial_name
+        trial_root.mkdir(parents=True, exist_ok=True)
+    else:
+        trial_root = published_trial_root
+        trial_root.mkdir(parents=True, exist_ok=True)
     resolved_final_csv_path = (
         final_csv_path.resolve()
         if final_csv_path is not None
@@ -254,6 +307,7 @@ def _run_single_trial_pipeline(
         marker_names=marker_names,
         output_path=trial_root / "trials" / trial_name / "markers.trc",
         frame_rate_hz=sequence.frame_rate_hz,
+        vertical_offset=float(marker_positions[:, :, 1].min()),
     )
 
     subject_json = build_subject_json(
@@ -277,15 +331,24 @@ def _run_single_trial_pipeline(
         subject_root=subject_folder.subject_root,
         addbio_root=args.addbio_root,
         output_name="results",
+        timeout_s=None if args.engine_timeout_s == 0.0 else args.engine_timeout_s,
     )
+    # Motion-X synthetic marker fits can contain isolated pelvis branch jumps.
+    # AIST needs 1 Hz; other Motion-X subsets retain 4 Hz.
+    source_parts = {part.lower() for part in sequence.source_path.parts}
+    motionx_cutoff_hz = 1.0 if "aist" in source_parts else (4.0 if "smplx_322" in source_parts else None)
+    effective_id_cutoff_hz = args.id_cutoff_hz if args.id_cutoff_hz is not None else motionx_cutoff_hz
     csv_summary = export_addbiomechanics_csv(
         final_model_path=engine_result.final_model_path,
         final_mot_path=engine_result.final_mot_path,
         output_csv_path=subject_folder.subject_root / "CSV" / f"{trial_name}_bsm_dofs.csv",
+        filter_mode=args.id_filter_mode,
+        cutoff_hz=effective_id_cutoff_hz,
     )
 
     torque_summary = None
     final_csv_summary = None
+    summary_quality = None
     if not args.skip_inverse_dynamics:
         contact_body_names = _parse_contact_body_names(args.id_contact_bodies)
         fallback_contact_bodies = _fallback_contact_bodies_for_csv(contact_body_names)
@@ -297,53 +360,101 @@ def _run_single_trial_pipeline(
             trial_name=trial_name,
             torque_csv_path=subject_folder.subject_root / "CSV" / f"{trial_name}_bsm_torques.csv",
             filter_mode=args.id_filter_mode,
-            cutoff_hz=args.id_cutoff_hz,
+            cutoff_hz=effective_id_cutoff_hz,
             grf_mode=args.id_grf_mode,
             contact_body_names=contact_body_names,
             friction_coeff=args.id_friction_coeff,
             contact_height_threshold_m=args.id_contact_height_threshold_m,
             contact_speed_threshold_mps=args.id_contact_speed_threshold_mps,
         )
+        partial_csv_path = resolved_final_csv_path.with_suffix(resolved_final_csv_path.suffix + ".partial")
         final_csv_summary = export_final_csv(
             dof_csv_path=csv_summary.output_csv_path,
             torque_csv_path=torque_summary.torque_csv_path,
-            output_csv_path=resolved_final_csv_path,
+            output_csv_path=partial_csv_path,
             contact_wrench_csv_path=torque_summary.contact_wrench_csv_path,
             subject_json_path=subject_folder.subject_json_path,
             model_path=engine_result.final_model_path,
             excluded_dofs=("knee_angle_r_beta", "knee_angle_l_beta"),
             fallback_contact_bodies=fallback_contact_bodies,
         )
+        quality = assess_csv(partial_csv_path, mass_kg=final_csv_summary.mass_kg)
+        if set(quality.get("reasons", ())) == {"pelvis_rotation_speed_gt_20rad_s"}:
+            trim = leading_pelvis_transient_frames(partial_csv_path)
+            if trim:
+                with partial_csv_path.open(newline="", encoding="utf-8") as f:
+                    rows = list(csv.reader(f))
+                with partial_csv_path.open("w", newline="", encoding="utf-8") as f:
+                    # The first retained velocity is centrally differentiated
+                    # against the transient's last frame.
+                    csv.writer(f).writerows([rows[0], *rows[trim + 2 :]])
+                quality = assess_csv(partial_csv_path, mass_kg=final_csv_summary.mass_kg)
+                quality["trimmed_leading_frames"] = trim + 1
+        # This provenance marker makes --skip-existing/--resume invalidate
+        # outputs made before the force target was derived by OpenSim itself.
+        quality["dynamics_pipeline_version"] = DYNAMICS_PIPELINE_VERSION
+        quality_path = resolved_final_csv_path.with_suffix(resolved_final_csv_path.suffix + ".quality.json")
+        write_quality(quality_path, quality)
+        if quality.get("status") != "ok":
+            partial_csv_path.unlink(missing_ok=True)
+            raise RuntimeError(f"quality gate rejected {trial_name}: {quality}")
+        os.replace(partial_csv_path, resolved_final_csv_path)
+        summary_quality = quality
+
+    # The engine and all heavy OpenSim work ran on local storage. Publish only
+    # the retained trial artifacts to the requested output tree after success.
+    # In cleanup mode no intermediate artifacts are needed, so avoid a large
+    # copy back to the NAS altogether.
+    if stage_parent is not None and not args.cleanup_intermediate:
+        _publish_trial_artifacts(trial_root, published_trial_root)
+
+    def _published_path(path: Path) -> Path:
+        if stage_parent is not None and _is_relative_to(path, trial_root):
+            return published_trial_root / path.relative_to(trial_root)
+        return path
+
+    def _rewrite_stage_paths(value: object) -> object:
+        """Rewrite retained path fields in nested engine provenance JSON."""
+        if isinstance(value, dict):
+            return {key: _rewrite_stage_paths(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [_rewrite_stage_paths(item) for item in value]
+        if isinstance(value, str) and stage_parent is not None:
+            candidate = Path(value)
+            if _is_relative_to(candidate, trial_root):
+                return str(_published_path(candidate))
+        return value
 
     summary = {
         "trial": trial_name,
-        "subject_root": str(subject_folder.subject_root),
-        "trial_trc_path": str(trial_trc_path),
-        "subject_json_path": str(subject_folder.subject_json_path),
-        "engine_output_root": str(engine_result.output_root),
-        "final_model_path": str(engine_result.final_model_path),
-        "final_mot_path": str(engine_result.final_mot_path),
-        "csv_path": str(csv_summary.output_csv_path),
+        "subject_root": str(_published_path(subject_folder.subject_root)),
+        "trial_trc_path": str(_published_path(trial_trc_path)),
+        "subject_json_path": str(_published_path(subject_folder.subject_json_path)),
+        "engine_output_root": str(_published_path(engine_result.output_root)),
+        "final_model_path": str(_published_path(engine_result.final_model_path)),
+        "final_mot_path": str(_published_path(engine_result.final_mot_path)),
+        "csv_path": str(_published_path(csv_summary.output_csv_path)),
         "velocity_source": csv_summary.velocity_source,
         "frames": csv_summary.frames,
         "dof_count": len(csv_summary.dof_names),
         "inverse_dynamics_enabled": not args.skip_inverse_dynamics,
-        "engine_result": json.loads(result_to_json(engine_result)),
+        "engine_result": _rewrite_stage_paths(json.loads(result_to_json(engine_result))),
         "final_csv_path": str(resolved_final_csv_path) if final_csv_summary is not None else None,
+        "quality": summary_quality if final_csv_summary is not None else None,
     }
     if torque_summary is not None:
-        summary["torque_csv_path"] = str(torque_summary.torque_csv_path)
-        summary["id_sto_path"] = str(torque_summary.id_sto_path)
-        summary["id_setup_path"] = str(torque_summary.id_setup_path)
+        summary["torque_csv_path"] = str(_published_path(torque_summary.torque_csv_path))
+        summary["id_sto_path"] = str(_published_path(torque_summary.id_sto_path))
+        summary["id_setup_path"] = str(_published_path(torque_summary.id_setup_path))
         summary["id_cutoff_hz"] = torque_summary.cutoff_hz
         summary["id_missing_dofs"] = list(torque_summary.missing_dofs)
         summary["id_grf_mode"] = torque_summary.grf_mode
         if torque_summary.grf_mot_path is not None:
-            summary["id_grf_mot_path"] = str(torque_summary.grf_mot_path)
+            summary["id_grf_mot_path"] = str(_published_path(torque_summary.grf_mot_path))
         if torque_summary.external_loads_xml_path is not None:
-            summary["id_external_loads_xml_path"] = str(torque_summary.external_loads_xml_path)
+            summary["id_external_loads_xml_path"] = str(_published_path(torque_summary.external_loads_xml_path))
         if torque_summary.contact_wrench_csv_path is not None:
-            summary["id_contact_wrench_csv_path"] = str(torque_summary.contact_wrench_csv_path)
+            summary["id_contact_wrench_csv_path"] = str(_published_path(torque_summary.contact_wrench_csv_path))
     if final_csv_summary is not None:
         summary["final_dof_count"] = len(final_csv_summary.dof_names)
         summary["final_contact_bodies"] = list(final_csv_summary.contact_body_names)
@@ -355,14 +466,25 @@ def _run_single_trial_pipeline(
     if args.cleanup_intermediate:
         if not resolved_final_csv_path.exists():
             raise FileNotFoundError(f"Final CSV not found after export: {resolved_final_csv_path}")
-        if trial_root.exists():
+        if stage_parent is not None:
+            shutil.rmtree(stage_parent, ignore_errors=True)
+        elif trial_root.exists():
             shutil.rmtree(trial_root)
         summary["cleanup_intermediate"] = True
         summary["summary_json_path"] = None
     else:
-        summary_path = subject_folder.subject_root / "summary.json"
+        # Keep the summary write local too; publishing it to a CIFS/NAS share
+        # is a final small copy rather than part of the engine critical path.
+        local_summary_path = subject_folder.subject_root / "summary.json"
+        summary_path = _published_path(local_summary_path)
         summary["summary_json_path"] = str(summary_path)
-        summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        local_summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        if stage_parent is not None:
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(local_summary_path, summary_path)
+
+        if stage_parent is not None:
+            shutil.rmtree(stage_parent, ignore_errors=True)
 
     return summary
 
