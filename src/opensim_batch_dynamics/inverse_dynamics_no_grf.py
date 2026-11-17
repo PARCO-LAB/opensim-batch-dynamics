@@ -319,6 +319,14 @@ def _horizontal_split_targets(
     return targets
 
 
+def _cop_progress_points(
+    heel: np.ndarray, toes: np.ndarray, features: np.ndarray, coefficients: np.ndarray
+) -> np.ndarray:
+    design = np.column_stack([np.ones(len(features)), features])
+    progress = np.clip(design @ coefficients, 0.0, 1.0)
+    return heel + progress[:, None] * (toes - heel)
+
+
 def _stance_progress(times: np.ndarray, contact: np.ndarray) -> np.ndarray:
     progress = np.zeros(len(times), dtype=np.float64)
     padded = np.r_[False, contact, False]
@@ -340,6 +348,7 @@ def _estimate_contact_wrenches_from_kinematics(
     force_cutoff_hz: float | None,
     force_target_id_sto_path: Path | None = None,
     horizontal_split_model_path: str | Path | None = None,
+    cop_progress_model_path: str | Path | None = None,
 ) -> tuple[Path, Path, Path]:
     """
     Estimate multi-body contact wrenches from kinematics and export OpenSim GRF artifacts.
@@ -361,6 +370,11 @@ def _estimate_contact_wrenches_from_kinematics(
     horizontal_split_model = (
         json.loads(Path(horizontal_split_model_path).read_text(encoding="utf-8"))
         if horizontal_split_model_path is not None else None
+    )
+    cop_progress_coefficients = (
+        np.asarray(json.loads(Path(cop_progress_model_path).read_text(encoding="utf-8"))["coefficients"],
+                   dtype=np.float64)
+        if cop_progress_model_path is not None else None
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     grf_mot_path = output_dir / f"{trial_name}_grf_estimated.mot"
@@ -690,6 +704,27 @@ def _estimate_contact_wrenches_from_kinematics(
                 force_per_body[indices, :, axis] = (targets[:, side, axis, None] * shares).T
                 force_per_body[indices, :, axis][:, ~active] = 0.0
 
+    if cop_progress_coefficients is not None:
+        body_index = {name: index for index, name in enumerate(selected_names)}
+        required = ("calcn_l", "toes_l", "calcn_r", "toes_r")
+        if any(name not in body_index for name in required):
+            raise ValueError("CoP progression model requires calcn/toes contact bodies on both sides.")
+        if cop_progress_coefficients.shape != (5,):
+            raise ValueError("CoP progression model must contain five linear coefficients.")
+        group_index = {name: index for index, name in enumerate(group_keys)}
+        for side, names in enumerate((("calcn_l", "toes_l"), ("calcn_r", "toes_r"))):
+            heel = body_positions_filt[body_index[names[0]]]
+            toes = body_positions_filt[body_index[names[1]]]
+            axis = toes[:, :2] - heel[:, :2]
+            length = np.linalg.norm(axis, axis=1)
+            incline = np.arctan2(toes[:, 2] - heel[:, 2], np.maximum(length, 1e-4))
+            group = group_activation[group_index[("left", "right")[side] + "_foot"]]
+            progress = _stance_progress(timestamps, group > 0.05)
+            features = np.column_stack([progress, incline, group, group])
+            point = _cop_progress_points(heel, toes, features, cop_progress_coefficients)
+            for name in names:
+                cop_per_body[body_index[name]] = point
+
     # Write a transparent per-frame debug CSV for inspection.
     with contact_wrench_csv_path.open("w", newline="", encoding="utf-8") as file_obj:
         writer = csv.writer(file_obj)
@@ -1007,6 +1042,7 @@ def run_inverse_dynamics_with_estimated_grf(
     contact_height_threshold_m: float = 0.04,
     contact_speed_threshold_mps: float = 0.5,
     horizontal_split_model_path: str | Path | None = None,
+    cop_progress_model_path: str | Path | None = None,
 ) -> tuple[Path, Path, float | None, Path, Path, Path]:
     """
     Run OpenSim ID using GRF/contact wrench estimated from kinematics.
@@ -1059,6 +1095,7 @@ def run_inverse_dynamics_with_estimated_grf(
             force_cutoff_hz=effective_cutoff,
             force_target_id_sto_path=force_target_id_sto_path,
             horizontal_split_model_path=horizontal_split_model_path,
+            cop_progress_model_path=cop_progress_model_path,
         )
     )
 
@@ -1170,6 +1207,7 @@ def run_inverse_dynamics_and_export_torque_csv(
     contact_height_threshold_m: float = 0.04,
     contact_speed_threshold_mps: float = 0.5,
     horizontal_split_model_path: str | Path | None = None,
+    cop_progress_model_path: str | Path | None = None,
 ) -> InverseDynamicsNoGrfSummary:
     """High-level helper: run ID (no GRF) and export DOF torque CSV."""
     model_path = Path(model_path).resolve()
@@ -1198,6 +1236,7 @@ def run_inverse_dynamics_and_export_torque_csv(
                     contact_height_threshold_m=contact_height_threshold_m,
                     contact_speed_threshold_mps=contact_speed_threshold_mps,
                     horizontal_split_model_path=horizontal_split_model_path,
+                    cop_progress_model_path=cop_progress_model_path,
                 )
             )
 
@@ -1289,6 +1328,7 @@ def run_inverse_dynamics_and_export_torque_csv(
             contact_height_threshold_m=contact_height_threshold_m,
             contact_speed_threshold_mps=contact_speed_threshold_mps,
             horizontal_split_model_path=horizontal_split_model_path,
+            cop_progress_model_path=cop_progress_model_path,
         )
     elif grf_mode_normalized in ("none", "no_grf"):
         id_setup_path, id_sto_path, effective_cutoff = run_inverse_dynamics_no_grf(

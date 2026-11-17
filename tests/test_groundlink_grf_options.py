@@ -6,7 +6,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "scripts" / "metrics_tau_claude"))
 from loso_prototypes import apply_variant, horizontal_features
-from opensim_batch_dynamics.inverse_dynamics_no_grf import _horizontal_split_targets
+from opensim_batch_dynamics.inverse_dynamics_no_grf import (
+    _cop_progress_points,
+    _horizontal_split_targets,
+)
 
 
 def sample_data():
@@ -51,6 +54,13 @@ class GroundLinkGRFOptionTests(unittest.TestCase):
         result = apply_variant(data, "H", params)
         np.testing.assert_allclose(result["foot_force"].sum(axis=1)[:, :2],
                                    data["net_force"][:, :2], atol=1e-12)
+
+    def test_cop_progress_uses_kinematics_only(self):
+        heel = np.zeros((2, 3))
+        toes = np.tile([1.0, 0.0, 0.0], (2, 1))
+        features = np.array([[0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
+        points = _cop_progress_points(heel, toes, features, np.array([0.0, 1.0, 0.0, 0.0, 0.0]))
+        np.testing.assert_allclose(points[:, 0], [0.0, 1.0])
 
     def test_pipeline_split_sum_constraint_uses_only_estimated_inputs(self):
         net = np.tile([4.0, -3.0], (3, 1))

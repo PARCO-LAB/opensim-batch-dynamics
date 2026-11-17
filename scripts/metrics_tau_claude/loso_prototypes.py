@@ -677,6 +677,12 @@ def parameter_rows(fold: str, variant: str, params: dict[str, Any]) -> list[dict
             output.append({"fold": fold, "variant": variant, "parameter": "H.ridge",
                            "value": params["H_ridge"], "training_J": params.get("training_J"),
                            "budget_configs": params.get("budget_configs")})
+            for name in ("mean", "scale"):
+                for index, value in enumerate(params["H_model"][name]):
+                    output.append({"fold": fold, "variant": variant,
+                                   "parameter": f"H.{name}_{index}", "value": value,
+                                   "training_J": params.get("training_J"),
+                                   "budget_configs": params.get("budget_configs")})
             for index, pair in enumerate(params["H_model"]["coefficients"]):
                 for axis, value in zip(("x", "y"), pair):
                     output.append({"fold": fold, "variant": variant,
