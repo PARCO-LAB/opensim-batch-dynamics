@@ -108,23 +108,37 @@ def main() -> int:
         raise ValueError(f"Empty prototype ID manifest: {args.manifest}")
 
     samples: dict[tuple[str, str, str, str, str], list[tuple[np.ndarray, np.ndarray, np.ndarray]]] = defaultdict(list)
+    target_cache, metadata_cache, mass_cache, force_cache, wrench_cache, baseline_cache = (
+        {}, {}, {}, {}, {}, {}
+    )
     variants = sorted({row["variant"] for row in manifest})
     for row in manifest:
         variant, subject, trial, segment = row["variant"], row["subject"], row["trial"], int(row["segment"])
-        target_csv = pd.read_csv(row["target_csv"])
+        target_path = Path(row["target_csv"])
+        if target_path not in target_cache:
+            target_cache[target_path] = pd.read_csv(target_path)
+        target_csv = target_cache[target_path]
         target = target_csv[target_csv.segment.astype(int) == segment].reset_index(drop=True)
         times = target.time.to_numpy(dtype=float)
         valid = target.valid.to_numpy(dtype=int) == 1
-        metadata_path = Path(row["target_csv"]).parent / "run_metadata.json"
-        metadata = json.loads(metadata_path.read_text())
+        metadata_path = target_path.parent / "run_metadata.json"
+        if metadata_path not in metadata_cache:
+            metadata_cache[metadata_path] = json.loads(metadata_path.read_text())
+        metadata = metadata_cache[metadata_path]
         model_path = mapped_source_path(metadata["source_paths"]["model"], args.source_torque_root, args.torque_root)
         pipeline_path = mapped_source_path(metadata["source_paths"]["pipeline_csv"], args.source_torque_root, args.torque_root)
-        pipeline_mass = pd.read_csv(pipeline_path, usecols=["subject_mass_kg"]).subject_mass_kg.iloc[0]
-        mass = read_model_mass(model_path)
+        if pipeline_path not in mass_cache:
+            mass_cache[pipeline_path] = float(pd.read_csv(pipeline_path, usecols=["subject_mass_kg"]).subject_mass_kg.iloc[0])
+        pipeline_mass = mass_cache[pipeline_path]
+        if model_path not in mass_cache:
+            mass_cache[model_path] = read_model_mass(model_path)
+        mass = mass_cache[model_path]
         bw_n = float(pipeline_mass) * 9.81
         force_path = _force_path(metadata["source_paths"]["measured_force"], force_config)
-        measured_raw, _ = _load_force_arrays(force_path)
-        measured_filtered = _lowpass_force(measured_raw, 250.0, 12.0)
+        if force_path not in force_cache:
+            force_raw, _ = _load_force_arrays(force_path)
+            force_cache[force_path] = (force_raw, _lowpass_force(force_raw, 250.0, 12.0))
+        force_raw, measured_filtered = force_cache[force_path]
         raw_index = np.rint(times * 250.0).astype(int)
         in_range = (raw_index >= 0) & (raw_index < len(measured_filtered))
         safe_index = np.clip(raw_index, 0, len(measured_filtered) - 1)
@@ -135,7 +149,10 @@ def main() -> int:
         phase = phase_labels_from_forces(times, measured_force, measured_raw, bw_n)
         measured_fz = measured_force[:, :, 2]
         true_contact = measured_fz > 0.05 * bw_n
-        wrench = read_contact_wrenches(model_path, pipeline_path, segment, times)
+        wrench_key = (model_path, pipeline_path, segment)
+        if wrench_key not in wrench_cache:
+            wrench_cache[wrench_key] = read_contact_wrenches(model_path, pipeline_path, segment, times)
+        wrench = wrench_cache[wrench_key]
         net_force_z = wrench.target_force_z.to_numpy(dtype=float)
         force_valid = (
             in_range & np.isfinite(measured_fz).all(axis=1) & np.isfinite(net_force_z)
@@ -147,7 +164,9 @@ def main() -> int:
             for coordinate in COORDINATES
         ])
         baseline_path = Path(row["estimated_sto"])
-        baseline = read_storage(baseline_path)
+        if baseline_path not in baseline_cache:
+            baseline_cache[baseline_path] = read_storage(baseline_path)
+        baseline = baseline_cache[baseline_path]
         baseline_moments = interpolate_columns(
             baseline, times, [f"{coordinate}_moment" for coordinate in COORDINATES], baseline_path
         ) / mass
