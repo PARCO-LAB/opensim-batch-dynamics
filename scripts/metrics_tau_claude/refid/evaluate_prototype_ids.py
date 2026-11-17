@@ -20,14 +20,11 @@ from scipy.stats import t
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from diagnose_modes import read_contact_wrenches
 from evaluate_hybrid_ids import (
-    COORDINATES,
-    PHASES,
-    TIME_TOLERANCE_S,
-    interpolate_columns,
-    mapped_source_path,
-    metric,
-    phase_labels,
-    read_storage,
+    COORDINATES, PHASES, TIME_TOLERANCE_S, TRANSITION_WINDOW_S, interpolate_columns, mapped_source_path, read_storage,
+)
+from groundlink import (
+    DEFAULT_SOURCE_FORCE_ROOT, EvaluationConfig as GroundLinkEvaluationConfig,
+    _force_path, _load_force_arrays, _lowpass_force,
 )
 
 
@@ -58,6 +55,27 @@ def pearson(target: np.ndarray, estimate: np.ndarray) -> float:
     return float(np.corrcoef(target, estimate)[0, 1])
 
 
+def phase_labels_from_forces(
+    times: np.ndarray, measured_force: np.ndarray, measured_raw: np.ndarray, bw_n: float
+) -> np.ndarray:
+    contact = measured_force[:, :, 2] > 0.05 * bw_n
+    labels = np.full(len(times), "other", dtype=object)
+    count = contact.sum(axis=1)
+    labels[count == 1] = "single_stance"
+    labels[count == 2] = "double_stance"
+    labels[np.all(measured_raw[:, :, 2] <= 1.0, axis=1)] = "flight"
+    transition = np.zeros(len(times), dtype=bool)
+    for side in range(2):
+        states = contact[:, side]
+        edges = np.flatnonzero(states[1:] != states[:-1]) + 1
+        if states.size and states[0]:
+            edges = np.r_[0, edges]
+        for edge in edges:
+            transition |= np.abs(times - times[edge]) <= TRANSITION_WINDOW_S
+    labels[transition] = "transition"
+    return labels
+
+
 def signflip_p(values: np.ndarray) -> float:
     values = values[np.isfinite(values)]
     if not len(values):
@@ -76,8 +94,14 @@ def main() -> int:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--torque-root", type=Path, required=True)
     parser.add_argument("--source-torque-root", required=True)
+    parser.add_argument("--force-root", type=Path, required=True)
+    parser.add_argument("--source-force-root", default=DEFAULT_SOURCE_FORCE_ROOT)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    force_config = GroundLinkEvaluationConfig(
+        torque_root=args.torque_root, force_root=args.force_root, output_dir=args.output.parent,
+        source_torque_root=args.source_torque_root, source_force_root=args.source_force_root,
+    )
     with args.manifest.open(newline="") as handle:
         manifest = list(csv.DictReader(handle))
     if not manifest:
@@ -91,10 +115,6 @@ def main() -> int:
         target = target_csv[target_csv.segment.astype(int) == segment].reset_index(drop=True)
         times = target.time.to_numpy(dtype=float)
         valid = target.valid.to_numpy(dtype=int) == 1
-        measured_path = Path(row["measured_mot"])
-        measured_all = read_storage(measured_path)
-        measured_idx = align_indices(measured_all.time.to_numpy(dtype=float), times, measured_path)
-        measured = measured_all.iloc[measured_idx].reset_index(drop=True)
         metadata_path = Path(row["target_csv"]).parent / "run_metadata.json"
         metadata = json.loads(metadata_path.read_text())
         model_path = mapped_source_path(metadata["source_paths"]["model"], args.source_torque_root, args.torque_root)
@@ -102,15 +122,23 @@ def main() -> int:
         pipeline_mass = pd.read_csv(pipeline_path, usecols=["subject_mass_kg"]).subject_mass_kg.iloc[0]
         mass = read_model_mass(model_path)
         bw_n = float(pipeline_mass) * 9.81
-        phase = phase_labels(times, measured, bw_n / 9.81)
-        measured_fz = np.column_stack([
-            measured[f"ground_force_calcn_{side}_vz"].to_numpy(dtype=float) for side in "lr"
-        ])
+        force_path = _force_path(metadata["source_paths"]["measured_force"], force_config)
+        measured_raw, _ = _load_force_arrays(force_path)
+        measured_filtered = _lowpass_force(measured_raw, 250.0, 12.0)
+        raw_index = np.rint(times * 250.0).astype(int)
+        in_range = (raw_index >= 0) & (raw_index < len(measured_filtered))
+        safe_index = np.clip(raw_index, 0, len(measured_filtered) - 1)
+        measured_force = measured_filtered[safe_index].copy()
+        measured_raw = measured_raw[safe_index].copy()
+        measured_force[~in_range] = np.nan
+        measured_raw[~in_range] = np.nan
+        phase = phase_labels_from_forces(times, measured_force, measured_raw, bw_n)
+        measured_fz = measured_force[:, :, 2]
         true_contact = measured_fz > 0.05 * bw_n
         wrench = read_contact_wrenches(model_path, pipeline_path, segment, times)
         net_force_z = wrench.target_force_z.to_numpy(dtype=float)
         force_valid = (
-            np.isfinite(measured_fz).all(axis=1) & np.isfinite(net_force_z)
+            in_range & np.isfinite(measured_fz).all(axis=1) & np.isfinite(net_force_z)
             & (np.abs(measured_fz.sum(axis=1) - net_force_z) <= 0.25 * bw_n)
         )
         valid &= force_valid
