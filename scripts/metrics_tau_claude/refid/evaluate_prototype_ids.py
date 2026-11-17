@@ -8,6 +8,7 @@ import csv
 import itertools
 import json
 import math
+import sys
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
@@ -16,6 +17,8 @@ import numpy as np
 import pandas as pd
 from scipy.stats import t
 
+sys.path.insert(0, str(Path(__file__).parents[1]))
+from diagnose_modes import read_contact_wrenches
 from evaluate_hybrid_ids import (
     COORDINATES,
     PHASES,
@@ -80,7 +83,7 @@ def main() -> int:
     if not manifest:
         raise ValueError(f"Empty prototype ID manifest: {args.manifest}")
 
-    samples: dict[tuple[str, str, str, str], list[tuple[np.ndarray, np.ndarray, np.ndarray]]] = defaultdict(list)
+    samples: dict[tuple[str, str, str, str, str], list[tuple[np.ndarray, np.ndarray, np.ndarray]]] = defaultdict(list)
     variants = sorted({row["variant"] for row in manifest})
     for row in manifest:
         variant, subject, trial, segment = row["variant"], row["subject"], row["trial"], int(row["segment"])
@@ -95,8 +98,22 @@ def main() -> int:
         metadata_path = Path(row["target_csv"]).parent / "run_metadata.json"
         metadata = json.loads(metadata_path.read_text())
         model_path = mapped_source_path(metadata["source_paths"]["model"], args.source_torque_root, args.torque_root)
+        pipeline_path = mapped_source_path(metadata["source_paths"]["pipeline_csv"], args.source_torque_root, args.torque_root)
+        pipeline_mass = pd.read_csv(pipeline_path, usecols=["subject_mass_kg"]).subject_mass_kg.iloc[0]
         mass = read_model_mass(model_path)
-        phase = phase_labels(times, measured, mass)
+        bw_n = float(pipeline_mass) * 9.81
+        phase = phase_labels(times, measured, bw_n / 9.81)
+        measured_fz = np.column_stack([
+            measured[f"ground_force_calcn_{side}_vz"].to_numpy(dtype=float) for side in "lr"
+        ])
+        true_contact = measured_fz > 0.05 * bw_n
+        wrench = read_contact_wrenches(model_path, pipeline_path, segment, times)
+        net_force_z = wrench.target_force_z.to_numpy(dtype=float)
+        force_valid = (
+            np.isfinite(measured_fz).all(axis=1) & np.isfinite(net_force_z)
+            & (np.abs(measured_fz.sum(axis=1) - net_force_z) <= 0.25 * bw_n)
+        )
+        valid &= force_valid
         target_moments = np.column_stack([
             target[f"{coordinate}_tau_target"].to_numpy(dtype=float) / mass
             for coordinate in COORDINATES
@@ -114,9 +131,13 @@ def main() -> int:
         for coordinate_index, coordinate in enumerate(COORDINATES):
             for phase_name in PHASES:
                 phase_mask = np.ones(len(target), dtype=bool) if phase_name == "total" else phase == phase_name
-                mask = valid & phase_mask
+                side_index = 0 if coordinate.endswith("_l") else 1
+                # Total reproduces Table I's ipsilateral measured-stance mask;
+                # phase rows score valid, force-consistent target frames in that phase.
+                mask = (valid & phase_mask & true_contact[:, side_index] if phase_name == "total"
+                        else valid & phase_mask)
                 if mask.any():
-                    samples[(variant, subject, coordinate, phase_name)].append((
+                    samples[(variant, subject, trial, coordinate, phase_name)].append((
                         target_moments[mask, coordinate_index],
                         baseline_moments[mask, coordinate_index],
                         candidate_moments[mask, coordinate_index],
@@ -127,16 +148,29 @@ def main() -> int:
         for coordinate in COORDINATES:
             for phase_name in PHASES:
                 subject_rows = []
-                for subject in sorted({key[1] for key in samples if key[0] == variant and key[2] == coordinate and key[3] == phase_name}):
-                    chunks = samples[(variant, subject, coordinate, phase_name)]
-                    target = np.concatenate([part[0] for part in chunks])
-                    base = np.concatenate([part[1] for part in chunks])
-                    candidate = np.concatenate([part[2] for part in chunks])
-                    base_rmse = float(np.sqrt(np.mean((target - base) ** 2)))
-                    candidate_rmse = float(np.sqrt(np.mean((target - candidate) ** 2)))
-                    delta = candidate_rmse - base_rmse
-                    subject_rows.append((subject, base_rmse, candidate_rmse, delta,
-                                         pearson(target, base), pearson(target, candidate), len(target)))
+                subjects = sorted({key[1] for key in samples
+                                   if key[0] == variant and key[3] == coordinate and key[4] == phase_name})
+                for subject in subjects:
+                    trial_metrics = []
+                    trials = sorted({key[2] for key in samples
+                                     if key[0] == variant and key[1] == subject
+                                     and key[3] == coordinate and key[4] == phase_name})
+                    for trial in trials:
+                        chunks = samples[(variant, subject, trial, coordinate, phase_name)]
+                        target = np.concatenate([part[0] for part in chunks])
+                        base = np.concatenate([part[1] for part in chunks])
+                        candidate = np.concatenate([part[2] for part in chunks])
+                        trial_metrics.append((
+                            float(np.sqrt(np.mean((target - base) ** 2))),
+                            float(np.sqrt(np.mean((target - candidate) ** 2))),
+                            pearson(target, base), pearson(target, candidate), len(target),
+                        ))
+                    base_rmse = float(np.mean([item[0] for item in trial_metrics]))
+                    candidate_rmse = float(np.mean([item[1] for item in trial_metrics]))
+                    subject_rows.append((subject, base_rmse, candidate_rmse, candidate_rmse - base_rmse,
+                                         float(np.nanmean([item[2] for item in trial_metrics])),
+                                         float(np.nanmean([item[3] for item in trial_metrics])),
+                                         int(sum(item[4] for item in trial_metrics))))
                 for subject, base_rmse, candidate_rmse, delta, base_r, candidate_r, n in subject_rows:
                     rows.append({
                         "record_type": "subject", "variant": variant, "subject": subject,
@@ -156,7 +190,8 @@ def main() -> int:
                         "coordinate": coordinate, "phase": phase_name,
                         "baseline_rmse_nmkg": float(np.mean([row[1] for row in subject_rows])),
                         "variant_rmse_nmkg": float(np.mean([row[2] for row in subject_rows])),
-                        "delta_rmse_nmkg": mean_delta, "baseline_r": float(np.nanmean([row[4] for row in subject_rows])),
+                        "delta_rmse_nmkg": mean_delta,
+                        "baseline_r": float(np.nanmean([row[4] for row in subject_rows])),
                         "variant_r": float(np.nanmean([row[5] for row in subject_rows])),
                         "n": int(sum(row[6] for row in subject_rows)),
                         "mean_delta_rmse_nmkg": mean_delta,
