@@ -143,7 +143,7 @@ def main() -> int:
         in_range = (raw_index >= 0) & (raw_index < len(measured_filtered))
         safe_index = np.clip(raw_index, 0, len(measured_filtered) - 1)
         measured_force = measured_filtered[safe_index].copy()
-        measured_raw = measured_raw[safe_index].copy()
+        measured_raw = force_raw[safe_index].copy()
         measured_force[~in_range] = np.nan
         measured_raw[~in_range] = np.nan
         phase = phase_labels_from_forces(times, measured_force, measured_raw, bw_n)
