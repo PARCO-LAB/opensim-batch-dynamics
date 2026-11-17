@@ -124,6 +124,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--id-horizontal-split-model",
+        type=Path,
+        default=None,
+        help="Optional fitted kinematics-only horizontal GRF split model (default: disabled)",
+    )
+    parser.add_argument(
+        "--id-cop-progress-model",
+        type=Path,
+        default=None,
+        help="Optional fitted kinematics-only CoP progression model (default: disabled)",
+    )
+    parser.add_argument(
         "--id-contact-height-threshold-m",
         type=float,
         default=0.04,
@@ -366,6 +378,8 @@ def _run_single_trial_pipeline(
             friction_coeff=args.id_friction_coeff,
             contact_height_threshold_m=args.id_contact_height_threshold_m,
             contact_speed_threshold_mps=args.id_contact_speed_threshold_mps,
+            horizontal_split_model_path=args.id_horizontal_split_model,
+            cop_progress_model_path=args.id_cop_progress_model,
         )
         partial_csv_path = resolved_final_csv_path.with_suffix(resolved_final_csv_path.suffix + ".partial")
         final_csv_summary = export_final_csv(

@@ -60,6 +60,7 @@ HEIGHT_GRID_M = (0.01, 0.02, 0.03, 0.04, 0.05)
 SPEED_GRID_MPS = (0.1, 0.2, 0.3, 0.5, 0.7)
 HYSTERESIS_GRID_M = (0.0, 0.01)
 RIDGE_GRID = (0.0, 1e-4, 1e-3, 1e-2, 1e-1)
+S_CONTACT_GRID = (0.5, 0.65, 0.8, 0.9, 0.95)
 PHASES = ("total", "single_stance", "double_stance", "flight", "transition", "other")
 BODY_NAMES = ("calcn_l", "toes_l", "calcn_r", "toes_r")
 BODY_INDEX = {name: index for index, name in enumerate(BODY_NAMES)}
@@ -125,9 +126,11 @@ def hysteretic_contact(height: np.ndarray, speed: np.ndarray, height_cut: float,
     return last_on > last_break
 
 
-def estimated_point_contacts(data: dict[str, Any], a_params: dict[str, Any] | None = None) -> np.ndarray:
+def estimated_point_contacts(
+    data: dict[str, Any], a_params: dict[str, Any] | None = None, activation_threshold: float = 0.5
+) -> np.ndarray:
     if a_params is None:
-        return data["activation"].reshape(len(data["times"]), 4) > 0.5
+        return data["activation"].reshape(len(data["times"]), 4) > activation_threshold
     point_contact = np.zeros((len(data["times"]), 4), dtype=bool)
     for body_index in range(4):
         point_contact[:, body_index] = hysteretic_contact(
@@ -138,8 +141,10 @@ def estimated_point_contacts(data: dict[str, Any], a_params: dict[str, Any] | No
     return point_contact
 
 
-def estimated_contacts(data: dict[str, Any], a_params: dict[str, Any] | None = None) -> np.ndarray:
-    point_contact = estimated_point_contacts(data, a_params)
+def estimated_contacts(
+    data: dict[str, Any], a_params: dict[str, Any] | None = None, activation_threshold: float = 0.5
+) -> np.ndarray:
+    point_contact = estimated_point_contacts(data, a_params, activation_threshold)
     return np.column_stack([point_contact[:, :2].any(axis=1), point_contact[:, 2:].any(axis=1)])
 
 
@@ -241,7 +246,10 @@ def model_features(data: dict[str, Any], component: str, a_params: dict[str, Any
     raise ValueError(component)
 
 
-def fit_split_model(segments: list[dict[str, Any]], ridge: float, a_params: dict[str, Any] | None = None) -> np.ndarray:
+def fit_split_model(
+    segments: list[dict[str, Any]], ridge: float, a_params: dict[str, Any] | None = None,
+    activation_threshold: float = 0.5,
+) -> np.ndarray:
     features, targets = [], []
     for data in segments:
         measured_contact = data["true_contact"]
@@ -250,7 +258,7 @@ def fit_split_model(segments: list[dict[str, Any]], ridge: float, a_params: dict
         total = data["measured_force"][:, :, 2].sum(axis=1)
         share = np.divide(data["measured_force"][:, 0, 2], total,
                           out=np.full(len(total), np.nan), where=total > 1e-6)
-        features.append(split_features(data, estimated_contacts(data, a_params))[mask])
+        features.append(split_features(data, estimated_contacts(data, a_params, activation_threshold))[mask])
         targets.append(share[mask])
     return fit_ridge(features, targets, ridge)
 
@@ -335,14 +343,15 @@ def apply_variant(data: dict[str, Any], variant: str, params: dict[str, Any]) ->
                 body_force[:, start:start + 2, axis] = targets[:, side, axis, None] * shares
 
     if "S" in components:
-        split = predict_linear(split_features(data, contact), np.asarray(params["S_coefficients"]))
+        split_contact = estimated_contacts(data, activation_threshold=float(params["S_contact_threshold"]))
+        split = predict_linear(split_features(data, split_contact), np.asarray(params["S_coefficients"]))
         left_share = np.clip(split, 0.0, 1.0)
-        active_count = contact.sum(axis=1)
+        active_count = split_contact.sum(axis=1)
         total_z = np.maximum(np.nan_to_num(data["net_force"][:, 2]), 0.0)
         desired = np.zeros((len(contact), 2), dtype=float)
         double = active_count == 2
-        left_only = (active_count == 1) & contact[:, 0]
-        right_only = (active_count == 1) & contact[:, 1]
+        left_only = (active_count == 1) & split_contact[:, 0]
+        right_only = (active_count == 1) & split_contact[:, 1]
         desired[double, 0] = total_z[double] * left_share[double]
         desired[double, 1] = total_z[double] - desired[double, 0]
         desired[left_only, 0] = total_z[left_only]
@@ -625,17 +634,19 @@ def fit_variant_params(train_segments: list[dict[str, Any]], train_subjects: lis
     assert h_best is not None
     candidates["H"] = {**h_best[1], "training_J": h_best[0], "budget_configs": len(RIDGE_GRID)}
 
-    # S and P use five declared ridge settings; labels are measured only on training subjects.
+    # Five predeclared activation cutoffs gate only the estimated double-stance split.
     s_best: tuple[float, dict[str, Any]] | None = None
-    for ridge in RIDGE_GRID:
-        coeff = fit_split_model(train_segments, ridge)
-        params = {"S_coefficients": coeff.tolist(), "S_ridge": ridge}
+    for threshold in S_CONTACT_GRID:
+        coeff = fit_split_model(train_segments, 0.0, activation_threshold=threshold)
+        params = {"S_coefficients": coeff.tolist(), "S_ridge": 0.0,
+                  "S_contact_threshold": threshold}
         score = mean_training_objective(by_subject, "S", params, baseline, train_subjects)
         if s_best is None or score < s_best[0]:
             s_best = (score, params)
     assert s_best is not None
-    candidates["S"] = {**s_best[1], "training_J": s_best[0], "budget_configs": len(RIDGE_GRID)}
+    candidates["S"] = {**s_best[1], "training_J": s_best[0], "budget_configs": len(S_CONTACT_GRID)}
 
+    # P uses five declared ridge settings; labels are measured only on training subjects.
     p_best: tuple[float, dict[str, Any]] | None = None
     for ridge in RIDGE_GRID:
         coeff = fit_cop_model(train_segments, ridge)
@@ -647,13 +658,16 @@ def fit_variant_params(train_segments: list[dict[str, Any]], train_subjects: lis
     candidates["P"] = {**p_best[1], "training_J": p_best[0], "budget_configs": len(RIDGE_GRID)}
 
     s_ridge = float(candidates["S"]["S_ridge"])
+    s_threshold = float(candidates["S"]["S_contact_threshold"])
     p_params = candidates["P"]
     candidates["H+P"] = {"H_model": candidates["H"]["H_model"], "H_ridge": candidates["H"]["H_ridge"],
                          "P_coefficients": p_params["P_coefficients"], "P_ridge": p_params["P_ridge"]}
     candidates["S+P"] = {"S_coefficients": candidates["S"]["S_coefficients"], "S_ridge": s_ridge,
+                         "S_contact_threshold": s_threshold,
                          "P_coefficients": p_params["P_coefficients"], "P_ridge": p_params["P_ridge"]}
     candidates["H+S+P"] = {"H_model": candidates["H"]["H_model"], "H_ridge": candidates["H"]["H_ridge"],
                            "S_coefficients": candidates["S"]["S_coefficients"], "S_ridge": s_ridge,
+                           "S_contact_threshold": s_threshold,
                            "P_coefficients": p_params["P_coefficients"], "P_ridge": p_params["P_ridge"]}
     for name in ("H+P", "S+P", "H+S+P"):
         score = mean_training_objective(by_subject, name, candidates[name], baseline, train_subjects)
@@ -690,6 +704,9 @@ def parameter_rows(fold: str, variant: str, params: dict[str, Any]) -> list[dict
                                    "training_J": params.get("training_J"),
                                    "budget_configs": params.get("budget_configs")})
         if component == "S":
+            output.append({"fold": fold, "variant": variant, "parameter": "S.contact_threshold",
+                           "value": params["S_contact_threshold"], "training_J": params.get("training_J"),
+                           "budget_configs": params.get("budget_configs")})
             for index, value in enumerate(params["S_coefficients"]):
                 output.append({"fold": fold, "variant": variant, "parameter": f"S.coef_{index}",
                                "value": value, "training_J": params.get("training_J"),
@@ -832,7 +849,7 @@ def main() -> int:
     selected_variants = [variant for variant, score in ranking[:3] if math.isfinite(score)]
     summary = {
         "subjects": list(SUBJECTS), "segments": len(all_data), "budget": {
-            "H_configs_per_fold": len(RIDGE_GRID), "S_configs_per_fold": len(RIDGE_GRID),
+            "H_configs_per_fold": len(RIDGE_GRID), "S_configs_per_fold": len(S_CONTACT_GRID),
             "P_configs_per_fold": len(RIDGE_GRID), "combination_configs_per_fold": 3,
         },
         "variants": {variant: {"mean_loso_J": score, "fold_J": test_scores[variant]}

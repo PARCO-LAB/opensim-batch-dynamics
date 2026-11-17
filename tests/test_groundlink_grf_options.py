@@ -46,6 +46,15 @@ class GroundLinkGRFOptionTests(unittest.TestCase):
         np.testing.assert_array_equal(result["body_force"], data["body_force"])
         np.testing.assert_array_equal(result["body_point"], data["body_point"])
 
+    def test_vertical_split_leaves_estimated_single_stance_unchanged(self):
+        data = sample_data()
+        data["activation"][2:, 1, :] = 0.0
+        before = data["body_force"].copy()
+        params = {"S_coefficients": [0.5, 0.0, 0.0, 0.0], "S_contact_threshold": 0.5}
+        result = apply_variant(data, "S", params)
+        np.testing.assert_array_equal(result["body_force"][2:, :, 2], before[2:, :, 2])
+        np.testing.assert_allclose(result["foot_force"][:2, :, 2].sum(axis=1), 400.0)
+
     def test_horizontal_split_preserves_net_force(self):
         data = sample_data()
         width = horizontal_features(data).shape[1]
