@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 import os
 import shutil
@@ -303,6 +304,30 @@ def _contact_force_target_and_activation(
     return np.asarray(raw_force_target, dtype=np.float64).copy(), resolved, False
 
 
+def _horizontal_split_targets(
+    net_force_xy: np.ndarray, contact: np.ndarray, left_prediction: np.ndarray
+) -> np.ndarray:
+    """Return per-foot horizontal forces whose sum equals net force in contact."""
+    targets = np.zeros((len(contact), 2, 2), dtype=np.float64)
+    double = contact.all(axis=1)
+    targets[double, 0] = left_prediction[double]
+    targets[double, 1] = net_force_xy[double] - left_prediction[double]
+    left_only = contact[:, 0] & ~contact[:, 1]
+    right_only = contact[:, 1] & ~contact[:, 0]
+    targets[left_only, 0] = net_force_xy[left_only]
+    targets[right_only, 1] = net_force_xy[right_only]
+    return targets
+
+
+def _stance_progress(times: np.ndarray, contact: np.ndarray) -> np.ndarray:
+    progress = np.zeros(len(times), dtype=np.float64)
+    padded = np.r_[False, contact, False]
+    edges = np.flatnonzero(np.diff(padded.astype(np.int8)))
+    for start, end in zip(edges[0::2], edges[1::2]):
+        progress[start:end] = np.linspace(0.0, 1.0, end - start) if end - start > 1 else 0.5
+    return progress
+
+
 def _estimate_contact_wrenches_from_kinematics(
     model_path: Path,
     ik_mot_path: Path,
@@ -314,6 +339,7 @@ def _estimate_contact_wrenches_from_kinematics(
     contact_speed_threshold_mps: float,
     force_cutoff_hz: float | None,
     force_target_id_sto_path: Path | None = None,
+    horizontal_split_model_path: str | Path | None = None,
 ) -> tuple[Path, Path, Path]:
     """
     Estimate multi-body contact wrenches from kinematics and export OpenSim GRF artifacts.
@@ -332,6 +358,10 @@ def _estimate_contact_wrenches_from_kinematics(
             "nimblephysics is required to estimate GRF/contact wrenches from kinematics."
         ) from exc
 
+    horizontal_split_model = (
+        json.loads(Path(horizontal_split_model_path).read_text(encoding="utf-8"))
+        if horizontal_split_model_path is not None else None
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     grf_mot_path = output_dir / f"{trial_name}_grf_estimated.mot"
     external_loads_xml_path = output_dir / f"{trial_name}_external_forces_estimated.xml"
@@ -609,6 +639,56 @@ def _estimate_contact_wrenches_from_kinematics(
             if weights[body_idx] <= 0.0:
                 continue
             force_per_body[body_idx, frame_idx, :] = weights[body_idx] * force_target
+
+    if horizontal_split_model is not None:
+        body_index = {name: index for index, name in enumerate(selected_names)}
+        required = ("calcn_l", "toes_l", "calcn_r", "toes_r")
+        if any(name not in body_index for name in required):
+            raise ValueError("Horizontal split model requires calcn/toes contact bodies on both sides.")
+        group_index = {name: index for index, name in enumerate(group_keys)}
+        if "left_foot" not in group_index or "right_foot" not in group_index:
+            raise ValueError("Horizontal split model requires left and right foot contact groups.")
+        contact = np.column_stack([
+            group_activation[group_index[side + "_foot"]] > 0.5 for side in ("left", "right")
+        ])
+        feet = body_positions_filt[[body_index["calcn_l"], body_index["calcn_r"]]].transpose(1, 0, 2)
+        com_velocity = np.gradient(com_positions_filt[:, :2], timestamps, axis=0)
+        foot_velocity = np.gradient(feet[:, :, :2], timestamps, axis=0)
+        height = np.maximum(com_positions_filt[:, 2] - contact_ground_height, 0.1)
+        relative = (feet[:, :, :2] - com_positions_filt[:, None, :2]) / height[:, None, None]
+        relative_velocity = (foot_velocity - com_velocity[:, None, :]) / height[:, None, None]
+        foot_force = np.stack([
+            force_per_body[[body_index["calcn_l"], body_index["toes_l"]]].sum(axis=0),
+            force_per_body[[body_index["calcn_r"], body_index["toes_r"]]].sum(axis=0),
+        ], axis=1)
+        vertical = foot_force[:, :, 2] / (mass_kg * gravity_norm)
+        progress = np.column_stack([
+            _stance_progress(timestamps, group_activation[group_index[side + "_foot"]] > 0.05)
+            for side in ("left", "right")
+        ])
+        features = np.column_stack([
+            progress, contact.astype(float), vertical, relative.reshape(frames, -1),
+            relative_velocity.reshape(frames, -1), total_external_force[:, :2] / (mass_kg * gravity_norm)
+        ])
+        mean = np.asarray(horizontal_split_model["mean"], dtype=np.float64)
+        scale = np.asarray(horizontal_split_model["scale"], dtype=np.float64)
+        coefficients = np.asarray(horizontal_split_model["coefficients"], dtype=np.float64)
+        if features.shape[1] != len(mean) or len(scale) != len(mean) or coefficients.shape != (len(mean) + 1, 2):
+            raise ValueError("Horizontal split model feature dimensions do not match this estimator.")
+        left_prediction = np.column_stack([np.ones(frames), (features - mean) / scale]) @ coefficients
+        targets = _horizontal_split_targets(total_external_force[:, :2], contact, left_prediction)
+        for side, names in enumerate((("calcn_l", "toes_l"), ("calcn_r", "toes_r"))):
+            indices = [body_index[name] for name in names]
+            vertical_share = np.maximum(force_per_body[indices, :, 2].T, 0.0)
+            share_sum = vertical_share.sum(axis=1, keepdims=True)
+            fallback = np.linalg.norm(force_per_body[indices, :, :], axis=2).T
+            fallback_sum = fallback.sum(axis=1, keepdims=True)
+            shares = np.divide(vertical_share, share_sum, out=np.divide(
+                fallback, np.maximum(fallback_sum, 1e-12)), where=share_sum > 1e-9)
+            active = contact[:, side]
+            for axis in range(2):
+                force_per_body[indices, :, axis] = (targets[:, side, axis, None] * shares).T
+                force_per_body[indices, :, axis][:, ~active] = 0.0
 
     # Write a transparent per-frame debug CSV for inspection.
     with contact_wrench_csv_path.open("w", newline="", encoding="utf-8") as file_obj:
@@ -926,6 +1006,7 @@ def run_inverse_dynamics_with_estimated_grf(
     friction_coeff: float = 0.8,
     contact_height_threshold_m: float = 0.04,
     contact_speed_threshold_mps: float = 0.5,
+    horizontal_split_model_path: str | Path | None = None,
 ) -> tuple[Path, Path, float | None, Path, Path, Path]:
     """
     Run OpenSim ID using GRF/contact wrench estimated from kinematics.
@@ -977,6 +1058,7 @@ def run_inverse_dynamics_with_estimated_grf(
             contact_speed_threshold_mps=contact_speed_threshold_mps,
             force_cutoff_hz=effective_cutoff,
             force_target_id_sto_path=force_target_id_sto_path,
+            horizontal_split_model_path=horizontal_split_model_path,
         )
     )
 
@@ -1087,6 +1169,7 @@ def run_inverse_dynamics_and_export_torque_csv(
     friction_coeff: float = 0.8,
     contact_height_threshold_m: float = 0.04,
     contact_speed_threshold_mps: float = 0.5,
+    horizontal_split_model_path: str | Path | None = None,
 ) -> InverseDynamicsNoGrfSummary:
     """High-level helper: run ID (no GRF) and export DOF torque CSV."""
     model_path = Path(model_path).resolve()
@@ -1114,6 +1197,7 @@ def run_inverse_dynamics_and_export_torque_csv(
                     friction_coeff=friction_coeff,
                     contact_height_threshold_m=contact_height_threshold_m,
                     contact_speed_threshold_mps=contact_speed_threshold_mps,
+                    horizontal_split_model_path=horizontal_split_model_path,
                 )
             )
 
@@ -1204,6 +1288,7 @@ def run_inverse_dynamics_and_export_torque_csv(
             friction_coeff=friction_coeff,
             contact_height_threshold_m=contact_height_threshold_m,
             contact_speed_threshold_mps=contact_speed_threshold_mps,
+            horizontal_split_model_path=horizontal_split_model_path,
         )
     elif grf_mode_normalized in ("none", "no_grf"):
         id_setup_path, id_sto_path, effective_cutoff = run_inverse_dynamics_no_grf(
