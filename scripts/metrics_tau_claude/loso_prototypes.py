@@ -423,12 +423,16 @@ def apply_variant(data: dict[str, Any], variant: str, params: dict[str, Any]) ->
         design = np.column_stack([np.ones(len(features)),
                                   (features - np.asarray(model["mean"])) / np.asarray(model["scale"])])
         left_force = design @ np.asarray(model["coefficients"]) * data["bw_n"]
-        double = contact.all(axis=1)
+        force_contact = np.column_stack([
+            np.any(body_force[:, :2, :] != 0.0, axis=(1, 2)),
+            np.any(body_force[:, 2:, :] != 0.0, axis=(1, 2)),
+        ])
+        double = force_contact.all(axis=1)
         targets = np.zeros((len(contact), 2, 2), dtype=float)
         targets[double, 0] = left_force[double]
         targets[double, 1] = data["net_force"][double, :2] - left_force[double]
-        single_left = contact[:, 0] & ~contact[:, 1]
-        single_right = contact[:, 1] & ~contact[:, 0]
+        single_left = force_contact[:, 0] & ~force_contact[:, 1]
+        single_right = force_contact[:, 1] & ~force_contact[:, 0]
         targets[single_left, 0] = data["net_force"][single_left, :2]
         targets[single_right, 1] = data["net_force"][single_right, :2]
         for side in range(2):
@@ -447,8 +451,12 @@ def apply_variant(data: dict[str, Any], variant: str, params: dict[str, Any]) ->
         ], axis=2)
         predictions = design @ coefficients * data["bw_n"]
         predictions[:, 1, 1] *= -1.0
+        force_contact = np.column_stack([
+            np.any(body_force[:, :2, :] != 0.0, axis=(1, 2)),
+            np.any(body_force[:, 2:, :] != 0.0, axis=(1, 2)),
+        ])
         targets = _horizontal_symmetric_targets(
-            data["net_force"][:, :2], contact, predictions,
+            data["net_force"][:, :2], force_contact, predictions,
             np.stack([body_force[:, :2, 2].sum(axis=1), body_force[:, 2:, 2].sum(axis=1)], axis=1),
             model["residual_allocation"],
         )

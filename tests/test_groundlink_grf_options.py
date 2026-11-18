@@ -66,6 +66,34 @@ class GroundLinkGRFOptionTests(unittest.TestCase):
         np.testing.assert_allclose(result["foot_force"].sum(axis=1)[:, :2],
                                    data["net_force"][:, :2], atol=1e-12)
 
+    def test_soft_positive_activation_preserves_horizontal_net_force(self):
+        data = sample_data()
+        data["activation"][:] = 0.25
+        h_width = horizontal_features(data).shape[1]
+        hsym_width = horizontal_local_features(data).shape[2]
+        params_by_variant = {
+            "H": {"H_model": {
+                "mean": [0.0] * h_width, "scale": [1.0] * h_width,
+                "coefficients": [[0.0, 0.0]] * (h_width + 1),
+            }},
+            "Hsym": {"H_model": {
+                "architecture": "shared_per_foot_mirrored_y", "residual_allocation": "equal",
+                "mean": [0.0] * hsym_width, "scale": [1.0] * hsym_width,
+                "coefficients": [[0.0, 0.0]] * (hsym_width + 1),
+            }},
+        }
+        for variant, params in params_by_variant.items():
+            with self.subTest(variant=variant):
+                result = apply_variant(data, variant, params)
+                np.testing.assert_allclose(result["foot_force"].sum(axis=1)[:, :2],
+                                           data["net_force"][:, :2], atol=1e-12)
+
+        data["body_force"][:] = 0.0
+        for variant, params in params_by_variant.items():
+            with self.subTest(variant=variant, unsupported=True):
+                result = apply_variant(data, variant, params)
+                np.testing.assert_array_equal(result["foot_force"].sum(axis=1)[:, :2], 0.0)
+
     def test_hsym_mirrors_lateral_features_and_preserves_net_force(self):
         data = sample_data()
         data["body_positions"][:, 2:, 1] = 0.2

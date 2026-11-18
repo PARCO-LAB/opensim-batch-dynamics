@@ -718,6 +718,10 @@ def _estimate_contact_wrenches_from_kinematics(
         contact = np.column_stack([
             group_activation[group_index[side + "_foot"]] > 0.5 for side in ("left", "right")
         ])
+        force_contact = np.column_stack([
+            np.any(force_per_body[[body_index["calcn_l"], body_index["toes_l"]]] != 0.0, axis=(0, 2)),
+            np.any(force_per_body[[body_index["calcn_r"], body_index["toes_r"]]] != 0.0, axis=(0, 2)),
+        ])
         feet = body_positions_filt[[body_index["calcn_l"], body_index["calcn_r"]]].transpose(1, 0, 2)
         com_velocity = np.gradient(com_positions_filt[:, :2], timestamps, axis=0)
         foot_velocity = np.gradient(feet[:, :, :2], timestamps, axis=0)
@@ -757,7 +761,7 @@ def _estimate_contact_wrenches_from_kinematics(
             if architecture == "shared_per_foot_mirrored_y":
                 predictions[:, 1, 1] *= -1.0
             targets = _horizontal_symmetric_targets(
-                total_external_force[:, :2], contact, predictions, foot_force[:, :, 2],
+                total_external_force[:, :2], force_contact, predictions, foot_force[:, :, 2],
                 str(horizontal_split_model.get("residual_allocation", "equal")),
             )
         else:
@@ -768,7 +772,7 @@ def _estimate_contact_wrenches_from_kinematics(
             if features.shape[1] != len(mean) or len(scale) != len(mean) or coefficients.shape != (len(mean) + 1, 2):
                 raise ValueError("Horizontal split model feature dimensions do not match this estimator.")
             left_prediction = np.column_stack([np.ones(frames), (features - mean) / scale]) @ coefficients
-            targets = _horizontal_split_targets(total_external_force[:, :2], contact, left_prediction)
+            targets = _horizontal_split_targets(total_external_force[:, :2], force_contact, left_prediction)
         for side, names in enumerate((("calcn_l", "toes_l"), ("calcn_r", "toes_r"))):
             indices = [body_index[name] for name in names]
             vertical_share = np.maximum(force_per_body[indices, :, 2].T, 0.0)
@@ -777,7 +781,7 @@ def _estimate_contact_wrenches_from_kinematics(
             fallback_sum = fallback.sum(axis=1, keepdims=True)
             shares = np.divide(vertical_share, share_sum, out=np.divide(
                 fallback, np.maximum(fallback_sum, 1e-12)), where=share_sum > 1e-9)
-            active = contact[:, side]
+            active = force_contact[:, side]
             for axis in range(2):
                 force_per_body[indices, :, axis] = (targets[:, side, axis, None] * shares).T
                 force_per_body[indices, :, axis][:, ~active] = 0.0
