@@ -57,6 +57,8 @@ COMPONENTS = {
     "P": ("P",),
     "Pphase": ("Pphase",),
     "Hsym+Pphase": ("Hsym", "Pphase"),
+    "Pmix": ("Pmix",),
+    "Hsym+Pmix": ("Hsym", "Pmix"),
     "H+P": ("H", "P"),
     "H+S+P": ("H", "S", "P"),
     "A+S": ("A", "S"),
@@ -350,9 +352,10 @@ def fit_split_model(
 
 def fit_cop_model(
     segments: list[dict[str, Any]], ridge: float, stance_phase: str | None = None,
+    phase_features: bool = False,
 ) -> np.ndarray:
     features, targets = [], []
-    phase_features = stance_phase is not None
+    use_phase_features = phase_features or stance_phase is not None
     if stance_phase not in (None, "single_stance", "double_stance"):
         raise ValueError(f"Unsupported CoP training phase: {stance_phase}")
     for data in segments:
@@ -370,7 +373,7 @@ def fit_cop_model(
             if stance_phase is not None:
                 required_contacts = 1 if stance_phase == "single_stance" else 2
                 mask &= contact_count == required_contacts
-            feature_array = cop_phase_features(data) if phase_features else data["cop_features"]
+            feature_array = cop_phase_features(data) if use_phase_features else data["cop_features"]
             features.append(feature_array[:, side, :][mask])
             targets.append(progress[mask])
     return fit_ridge(features, targets, ridge)
@@ -499,10 +502,15 @@ def apply_variant(data: dict[str, Any], variant: str, params: dict[str, Any]) ->
             start = 0 if side == 0 else 2
             body_point[:, start:start + 2, :] = point[:, None, :]
 
-    if "Pphase" in components:
+    for phase_variant in ("Pphase", "Pmix"):
+        if phase_variant not in components:
+            continue
         contact = estimated_contacts(data)
         features = cop_phase_features(data)
-        coefficients = {name: np.asarray(value) for name, value in params["Pphase_coefficients"].items()}
+        coefficients = {
+            name: np.asarray(value)
+            for name, value in params[f"{phase_variant}_coefficients"].items()
+        }
         for side in range(2):
             progress = _phase_cop_progress(features[:, side, :], contact, coefficients)
             active = contact[:, side] & np.isfinite(progress)
@@ -873,6 +881,25 @@ def fit_variant_params(train_segments: list[dict[str, Any]], train_subjects: lis
     assert pphase_best is not None
     candidates["Pphase"] = {**pphase_best[1], "training_J": pphase_best[0], "budget_configs": 25}
 
+    # Pmix pools measured single- and double-stance targets for the single model.
+    pmix_single = {ridge: fit_cop_model(train_segments, ridge, phase_features=True)
+                   for ridge in RIDGE_GRID}
+    pmix_best: tuple[float, dict[str, Any]] | None = None
+    for single_ridge in RIDGE_GRID:
+        for double_ridge in RIDGE_GRID:
+            params = {
+                "Pmix_coefficients": {
+                    "single_stance": pmix_single[single_ridge].tolist(),
+                    "double_stance": phase_models["double_stance"][double_ridge].tolist(),
+                },
+                "Pmix_ridges": {"single_stance": single_ridge, "double_stance": double_ridge},
+            }
+            score = mean_training_objective(by_subject, "Pmix", params, baseline, train_subjects)
+            if pmix_best is None or score < pmix_best[0]:
+                pmix_best = (score, params)
+    assert pmix_best is not None
+    candidates["Pmix"] = {**pmix_best[1], "training_J": pmix_best[0], "budget_configs": 25}
+
     # Declared Hsym search: 5 ridge values × 2 residual-allocation rules per fold.
     hsym_best: tuple[float, dict[str, Any]] | None = None
     for ridge in RIDGE_GRID:
@@ -905,7 +932,12 @@ def fit_variant_params(train_segments: list[dict[str, Any]], train_subjects: lis
         "Pphase_coefficients": candidates["Pphase"]["Pphase_coefficients"],
         "Pphase_ridges": candidates["Pphase"]["Pphase_ridges"],
     }
-    for name in ("H+P", "S+P", "H+S+P", "Hsym+P", "Hsym+Pphase"):
+    candidates["Hsym+Pmix"] = {
+        "H_model": candidates["Hsym"]["H_model"], "H_ridge": candidates["Hsym"]["H_ridge"],
+        "Pmix_coefficients": candidates["Pmix"]["Pmix_coefficients"],
+        "Pmix_ridges": candidates["Pmix"]["Pmix_ridges"],
+    }
+    for name in ("H+P", "S+P", "H+S+P", "Hsym+P", "Hsym+Pphase", "Hsym+Pmix"):
         score = mean_training_objective(by_subject, name, candidates[name], baseline, train_subjects)
         candidates[name]["training_J"] = score
         candidates[name]["budget_configs"] = 1
@@ -970,16 +1002,16 @@ def parameter_rows(fold: str, variant: str, params: dict[str, Any]) -> list[dict
             output.append({"fold": fold, "variant": variant, "parameter": "S.ridge",
                            "value": params["S_ridge"], "training_J": params.get("training_J"),
                            "budget_configs": params.get("budget_configs")})
-        if component == "Pphase":
-            for phase, coefficients in params["Pphase_coefficients"].items():
+        if component in ("Pphase", "Pmix"):
+            for phase, coefficients in params[f"{component}_coefficients"].items():
                 output.append({"fold": fold, "variant": variant,
-                               "parameter": f"Pphase.{phase}.ridge",
-                               "value": params["Pphase_ridges"][phase],
+                               "parameter": f"{component}.{phase}.ridge",
+                               "value": params[f"{component}_ridges"][phase],
                                "training_J": params.get("training_J"),
                                "budget_configs": params.get("budget_configs")})
                 for index, value in enumerate(coefficients):
                     output.append({"fold": fold, "variant": variant,
-                                   "parameter": f"Pphase.{phase}.coef_{index}", "value": value,
+                                   "parameter": f"{component}.{phase}.coef_{index}", "value": value,
                                    "training_J": params.get("training_J"),
                                    "budget_configs": params.get("budget_configs")})
         if component == "P":
@@ -1132,7 +1164,8 @@ def main() -> int:
             "H_configs_per_fold": len(RIDGE_GRID), "Hsym_configs_per_fold": len(RIDGE_GRID) * 2,
             "S_configs_per_fold": len(S_CONTACT_GRID), "P_configs_per_fold": len(RIDGE_GRID),
             "Pphase_configs_per_fold": len(RIDGE_GRID) ** 2,
-            "combination_configs_per_fold": 5,
+            "Pmix_configs_per_fold": len(RIDGE_GRID) ** 2,
+            "combination_configs_per_fold": 6,
         },
         "variants": {variant: {"mean_loso_J": score, "fold_J": test_scores[variant]}
                      for variant, score in ranking},
@@ -1159,6 +1192,24 @@ def main() -> int:
         "ridges": pphase_ridges,
         "coefficients_by_phase": pphase_model,
     }, indent=2) + "\n", encoding="utf-8")
+    pmix_ridges = {
+        phase: Counter(all_fold_params[subject]["Pmix"]["Pmix_ridges"][phase]
+                       for subject in SUBJECTS).most_common(1)[0][0]
+        for phase in ("single_stance", "double_stance")
+    }
+    pmix_model = {
+        "single_stance": fit_cop_model(all_data, pmix_ridges["single_stance"], phase_features=True).tolist(),
+        "double_stance": fit_cop_model(all_data, pmix_ridges["double_stance"], "double_stance").tolist(),
+    }
+    pmix_path = model_dir / "groundlink_pmix_all_subjects.json"
+    pmix_path.write_text(json.dumps({
+        "schema_version": 1,
+        "feature_schema": "estimated_contact_binary_v1",
+        "single_stance_fit": "all_measured_contact_stance_targets",
+        "ridge_selection": "modal_LOSO_training_fold",
+        "ridges": pmix_ridges,
+        "coefficients_by_phase": pmix_model,
+    }, indent=2) + "\n", encoding="utf-8")
     hsym_models = [all_fold_params[subject]["Hsym"] for subject in SUBJECTS]
     hsym_ridge = Counter(params["H_ridge"] for params in hsym_models).most_common(1)[0][0]
     hsym_allocation = Counter(params["H_model"]["residual_allocation"]
@@ -1167,7 +1218,7 @@ def main() -> int:
     hsym_path = model_dir / "groundlink_hsym_all_subjects.json"
     hsym_path.write_text(json.dumps(hsym_model, indent=2) + "\n", encoding="utf-8")
     summary["model_exports"] = {
-        "Hsym": str(hsym_path), "Pphase": str(pphase_path),
+        "Hsym": str(hsym_path), "Pphase": str(pphase_path), "Pmix": str(pmix_path),
         "selection": "modal hyperparameters across LOSO training folds; coefficients refit on all subjects",
     }
     (phase_c / "selection.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

@@ -145,6 +145,18 @@ class GroundLinkGRFOptionTests(unittest.TestCase):
         # Flight frame keeps its default application points.
         np.testing.assert_array_equal(result["body_point"][2], data["body_point"][2])
 
+    def test_pmix_reuses_phase_schema_with_estimated_contacts(self):
+        data = sample_data()
+        data["activation"][1, 1, :] = 0.0
+        data["activation"][2, :, :] = 0.0
+        params = {"Pmix_coefficients": {
+            "single_stance": [0.0] * 5, "double_stance": [1.0, 0.0, 0.0, 0.0, 0.0],
+        }}
+        result = apply_variant(data, "Pmix", params)
+        np.testing.assert_allclose(result["body_point"][0, 0, 0], 0.1)
+        np.testing.assert_allclose(result["body_point"][1, 0, 0], -0.1)
+        np.testing.assert_array_equal(result["body_point"][2], data["body_point"][2])
+
     def test_cop_progress_uses_kinematics_only(self):
         heel = np.zeros((2, 3))
         toes = np.tile([1.0, 0.0, 0.0], (2, 1))
