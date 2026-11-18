@@ -31,6 +31,7 @@ from diagnose_modes import (
     read_storage,
     stance_progress,
 )
+from opensim_batch_dynamics.inverse_dynamics_no_grf import _horizontal_symmetric_targets
 from groundlink import (
     DEFAULT_SOURCE_FORCE_ROOT,
     DEFAULT_SOURCE_TORQUE_ROOT,
@@ -47,6 +48,8 @@ COMPONENTS = {
     "BASELINE": (),
     "A": ("A",),
     "H": ("H",),
+    "Hsym": ("Hsym",),
+    "Hsym+P": ("Hsym", "P"),
     "S": ("S",),
     "P": ("P",),
     "H+P": ("H", "P"),
@@ -215,6 +218,68 @@ def horizontal_features(data: dict[str, Any]) -> np.ndarray:
     return data["_horizontal_features"]
 
 
+def horizontal_local_features(data: dict[str, Any]) -> np.ndarray:
+    if "_horizontal_local_features" in data:
+        return data["_horizontal_local_features"]
+    times, body, com = data["times"], data["body_positions"], data["com"]
+    feet = body[:, [BODY_INDEX["calcn_l"], BODY_INDEX["calcn_r"]]]
+    height = np.maximum(com[:, 2] - data["floor_height"], 0.1)
+    com_velocity = np.gradient(com[:, :2], times, axis=0)
+    foot_velocity = np.gradient(feet[:, :, :2], times, axis=0)
+    relative = (feet[:, :, :2] - com[:, None, :2]) / height[:, None, None]
+    relative_velocity = (foot_velocity - com_velocity[:, None, :]) / height[:, None, None]
+    # Reflect the right foot's mediolateral coordinate into the left-foot frame.
+    mirror = np.array([1.0, -1.0])[None, :, None]
+    relative *= mirror
+    relative_velocity *= mirror
+    vertical = np.stack([
+        data["body_force"][:, :2, 2].sum(axis=1),
+        data["body_force"][:, 2:, 2].sum(axis=1),
+    ], axis=1) / data["bw_n"]
+    contact = estimated_contacts(data).astype(float)
+    progress = np.column_stack([
+        np.nan_to_num(stance_progress(times, data["base_contact"][:, side]), nan=0.0)
+        for side in range(2)
+    ])
+    net = np.broadcast_to(data["net_force"][:, None, :2] / data["bw_n"], (len(times), 2, 2)).copy()
+    net[:, 1, 1] *= -1.0
+    data["_horizontal_local_features"] = np.concatenate([
+        progress[:, :, None], contact[:, :, None], vertical[:, :, None],
+        relative, relative_velocity, net,
+    ], axis=2)
+    return data["_horizontal_local_features"]
+
+
+def fit_horizontal_symmetric_model(
+    segments: list[dict[str, Any]], ridge: float, residual_allocation: str,
+) -> dict[str, Any]:
+    features, targets = [], []
+    for data in segments:
+        mask = data["valid_target"] & data["force_valid"] & data["true_contact"].all(axis=1)
+        local = horizontal_local_features(data)
+        for side in range(2):
+            features.append(local[mask, side])
+            target = data["measured_force"][mask, side, :2] / data["bw_n"]
+            if side == 1:
+                target = target.copy()
+                target[:, 1] *= -1.0
+            targets.append(target)
+    x, y = np.concatenate(features), np.concatenate(targets)
+    finite = np.isfinite(x).all(axis=1) & np.isfinite(y).all(axis=1)
+    x, y = x[finite], y[finite]
+    mean, scale = x.mean(axis=0), x.std(axis=0)
+    scale[scale < 1e-8] = 1.0
+    design = np.column_stack([np.ones(len(x)), (x - mean) / scale])
+    penalty = np.eye(design.shape[1]) * ridge
+    penalty[0, 0] = 0.0
+    coefficients = (np.linalg.lstsq(design, y, rcond=None)[0] if ridge <= 0
+                    else np.linalg.solve(design.T @ design + penalty, design.T @ y))
+    return {
+        "architecture": "shared_per_foot_mirrored_y", "residual_allocation": residual_allocation,
+        "mean": mean.tolist(), "scale": scale.tolist(), "coefficients": coefficients.tolist(),
+    }
+
+
 def fit_horizontal_model(segments: list[dict[str, Any]], ridge: float) -> dict[str, Any]:
     features, targets = [], []
     for data in segments:
@@ -336,6 +401,27 @@ def apply_variant(data: dict[str, Any], variant: str, params: dict[str, Any]) ->
         single_right = contact[:, 1] & ~contact[:, 0]
         targets[single_left, 0] = data["net_force"][single_left, :2]
         targets[single_right, 1] = data["net_force"][single_right, :2]
+        for side in range(2):
+            start = 0 if side == 0 else 2
+            shares = body_shares(body_force, side)
+            for axis in range(2):
+                body_force[:, start:start + 2, axis] = targets[:, side, axis, None] * shares
+
+    if "Hsym" in components:
+        model = params["H_model"]
+        local = horizontal_local_features(data)
+        mean, scale = np.asarray(model["mean"]), np.asarray(model["scale"])
+        coefficients = np.asarray(model["coefficients"])
+        design = np.concatenate([
+            np.ones((*local.shape[:2], 1)), (local - mean) / scale,
+        ], axis=2)
+        predictions = design @ coefficients * data["bw_n"]
+        predictions[:, 1, 1] *= -1.0
+        targets = _horizontal_symmetric_targets(
+            data["net_force"][:, :2], contact, predictions,
+            np.stack([body_force[:, :2, 2].sum(axis=1), body_force[:, 2:, 2].sum(axis=1)], axis=1),
+            model["residual_allocation"],
+        )
         for side in range(2):
             start = 0 if side == 0 else 2
             shares = body_shares(body_force, side)
@@ -486,6 +572,43 @@ def objective(metrics: dict[str, float], baseline: dict[str, float]) -> float:
     return float(np.mean(ratios)) if ratios else math.nan
 
 
+def laterality_diagnostics(
+    segments: list[dict[str, Any]], fold: str, variant: str, params: dict[str, Any],
+) -> list[dict[str, Any]]:
+    errors: dict[tuple[int, int], list[float]] = defaultdict(list)
+    measured_means: dict[tuple[int, int], list[float]] = defaultdict(list)
+    estimated_means: dict[tuple[int, int], list[float]] = defaultdict(list)
+    for data in segments:
+        candidate = apply_variant(data, variant, params)
+        for side in range(2):
+            mask = data["valid_target"] & data["force_valid"] & data["true_contact"][:, side]
+            for axis in range(2):
+                selected = mask & np.isfinite(candidate["foot_force"][:, side, axis])
+                if not selected.any():
+                    continue
+                key = (side, axis)
+                measured = data["measured_force"][selected, side, axis] / data["bw_n"]
+                estimated = candidate["foot_force"][selected, side, axis] / data["bw_n"]
+                errors[key].extend((estimated - measured).tolist())
+                measured_means[key].extend(measured.tolist())
+                estimated_means[key].extend(estimated.tolist())
+    rows = []
+    for side in range(2):
+        for axis in range(2):
+            key = (side, axis)
+            error = np.asarray(errors[key], dtype=float)
+            measured = np.asarray(measured_means[key], dtype=float)
+            estimated = np.asarray(estimated_means[key], dtype=float)
+            rows.append({
+                "fold": fold, "variant": variant, "side": ("left", "right")[side],
+                "axis": ("global_x", "global_y")[axis], "n": int(len(error)),
+                "rmse_bw": float(np.sqrt(np.mean(error * error))) if len(error) else math.nan,
+                "measured_mean_bw": float(np.mean(measured)) if len(measured) else math.nan,
+                "estimated_mean_bw": float(np.mean(estimated)) if len(estimated) else math.nan,
+            })
+    return rows
+
+
 def subject_segments(all_data: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for data in all_data:
@@ -622,6 +745,25 @@ def load_segment(cache_row: dict[str, str], args: argparse.Namespace, eval_confi
     }
 
 
+def mean_training_horizontal_rmse(
+    by_subject: dict[str, list[dict[str, Any]]], params: dict[str, Any], subjects: list[str],
+) -> float:
+    scores = []
+    for subject in subjects:
+        squared_errors = []
+        for data in by_subject.get(subject, []):
+            candidate = apply_variant(data, "Hsym", params)
+            for side in range(2):
+                mask = data["valid_target"] & data["force_valid"] & data["true_contact"][:, side]
+                error = (candidate["foot_force"][mask, side, :2]
+                         - data["measured_force"][mask, side, :2]) / data["bw_n"]
+                if len(error):
+                    squared_errors.extend(np.sum(error * error, axis=1).tolist())
+        if squared_errors:
+            scores.append(float(np.sqrt(np.mean(squared_errors))))
+    return float(np.mean(scores)) if scores else math.inf
+
+
 def fit_variant_params(train_segments: list[dict[str, Any]], train_subjects: list[str], by_subject: dict[str, list[dict[str, Any]]], baseline: dict[str, dict[str, float]], selected: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     candidates: dict[str, dict[str, Any]] = {"BASELINE": {}}
 
@@ -657,6 +799,19 @@ def fit_variant_params(train_segments: list[dict[str, Any]], train_subjects: lis
     assert p_best is not None
     candidates["P"] = {**p_best[1], "training_J": p_best[0], "budget_configs": len(RIDGE_GRID)}
 
+    # Declared Hsym search: 5 ridge values × 2 residual-allocation rules per fold.
+    hsym_best: tuple[float, dict[str, Any]] | None = None
+    for ridge in RIDGE_GRID:
+        for allocation in ("equal", "vertical"):
+            model = fit_horizontal_symmetric_model(train_segments, ridge, allocation)
+            params = {"H_model": model, "H_ridge": ridge}
+            score = mean_training_horizontal_rmse(by_subject, params, train_subjects)
+            if hsym_best is None or score < hsym_best[0]:
+                hsym_best = (score, params)
+    assert hsym_best is not None
+    candidates["Hsym"] = {**hsym_best[1], "training_horizontal_rmse": hsym_best[0],
+                          "budget_configs": len(RIDGE_GRID) * 2}
+
     s_ridge = float(candidates["S"]["S_ridge"])
     s_threshold = float(candidates["S"]["S_contact_threshold"])
     p_params = candidates["P"]
@@ -669,7 +824,9 @@ def fit_variant_params(train_segments: list[dict[str, Any]], train_subjects: lis
                            "S_coefficients": candidates["S"]["S_coefficients"], "S_ridge": s_ridge,
                            "S_contact_threshold": s_threshold,
                            "P_coefficients": p_params["P_coefficients"], "P_ridge": p_params["P_ridge"]}
-    for name in ("H+P", "S+P", "H+S+P"):
+    candidates["Hsym+P"] = {"H_model": candidates["Hsym"]["H_model"], "H_ridge": candidates["Hsym"]["H_ridge"],
+                             "P_coefficients": p_params["P_coefficients"], "P_ridge": p_params["P_ridge"]}
+    for name in ("H+P", "S+P", "H+S+P", "Hsym+P"):
         score = mean_training_objective(by_subject, name, candidates[name], baseline, train_subjects)
         candidates[name]["training_J"] = score
         candidates[name]["budget_configs"] = 1
@@ -687,6 +844,26 @@ def parameter_rows(fold: str, variant: str, params: dict[str, Any]) -> list[dict
                 output.append({"fold": fold, "variant": variant, "parameter": f"A.{key}",
                                "value": value, "training_J": params.get("training_J"),
                                "budget_configs": params.get("budget_configs")})
+        if component == "Hsym":
+            output.append({"fold": fold, "variant": variant, "parameter": "Hsym.ridge",
+                           "value": params["H_ridge"], "training_J": params.get("training_J"),
+                           "budget_configs": params.get("budget_configs")})
+            output.append({"fold": fold, "variant": variant, "parameter": "Hsym.residual_allocation",
+                           "value": params["H_model"]["residual_allocation"],
+                           "training_J": params.get("training_J"),
+                           "budget_configs": params.get("budget_configs")})
+            for name in ("mean", "scale"):
+                for index, value in enumerate(params["H_model"][name]):
+                    output.append({"fold": fold, "variant": variant,
+                                   "parameter": f"Hsym.{name}_{index}", "value": value,
+                                   "training_J": params.get("training_J"),
+                                   "budget_configs": params.get("budget_configs")})
+            for index, pair in enumerate(params["H_model"]["coefficients"]):
+                for axis, value in zip(("x", "y"), pair):
+                    output.append({"fold": fold, "variant": variant,
+                                   "parameter": f"Hsym.coef_{index}_{axis}", "value": value,
+                                   "training_J": params.get("training_J"),
+                                   "budget_configs": params.get("budget_configs")})
         if component == "H":
             output.append({"fold": fold, "variant": variant, "parameter": "H.ridge",
                            "value": params["H_ridge"], "training_J": params.get("training_J"),
@@ -778,6 +955,7 @@ def main() -> int:
     parser.add_argument("--source-force-root", default=DEFAULT_SOURCE_FORCE_ROOT)
     parser.add_argument("--study-root", type=Path, required=True)
     parser.add_argument("--cache-subdir", default="kinematics_cache_h2_unwrapped")
+    parser.add_argument("--phase-d-variants", help="Comma-separated variants to prepare for held-out ID")
     args = parser.parse_args()
 
     eval_config = EvaluationConfig(
@@ -814,6 +992,7 @@ def main() -> int:
     params_rows: list[dict[str, Any]] = []
     all_fold_params: dict[str, dict[str, dict[str, Any]]] = {}
     test_scores: dict[str, list[float]] = defaultdict(list)
+    laterality_rows: list[dict[str, Any]] = []
     for heldout in SUBJECTS:
         train_subjects = [subject for subject in SUBJECTS if subject != heldout]
         train_segments = [data for data in all_data if data["subject"] in train_subjects]
@@ -821,6 +1000,10 @@ def main() -> int:
         chosen["BASELINE"] = {"training_J": 1.0, "budget_configs": 1}
         all_fold_params[heldout] = chosen
         test_segments = by_subject[heldout]
+        for variant in ("BASELINE", "H+P"):
+            laterality_rows.extend(laterality_diagnostics(
+                test_segments, heldout, variant, chosen.get(variant, {}),
+            ))
         for variant, params in chosen.items():
             params_rows.extend(parameter_rows(heldout, variant, params))
             for phase_name in PHASES:
@@ -842,15 +1025,22 @@ def main() -> int:
     phase_c.mkdir(parents=True, exist_ok=True)
     write_csv(phase_c / "ablation.csv", ablation_rows)
     write_csv(phase_c / "loso_params.csv", params_rows)
+    write_csv(phase_c / "laterality.csv", laterality_rows)
     ranking = sorted(
         ((variant, float(np.nanmean(scores))) for variant, scores in test_scores.items() if variant != "BASELINE"),
         key=lambda item: item[1],
     )
-    selected_variants = [variant for variant, score in ranking[:3] if math.isfinite(score)]
+    selected_variants = ([name.strip() for name in args.phase_d_variants.split(",") if name.strip()]
+                         if args.phase_d_variants else
+                         [variant for variant, score in ranking[:3] if math.isfinite(score)])
+    unknown = set(selected_variants) - set(COMPONENTS)
+    if unknown:
+        raise ValueError(f"Unknown Phase D variants: {sorted(unknown)}")
     summary = {
         "subjects": list(SUBJECTS), "segments": len(all_data), "budget": {
-            "H_configs_per_fold": len(RIDGE_GRID), "S_configs_per_fold": len(S_CONTACT_GRID),
-            "P_configs_per_fold": len(RIDGE_GRID), "combination_configs_per_fold": 3,
+            "H_configs_per_fold": len(RIDGE_GRID), "Hsym_configs_per_fold": len(RIDGE_GRID) * 2,
+            "S_configs_per_fold": len(S_CONTACT_GRID), "P_configs_per_fold": len(RIDGE_GRID),
+            "combination_configs_per_fold": 4,
         },
         "variants": {variant: {"mean_loso_J": score, "fold_J": test_scores[variant]}
                      for variant, score in ranking},

@@ -319,6 +319,32 @@ def _horizontal_split_targets(
     return targets
 
 
+def _horizontal_symmetric_targets(
+    net_force_xy: np.ndarray,
+    contact: np.ndarray,
+    predictions: np.ndarray,
+    vertical_force: np.ndarray,
+    residual_allocation: str = "equal",
+) -> np.ndarray:
+    """Project shared per-foot predictions onto the exact net-force constraint."""
+    targets = np.zeros_like(predictions, dtype=np.float64)
+    double = contact.all(axis=1)
+    if residual_allocation == "equal":
+        weights = np.full((len(contact), 2), 0.5)
+    elif residual_allocation == "vertical":
+        vertical = np.maximum(vertical_force, 0.0)
+        total = vertical.sum(axis=1, keepdims=True)
+        weights = np.divide(vertical, total, out=np.full_like(vertical, 0.5), where=total > 1e-9)
+    else:
+        raise ValueError(f"Unknown horizontal residual allocation: {residual_allocation}")
+    residual = net_force_xy - predictions.sum(axis=1)
+    targets[double] = predictions[double] + weights[double, :, None] * residual[double, None, :]
+    for side in range(2):
+        single = contact[:, side] & ~contact[:, 1 - side]
+        targets[single, side] = net_force_xy[single]
+    return targets
+
+
 def _cop_progress_points(
     heel: np.ndarray, toes: np.ndarray, features: np.ndarray, coefficients: np.ndarray
 ) -> np.ndarray:
@@ -680,17 +706,42 @@ def _estimate_contact_wrenches_from_kinematics(
             _stance_progress(timestamps, group_activation[group_index[side + "_foot"]] > 0.05)
             for side in ("left", "right")
         ])
-        features = np.column_stack([
-            progress, contact.astype(float), vertical, relative.reshape(frames, -1),
-            relative_velocity.reshape(frames, -1), total_external_force[:, :2] / (mass_kg * gravity_norm)
-        ])
+        architecture = horizontal_split_model.get("architecture", "left_global")
         mean = np.asarray(horizontal_split_model["mean"], dtype=np.float64)
         scale = np.asarray(horizontal_split_model["scale"], dtype=np.float64)
         coefficients = np.asarray(horizontal_split_model["coefficients"], dtype=np.float64)
-        if features.shape[1] != len(mean) or len(scale) != len(mean) or coefficients.shape != (len(mean) + 1, 2):
-            raise ValueError("Horizontal split model feature dimensions do not match this estimator.")
-        left_prediction = np.column_stack([np.ones(frames), (features - mean) / scale]) @ coefficients
-        targets = _horizontal_split_targets(total_external_force[:, :2], contact, left_prediction)
+        if architecture in ("shared_per_foot", "shared_per_foot_mirrored_y"):
+            local_features = np.stack([
+                np.column_stack([
+                    progress[:, side], contact[:, side], vertical[:, side], relative[:, side],
+                    relative_velocity[:, side], total_external_force[:, :2] / (mass_kg * gravity_norm),
+                ]) for side in range(2)
+            ], axis=1)
+            if local_features.shape[2] != len(mean) or len(scale) != len(mean) or coefficients.shape != (len(mean) + 1, 2):
+                raise ValueError("Shared horizontal model feature dimensions do not match this estimator.")
+            if architecture == "shared_per_foot_mirrored_y":
+                mirror = np.array([1.0, -1.0])
+                local_features[:, :, 3:5] *= mirror
+                local_features[:, :, 5:7] *= mirror
+                local_features[:, 1, 8] *= -1.0
+            normalized = (local_features - mean) / scale
+            design = np.concatenate([np.ones((frames, 2, 1)), normalized], axis=2)
+            predictions = design @ coefficients
+            if architecture == "shared_per_foot_mirrored_y":
+                predictions[:, 1, 1] *= -1.0
+            targets = _horizontal_symmetric_targets(
+                total_external_force[:, :2], contact, predictions, foot_force[:, :, 2],
+                str(horizontal_split_model.get("residual_allocation", "equal")),
+            )
+        else:
+            features = np.column_stack([
+                progress, contact.astype(float), vertical, relative.reshape(frames, -1),
+                relative_velocity.reshape(frames, -1), total_external_force[:, :2] / (mass_kg * gravity_norm)
+            ])
+            if features.shape[1] != len(mean) or len(scale) != len(mean) or coefficients.shape != (len(mean) + 1, 2):
+                raise ValueError("Horizontal split model feature dimensions do not match this estimator.")
+            left_prediction = np.column_stack([np.ones(frames), (features - mean) / scale]) @ coefficients
+            targets = _horizontal_split_targets(total_external_force[:, :2], contact, left_prediction)
         for side, names in enumerate((("calcn_l", "toes_l"), ("calcn_r", "toes_r"))):
             indices = [body_index[name] for name in names]
             vertical_share = np.maximum(force_per_body[indices, :, 2].T, 0.0)

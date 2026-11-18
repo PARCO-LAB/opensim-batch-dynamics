@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "scripts" / "metrics_tau_claude"))
-from loso_prototypes import apply_variant, horizontal_features
+from loso_prototypes import apply_variant, horizontal_features, horizontal_local_features
 from opensim_batch_dynamics.inverse_dynamics_no_grf import (
     _cop_progress_points,
     _horizontal_split_targets,
@@ -61,6 +61,25 @@ class GroundLinkGRFOptionTests(unittest.TestCase):
         params = {"H_model": {"mean": [0.0] * width, "scale": [1.0] * width,
                               "coefficients": [[0.0, 0.0]] * (width + 1)}}
         result = apply_variant(data, "H", params)
+        np.testing.assert_allclose(result["foot_force"].sum(axis=1)[:, :2],
+                                   data["net_force"][:, :2], atol=1e-12)
+
+    def test_hsym_mirrors_lateral_features_and_preserves_net_force(self):
+        data = sample_data()
+        data["body_positions"][:, 2:, 1] = 0.2
+        local = horizontal_local_features(data)
+        expected_right_ml = -(0.2 - data["com"][0, 1]) / data["com"][0, 2]
+        np.testing.assert_allclose(local[:, 1, 4], expected_right_ml)
+        np.testing.assert_allclose(local[:, 1, 8], -data["net_force"][:, 1] / data["bw_n"])
+
+        params = {"H_model": {
+            "architecture": "shared_per_foot_mirrored_y",
+            "residual_allocation": "equal",
+            "mean": [0.0] * 9,
+            "scale": [1.0] * 9,
+            "coefficients": [[0.0, 0.0]] * 10,
+        }}
+        result = apply_variant(data, "Hsym", params)
         np.testing.assert_allclose(result["foot_force"].sum(axis=1)[:, :2],
                                    data["net_force"][:, :2], atol=1e-12)
 
