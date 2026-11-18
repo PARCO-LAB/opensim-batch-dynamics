@@ -12,7 +12,7 @@ import csv
 import json
 import math
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +31,10 @@ from diagnose_modes import (
     read_storage,
     stance_progress,
 )
-from opensim_batch_dynamics.inverse_dynamics_no_grf import _horizontal_symmetric_targets
+from opensim_batch_dynamics.inverse_dynamics_no_grf import (
+    _horizontal_symmetric_targets,
+    _phase_cop_progress,
+)
 from groundlink import (
     DEFAULT_SOURCE_FORCE_ROOT,
     DEFAULT_SOURCE_TORQUE_ROOT,
@@ -52,6 +55,8 @@ COMPONENTS = {
     "Hsym+P": ("Hsym", "P"),
     "S": ("S",),
     "P": ("P",),
+    "Pphase": ("Pphase",),
+    "Hsym+Pphase": ("Hsym", "Pphase"),
     "H+P": ("H", "P"),
     "H+S+P": ("H", "S", "P"),
     "A+S": ("A", "S"),
@@ -194,6 +199,19 @@ def cop_features(data: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
     return np.stack(result, axis=1), np.stack([incline_l, incline_r], axis=1)
 
 
+def cop_phase_features(data: dict[str, Any]) -> np.ndarray:
+    """CoP features aligned to the production phase-model schema."""
+    contact = estimated_contacts(data)
+    progress = np.column_stack([
+        np.nan_to_num(stance_progress(data["times"], contact[:, side]), nan=0.0)
+        for side in range(2)
+    ])
+    cop, _ = cop_features(data)
+    incline = cop[:, :, 1]
+    active = contact.astype(float)
+    return np.stack([progress, incline, active, active], axis=2)
+
+
 def horizontal_features(data: dict[str, Any]) -> np.ndarray:
     if "_horizontal_features" in data:
         return data["_horizontal_features"]
@@ -308,6 +326,8 @@ def model_features(data: dict[str, Any], component: str, a_params: dict[str, Any
         return split_features(data, estimated_contacts(data, a_params))
     if component == "P":
         return data["cop_features"].reshape(-1, data["cop_features"].shape[-1])
+    if component == "Pphase":
+        return cop_phase_features(data).reshape(-1, 4)
     raise ValueError(component)
 
 
@@ -328,9 +348,15 @@ def fit_split_model(
     return fit_ridge(features, targets, ridge)
 
 
-def fit_cop_model(segments: list[dict[str, Any]], ridge: float) -> np.ndarray:
+def fit_cop_model(
+    segments: list[dict[str, Any]], ridge: float, stance_phase: str | None = None,
+) -> np.ndarray:
     features, targets = [], []
+    phase_features = stance_phase is not None
+    if stance_phase not in (None, "single_stance", "double_stance"):
+        raise ValueError(f"Unsupported CoP training phase: {stance_phase}")
     for data in segments:
+        contact_count = data["true_contact"].sum(axis=1)
         for side in range(2):
             heel = data["body_positions"][:, BODY_INDEX[("calcn_l", "calcn_r")[side]], :2]
             toes = data["body_positions"][:, BODY_INDEX[("toes_l", "toes_r")[side]], :2]
@@ -341,7 +367,11 @@ def fit_cop_model(segments: list[dict[str, Any]], ridge: float) -> np.ndarray:
                                  out=np.full(len(axis), np.nan), where=length2 > 1e-8)
             mask = (data["valid_target"] & data["force_valid"] & ~data["cop_invalid"]
                     & data["true_contact"][:, side] & np.isfinite(progress))
-            features.append(data["cop_features"][:, side, :][mask])
+            if stance_phase is not None:
+                required_contacts = 1 if stance_phase == "single_stance" else 2
+                mask &= contact_count == required_contacts
+            feature_array = cop_phase_features(data) if phase_features else data["cop_features"]
+            features.append(feature_array[:, side, :][mask])
             targets.append(progress[mask])
     return fit_ridge(features, targets, ridge)
 
@@ -460,6 +490,21 @@ def apply_variant(data: dict[str, Any], variant: str, params: dict[str, Any]) ->
             point = heel + progress[:, None] * (toes - heel)
             start = 0 if side == 0 else 2
             body_point[:, start:start + 2, :] = point[:, None, :]
+
+    if "Pphase" in components:
+        contact = estimated_contacts(data)
+        features = cop_phase_features(data)
+        coefficients = {name: np.asarray(value) for name, value in params["Pphase_coefficients"].items()}
+        for side in range(2):
+            progress = _phase_cop_progress(features[:, side, :], contact, coefficients)
+            active = contact[:, side] & np.isfinite(progress)
+            if not active.any():
+                continue
+            heel = data["body_positions"][:, BODY_INDEX[("calcn_l", "calcn_r")[side]], :]
+            toes = data["body_positions"][:, BODY_INDEX[("toes_l", "toes_r")[side]], :]
+            point = heel + progress[:, None] * (toes - heel)
+            start = 0 if side == 0 else 2
+            body_point[active, start:start + 2, :] = point[active, None, :]
 
     foot_force = np.stack([body_force[:, :2].sum(axis=1), body_force[:, 2:].sum(axis=1)], axis=1)
     foot_cop = np.zeros((len(body_force), 2, 3), dtype=float)
@@ -799,6 +844,27 @@ def fit_variant_params(train_segments: list[dict[str, Any]], train_subjects: lis
     assert p_best is not None
     candidates["P"] = {**p_best[1], "training_J": p_best[0], "budget_configs": len(RIDGE_GRID)}
 
+    # Declared Pphase search: 5 single-stance × 5 double-stance ridge pairs per fold.
+    phase_models = {
+        phase: {ridge: fit_cop_model(train_segments, ridge, phase) for ridge in RIDGE_GRID}
+        for phase in ("single_stance", "double_stance")
+    }
+    pphase_best: tuple[float, dict[str, Any]] | None = None
+    for single_ridge in RIDGE_GRID:
+        for double_ridge in RIDGE_GRID:
+            params = {
+                "Pphase_coefficients": {
+                    phase: phase_models[phase][ridge].tolist()
+                    for phase, ridge in (("single_stance", single_ridge), ("double_stance", double_ridge))
+                },
+                "Pphase_ridges": {"single_stance": single_ridge, "double_stance": double_ridge},
+            }
+            score = mean_training_objective(by_subject, "Pphase", params, baseline, train_subjects)
+            if pphase_best is None or score < pphase_best[0]:
+                pphase_best = (score, params)
+    assert pphase_best is not None
+    candidates["Pphase"] = {**pphase_best[1], "training_J": pphase_best[0], "budget_configs": 25}
+
     # Declared Hsym search: 5 ridge values × 2 residual-allocation rules per fold.
     hsym_best: tuple[float, dict[str, Any]] | None = None
     for ridge in RIDGE_GRID:
@@ -826,7 +892,12 @@ def fit_variant_params(train_segments: list[dict[str, Any]], train_subjects: lis
                            "P_coefficients": p_params["P_coefficients"], "P_ridge": p_params["P_ridge"]}
     candidates["Hsym+P"] = {"H_model": candidates["Hsym"]["H_model"], "H_ridge": candidates["Hsym"]["H_ridge"],
                              "P_coefficients": p_params["P_coefficients"], "P_ridge": p_params["P_ridge"]}
-    for name in ("H+P", "S+P", "H+S+P", "Hsym+P"):
+    candidates["Hsym+Pphase"] = {
+        "H_model": candidates["Hsym"]["H_model"], "H_ridge": candidates["Hsym"]["H_ridge"],
+        "Pphase_coefficients": candidates["Pphase"]["Pphase_coefficients"],
+        "Pphase_ridges": candidates["Pphase"]["Pphase_ridges"],
+    }
+    for name in ("H+P", "S+P", "H+S+P", "Hsym+P", "Hsym+Pphase"):
         score = mean_training_objective(by_subject, name, candidates[name], baseline, train_subjects)
         candidates[name]["training_J"] = score
         candidates[name]["budget_configs"] = 1
@@ -891,6 +962,18 @@ def parameter_rows(fold: str, variant: str, params: dict[str, Any]) -> list[dict
             output.append({"fold": fold, "variant": variant, "parameter": "S.ridge",
                            "value": params["S_ridge"], "training_J": params.get("training_J"),
                            "budget_configs": params.get("budget_configs")})
+        if component == "Pphase":
+            for phase, coefficients in params["Pphase_coefficients"].items():
+                output.append({"fold": fold, "variant": variant,
+                               "parameter": f"Pphase.{phase}.ridge",
+                               "value": params["Pphase_ridges"][phase],
+                               "training_J": params.get("training_J"),
+                               "budget_configs": params.get("budget_configs")})
+                for index, value in enumerate(coefficients):
+                    output.append({"fold": fold, "variant": variant,
+                                   "parameter": f"Pphase.{phase}.coef_{index}", "value": value,
+                                   "training_J": params.get("training_J"),
+                                   "budget_configs": params.get("budget_configs")})
         if component == "P":
             for index, value in enumerate(params["P_coefficients"]):
                 output.append({"fold": fold, "variant": variant, "parameter": f"P.coef_{index}",
@@ -1040,13 +1123,44 @@ def main() -> int:
         "subjects": list(SUBJECTS), "segments": len(all_data), "budget": {
             "H_configs_per_fold": len(RIDGE_GRID), "Hsym_configs_per_fold": len(RIDGE_GRID) * 2,
             "S_configs_per_fold": len(S_CONTACT_GRID), "P_configs_per_fold": len(RIDGE_GRID),
-            "combination_configs_per_fold": 4,
+            "Pphase_configs_per_fold": len(RIDGE_GRID) ** 2,
+            "combination_configs_per_fold": 5,
         },
         "variants": {variant: {"mean_loso_J": score, "fold_J": test_scores[variant]}
                      for variant, score in ranking},
         "selected_for_phase_d": selected_variants,
         "default_wrench_max_abs_delta": default_wrench_max_abs_delta,
         "measured_force_or_cop_used_at_inference": False,
+    }
+    model_dir = phase_c / "model_exports"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    pphase_ridges = {
+        phase: Counter(all_fold_params[subject]["Pphase"]["Pphase_ridges"][phase]
+                       for subject in SUBJECTS).most_common(1)[0][0]
+        for phase in ("single_stance", "double_stance")
+    }
+    pphase_model = {
+        phase: fit_cop_model(all_data, ridge, phase).tolist()
+        for phase, ridge in pphase_ridges.items()
+    }
+    pphase_path = model_dir / "groundlink_pphase_all_subjects.json"
+    pphase_path.write_text(json.dumps({
+        "schema_version": 1,
+        "feature_schema": "estimated_contact_binary_v1",
+        "ridge_selection": "modal_LOSO_training_fold",
+        "ridges": pphase_ridges,
+        "coefficients_by_phase": pphase_model,
+    }, indent=2) + "\n", encoding="utf-8")
+    hsym_models = [all_fold_params[subject]["Hsym"] for subject in SUBJECTS]
+    hsym_ridge = Counter(params["H_ridge"] for params in hsym_models).most_common(1)[0][0]
+    hsym_allocation = Counter(params["H_model"]["residual_allocation"]
+                              for params in hsym_models).most_common(1)[0][0]
+    hsym_model = fit_horizontal_symmetric_model(all_data, hsym_ridge, hsym_allocation)
+    hsym_path = model_dir / "groundlink_hsym_all_subjects.json"
+    hsym_path.write_text(json.dumps(hsym_model, indent=2) + "\n", encoding="utf-8")
+    summary["model_exports"] = {
+        "Hsym": str(hsym_path), "Pphase": str(pphase_path),
+        "selection": "modal hyperparameters across LOSO training folds; coefficients refit on all subjects",
     }
     (phase_c / "selection.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 

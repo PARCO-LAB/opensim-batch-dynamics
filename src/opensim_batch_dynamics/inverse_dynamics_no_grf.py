@@ -353,6 +353,34 @@ def _cop_progress_points(
     return heel + progress[:, None] * (toes - heel)
 
 
+def _parse_cop_progress_model(model: dict[str, object]) -> np.ndarray | dict[str, np.ndarray]:
+    if "coefficients_by_phase" in model:
+        values = model["coefficients_by_phase"]
+        if not isinstance(values, dict) or set(values) != {"single_stance", "double_stance"}:
+            raise ValueError("Phase-specific CoP model requires single_stance and double_stance coefficients.")
+        coefficients = {name: np.asarray(value, dtype=np.float64) for name, value in values.items()}
+        if any(value.shape != (5,) for value in coefficients.values()):
+            raise ValueError("Phase-specific CoP coefficients must each contain five values.")
+        return coefficients
+    coefficients = np.asarray(model["coefficients"], dtype=np.float64)
+    if coefficients.shape != (5,):
+        raise ValueError("CoP progression model must contain five coefficients.")
+    return coefficients
+
+
+def _phase_cop_progress(
+    features: np.ndarray, estimated_contact: np.ndarray, coefficients: dict[str, np.ndarray]
+) -> np.ndarray:
+    """Select CoP model from estimated contact count; NaN means no foot contact."""
+    count = estimated_contact.sum(axis=1)
+    progress = np.full(len(features), np.nan, dtype=np.float64)
+    for phase, selected in (("single_stance", count == 1), ("double_stance", count == 2)):
+        if selected.any():
+            design = np.column_stack([np.ones(selected.sum()), features[selected]])
+            progress[selected] = np.clip(design @ coefficients[phase], 0.0, 1.0)
+    return progress
+
+
 def _stance_progress(times: np.ndarray, contact: np.ndarray) -> np.ndarray:
     progress = np.zeros(len(times), dtype=np.float64)
     padded = np.r_[False, contact, False]
@@ -398,8 +426,7 @@ def _estimate_contact_wrenches_from_kinematics(
         if horizontal_split_model_path is not None else None
     )
     cop_progress_coefficients = (
-        np.asarray(json.loads(Path(cop_progress_model_path).read_text(encoding="utf-8"))["coefficients"],
-                   dtype=np.float64)
+        _parse_cop_progress_model(json.loads(Path(cop_progress_model_path).read_text(encoding="utf-8")))
         if cop_progress_model_path is not None else None
     )
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -760,21 +787,40 @@ def _estimate_contact_wrenches_from_kinematics(
         required = ("calcn_l", "toes_l", "calcn_r", "toes_r")
         if any(name not in body_index for name in required):
             raise ValueError("CoP progression model requires calcn/toes contact bodies on both sides.")
-        if cop_progress_coefficients.shape != (5,):
-            raise ValueError("CoP progression model must contain five linear coefficients.")
         group_index = {name: index for index, name in enumerate(group_keys)}
-        for side, names in enumerate((("calcn_l", "toes_l"), ("calcn_r", "toes_r"))):
-            heel = body_positions_filt[body_index[names[0]]]
-            toes = body_positions_filt[body_index[names[1]]]
-            axis = toes[:, :2] - heel[:, :2]
-            length = np.linalg.norm(axis, axis=1)
-            incline = np.arctan2(toes[:, 2] - heel[:, 2], np.maximum(length, 1e-4))
-            group = group_activation[group_index[("left", "right")[side] + "_foot"]]
-            progress = _stance_progress(timestamps, group > 0.05)
-            features = np.column_stack([progress, incline, group, group])
-            point = _cop_progress_points(heel, toes, features, cop_progress_coefficients)
-            for name in names:
-                cop_per_body[body_index[name]] = point
+        if isinstance(cop_progress_coefficients, dict):
+            contact = np.column_stack([
+                group_activation[group_index[side + "_foot"]] > 0.5 for side in ("left", "right")
+            ])
+            for side, names in enumerate((("calcn_l", "toes_l"), ("calcn_r", "toes_r"))):
+                heel = body_positions_filt[body_index[names[0]]]
+                toes = body_positions_filt[body_index[names[1]]]
+                axis = toes[:, :2] - heel[:, :2]
+                length = np.linalg.norm(axis, axis=1)
+                incline = np.arctan2(toes[:, 2] - heel[:, 2], np.maximum(length, 1e-4))
+                progress = _stance_progress(timestamps, contact[:, side])
+                active = contact[:, side].astype(float)
+                features = np.column_stack([progress, incline, active, active])
+                cop_progress = _phase_cop_progress(features, contact, cop_progress_coefficients)
+                mask = contact[:, side] & np.isfinite(cop_progress)
+                point = heel + cop_progress[:, None] * (toes - heel)
+                for name in names:
+                    cop_per_body[body_index[name], mask] = point[mask]
+        else:
+            if cop_progress_coefficients.shape != (5,):
+                raise ValueError("CoP progression model must contain five linear coefficients.")
+            for side, names in enumerate((("calcn_l", "toes_l"), ("calcn_r", "toes_r"))):
+                heel = body_positions_filt[body_index[names[0]]]
+                toes = body_positions_filt[body_index[names[1]]]
+                axis = toes[:, :2] - heel[:, :2]
+                length = np.linalg.norm(axis, axis=1)
+                incline = np.arctan2(toes[:, 2] - heel[:, 2], np.maximum(length, 1e-4))
+                group = group_activation[group_index[("left", "right")[side] + "_foot"]]
+                progress = _stance_progress(timestamps, group > 0.05)
+                features = np.column_stack([progress, incline, group, group])
+                point = _cop_progress_points(heel, toes, features, cop_progress_coefficients)
+                for name in names:
+                    cop_per_body[body_index[name]] = point
 
     # Write a transparent per-frame debug CSV for inspection.
     with contact_wrench_csv_path.open("w", newline="", encoding="utf-8") as file_obj:

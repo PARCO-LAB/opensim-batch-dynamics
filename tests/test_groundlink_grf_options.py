@@ -9,6 +9,8 @@ from loso_prototypes import apply_variant, horizontal_features, horizontal_local
 from opensim_batch_dynamics.inverse_dynamics_no_grf import (
     _cop_progress_points,
     _horizontal_split_targets,
+    _parse_cop_progress_model,
+    _phase_cop_progress,
 )
 
 
@@ -82,6 +84,38 @@ class GroundLinkGRFOptionTests(unittest.TestCase):
         result = apply_variant(data, "Hsym", params)
         np.testing.assert_allclose(result["foot_force"].sum(axis=1)[:, :2],
                                    data["net_force"][:, :2], atol=1e-12)
+
+    def test_phase_cop_schema_and_estimated_phase_selection(self):
+        legacy = np.array([0.2, 0.3, 0.4, 0.5, 0.6])
+        np.testing.assert_array_equal(_parse_cop_progress_model({"coefficients": legacy.tolist()}), legacy)
+        model = {"coefficients_by_phase": {
+            "single_stance": [0.0] * 5, "double_stance": [1.0, 0.0, 0.0, 0.0, 0.0],
+        }}
+        parsed = _parse_cop_progress_model(model)
+        self.assertIsInstance(parsed, dict)
+        data = sample_data()
+        data["activation"][1, 1, :] = 0.0
+        data["activation"][2, :, :] = 0.0
+        contact = data["activation"].reshape(4, 4).reshape(4, 2, 2).max(axis=2) > 0.5
+        features = np.zeros((4, 4))
+        progress = _phase_cop_progress(features, contact, parsed)
+        np.testing.assert_allclose(progress[:2], [1.0, 0.0])
+        self.assertTrue(np.isnan(progress[2]))
+        np.testing.assert_allclose(progress[3], 1.0)
+
+    def test_phase_cop_variant_uses_estimated_contacts_without_measured_arrays(self):
+        data = sample_data()
+        data["activation"][1, 1, :] = 0.0
+        data["activation"][2, :, :] = 0.0
+        params = {"Pphase_coefficients": {
+            "single_stance": [0.0] * 5, "double_stance": [1.0, 0.0, 0.0, 0.0, 0.0],
+        }}
+        result = apply_variant(data, "Pphase", params)
+        self.assertEqual(result["body_point"].shape, (4, 4, 3))
+        np.testing.assert_allclose(result["body_point"][0, 0, 0], 0.1)
+        np.testing.assert_allclose(result["body_point"][1, 0, 0], -0.1)
+        # Flight frame keeps its default application points.
+        np.testing.assert_array_equal(result["body_point"][2], data["body_point"][2])
 
     def test_cop_progress_uses_kinematics_only(self):
         heel = np.zeros((2, 3))
