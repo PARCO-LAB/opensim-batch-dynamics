@@ -21,9 +21,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from smplx.transfer_model import merge_output as transfer_merge_output
-from smplx.transfer_model.transfer_model import prepare_fitting_assets, run_fitting
-from smplx.transfer_model.utils import read_deformation_transfer
 
 
 DEFAULT_INPUT_ROOT = Path("/Volumes/MAEVE/dataset/CARE-PD/Canonicalized_SMPL_pickles")
@@ -760,6 +757,7 @@ def _build_in_memory_runtime(config: ConversionConfig) -> InMemoryWorkerRuntime:
     import torch
     import smplx
     from smplx import build_layer
+    from smplx.transfer_model.utils import read_deformation_transfer
 
     device = _runtime_device(config)
     if config.limit_threads:
@@ -832,6 +830,7 @@ def _get_target_model_and_assets(
 ):
     import torch
     from smplx import build_layer
+    from smplx.transfer_model.transfer_model import prepare_fitting_assets
 
     resolved_gender = _resolve_model_gender(config.smpl_model_root, "SMPLX", gender)
     model = runtime.target_models.get(resolved_gender)
@@ -1100,6 +1099,8 @@ def _aggregate_in_memory_outputs(
     frame_outputs: list[Mapping[str, Any]],
     gender: str,
 ) -> dict[str, Any]:
+    from smplx.transfer_model import merge_output as transfer_merge_output
+
     merged: dict[str, Any] = {}
     for key in _IN_MEMORY_MERGE_KEYS:
         values = [frame[key] for frame in frame_outputs if key in frame]
@@ -1227,6 +1228,7 @@ def _convert_one_take_in_memory(
     config: ConversionConfig,
 ) -> dict[str, Any]:
     from time import perf_counter
+    from smplx.transfer_model.transfer_model import run_fitting
 
     t_take = perf_counter()
     runtime = _get_worker_runtime(config)
@@ -1403,6 +1405,7 @@ def _convert_one_take_cpu_takes(
     config: ConversionConfig,
 ) -> dict[str, Any]:
     from time import perf_counter
+    from smplx.transfer_model.transfer_model import run_fitting
 
     t_take = perf_counter()
     runtime = _get_worker_runtime(config)
