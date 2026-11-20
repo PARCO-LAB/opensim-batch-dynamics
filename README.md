@@ -1,176 +1,128 @@
-# AMASS -> BSM OpenSim Unified CSV Pipeline
+# Automated Dynamics Annotation of Human Motion Archives
 
-This repository provides an end-to-end pipeline that takes an AMASS `.npz` file and produces a **single unified `.csv`** with:
+An automated pipeline that converts SMPL/SMPL-X motion into musculoskeletal
+kinematics, ground reaction forces and joint torques.
 
-- DOF positions
-- DOF velocities
-- DOF accelerations
-- DOF torques
-- Ground reaction forces (per foot + total)
-- Binary contact codes (`0/1`) per foot
+The pipeline labels SMPL/SMPL-X motion archives, such as AMASS, that have no
+force measurements. It estimates ground reaction forces (GRF) from body motion
+alone and computes joint torques by inverse dynamics. It requires no force
+measurements and no training, so it scales to large archives, for example
+to provide joint-torque targets for learning motion representations. Its
+force and torque estimates are evaluated against force-plate measurements
+from GroundLink.
 
-`knee_angle_r_beta` and `knee_angle_l_beta` are removed from the final output (they are always `NaN`), so the final CSV contains **49 effective DOFs**.
+For each input sequence, the pipeline writes one CSV with:
 
-Main entrypoint:
+- joint angles, velocities and accelerations of a 49-DOF musculoskeletal model;
+- estimated joint torques $\hat\tau$;
+- estimated GRF for each contact body and in total;
+- binary contact states for each contact body.
 
-- [run_amass_to_bsm_csv.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/run_amass_to_bsm_csv.py)
-- `--trial all` runs every trial found inside a multi-trial `.npz` and exports one CSV per trial.
+## Contents
 
-Additional NTU entrypoints:
+- [Method overview](#method-overview)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Annotating AMASS](#annotating-amass)
+- [Calibrated variant](#calibrated-variant)
+- [Evaluation on GroundLink](#evaluation-on-groundlink)
+- [Output format](#output-format)
+- [Repository structure](#repository-structure)
+- [License and acknowledgements](#license-and-acknowledgements)
 
-- [convert_ntu_skeleton_to_smplx_npz.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/convert_ntu_skeleton_to_smplx_npz.py): converts NTU RGB+D `.skeleton` files to AMASS-like SMPL-X `.npz`.
-- [run_ntu_skeleton_batch_slurm.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/run_ntu_skeleton_batch_slurm.py): SLURM helper for NTU `.skeleton -> .npz` conversion.
-- [convert_humanml3d_joints_to_smplx_npz.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/convert_humanml3d_joints_to_smplx_npz.py): fits SMPL-X params from HumanML3D `joints/*.npy` 52-joint files.
-- [run_humanml3d_joints_batch_slurm.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/run_humanml3d_joints_batch_slurm.py): SLURM helper for HumanML3D `joints/*.npy -> .npz` conversion.
-- [convert_carepd_smpl_pkl_to_smplx_npz.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/convert_carepd_smpl_pkl_to_smplx_npz.py): converts CARE-PD SMPL `.pkl` takes to AMASS-like SMPL-X `.npz`, one file per take.
-- [extract_carepd_mds_updrs_gait_severity_csv.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/extract_carepd_mds_updrs_gait_severity_csv.py): extracts the CARE-PD `UPDRS_GAIT` score from each take into a semicolon-delimited CSV.
+## Method overview
 
-## Required Inputs and Assets
-
-- AMASS input file (example): `data/A3-_Swing_arms_stageii.npz`
-- SMPL-X model file: `model/smpl/SMPLX_NEUTRAL.npz`
-- BSM OpenSim model: `model/bsm/bsm.osim`
-- BSM geometry folder: `model/bsm/Geometry/`
-- Marker map: `assets/smpl2ab/bsm_markers_smplx.yaml`
-- Local AddBiomechanics checkout (see setup below)
-
-AMASS compatibility note:
-
-- The loader supports both Stage-II style `.npz` files and legacy AMASS files with `poses/trans`.
-- If present, sibling `shape.npz` is used automatically as fallback for `gender` and `betas`.
-
-NTU compatibility note:
-
-- NTU RGB+D `.skeleton` files contain 25 3D joints in camera coordinates.
-- The NTU converter fits an AMASS-like SMPL-X parameter file with `trans`, `root_orient`, `pose_body`, zero hand/face pose, `betas`, `gender`, `mocap_frame_rate`, and NTU metadata.
-- Raw NTU skeletons are treated as Y-up; by default the converter exports **Z-up** motion (`--target-frame z-up`) to match this repo's BSM/Nimble/OpenSim gravity convention.
-- NTU uses a viewer-compatible 180-degree root yaw by default; left/right labels are not swapped unless `--swap-left-right` is passed.
-- Subject size is handled by fitting SMPL-X `betas` from metric 3D limb lengths.
-
-HumanML3D compatibility note:
-
-- `new_joint_vecs/*.npy` are feature vectors and are not direct SMPL parameters.
-- `new_joints/*.npy` are normalized 22-joint positions.
-- `joints/*.npy` are the preferred source for this repo because they contain 52 SMPL/SMPL-H-style joints, including hands.
-- HumanML3D motion is 20 fps by default.
-
-CARE-PD compatibility note:
-
-- The CARE-PD converter now uses official `vchoutas/smplx/transfer_model` pipeline.
-- Input source can be canonicalized SMPL `.pkl` files with packed `poses` or split `global_orient` + `body_pose`.
-- It first renders SMPL meshes, then runs `transfer_model`, then merges output into AMASS-like SMPL-X `.npz`, one file per take.
-- You need a local `smplx` checkout plus `transfer_data/smpl2smplx_deftrafo_setup.pkl` and `transfer_data/smplx_mask_ids.npy` from official correspondences package.
-- Defaults point at `/Volumes/MAEVE/dataset/CARE-PD/Canonicalized_SMPL_pickles` and `/Volumes/MAEVE/dataset/CARE-PD/npz`.
-
-Example:
-
-```bash
-conda activate opensim-torque
-python scripts/convert_carepd_smpl_pkl_to_smplx_npz.py \
-  --input-root /Volumes/MAEVE/dataset/CARE-PD/Canonicalized_SMPL_pickles \
-  --output-dir /Volumes/MAEVE/dataset/CARE-PD/npz \
-  --force
+```
+SMPL-X motion (.npz)
+  │  1. SMPL-X mesh → virtual markers → AddBiomechanics: scaled BSM model + IK
+  ▼
+Musculoskeletal kinematics q, q̇, q̈ (49 DOFs)
+  │  2. Total contact force from whole-body dynamics
+  │  3. Contact detection and distribution of the force over the feet
+  ▼
+Per-foot GRF and application points
+  │  4. OpenSim inverse dynamics
+  ▼
+Joint torques τ̂  →  quality gate  →  unified CSV
 ```
 
-To extract the gait severity score only:
+**1. Biomechanical model.** We generate a body mesh from SMPL-X and place
+virtual markers at fixed vertices
+([`assets/smpl2ab/bsm_markers_smplx.yaml`](assets/smpl2ab/bsm_markers_smplx.yaml)).
+[AddBiomechanics](https://github.com/keenon/AddBiomechanics) uses these
+markers to scale the biomechanical skeleton model (BSM) of
+[SKEL](https://skel.is.tue.mpg.de/), derived from the model of Rajagopal et
+al., and solves inverse kinematics. The model has 49 DOFs, including six at
+the pelvis, with consistent segment inertias. Body mass is computed from the
+mesh volume with a constant density of 985 kg m⁻³, or estimated from stature
+when the shape is unavailable.
+
+**2. Total contact force.** After zero-phase fourth-order Butterworth
+filtering, the total external force required by the motion is
+
+$$\mathbf F_{\text{target}}(t) = m\,\bigl(\ddot c(t) - \mathbf g\bigr),$$
+
+where $c$ is the center of mass. In the implementation, this force is taken
+from a first OpenSim inverse-dynamics pass without external loads: the
+residual force at the pelvis is exactly the external force that the motion
+requires, so the final inverse dynamics uses the same filtered kinematics.
+
+**3. Contact detection and load distribution.** The support plane is placed
+at the first percentile of foot-marker heights. A foot is a contact candidate
+when its lowest marker is within 4 cm of the plane and its speed is below
+0.5 m s⁻¹; hysteresis and smoothing give continuous activations
+$\alpha_i\in[0,1]$. The force is shared among the feet according to their
+activation and their planar distance $d_i$ to the projected center of mass,
+
+$$w_i = \frac{\alpha_i/(d_i+\epsilon)}{\sum_j \alpha_j/(d_j+\epsilon)},$$
+
+and each foot receives $w_i\mathbf F_{\text{target}}$, so the per-foot forces
+sum to the required total. Forces are applied at the contact-body origins
+projected onto the support plane. The residual
+$\rho=\lVert\mathbf F_{\text{target}}-\sum_i\mathbf F_i\rVert/\text{BW}$ is
+recorded for every frame.
+
+**4. Inverse dynamics.** OpenSim inverse dynamics computes the joint torques
+$\hat\tau$ under the estimated loads. A quality gate rejects sequences that
+are too short, with implausible global translation or pelvis rotation, or
+with diverging torques. Accepted sequences are written to the unified CSV.
+
+The pipeline assumes foot-only contact on a planar support, fixed application
+points and zero free moment. Sequences that violate these assumptions, such as
+sitting, crawling or stair climbing, should be excluded before use.
+
+## Installation
+
+Runs on Linux and macOS (Apple Silicon and Intel) with Python 3.11 and
+OpenSim 4.5.2.
 
 ```bash
-python scripts/extract_carepd_mds_updrs_gait_severity_csv.py \
-  --input-root /Volumes/MAEVE/dataset/CARE-PD/Canonicalized_SMPL_pickles \
-  --output-csv /Volumes/MAEVE/dataset/CARE-PD/carepd_mds_updrs_gait_severity.csv
-```
+git clone https://github.com/PARCO-LAB/opensim-batch-dynamics.git
+cd opensim-batch-dynamics
 
-## Ubuntu Setup
-
-1. Install system dependencies:
-
-```bash
-sudo apt update
-sudo apt install -y git wget
-```
-
-2. Install Conda (Miniconda), if needed:
-
-```bash
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
-bash miniconda.sh -b -p "$HOME/miniconda3"
-eval "$("$HOME/miniconda3/bin/conda" shell.bash hook)"
-```
-
-3. Create and activate the environment:
-
-```bash
 conda env create -f environment.yml
 conda activate opensim-torque
-```
 
-Optional realtime/RT tooling lives in `environment-rt.yml`.
-
-4. Install the SMPL-X trust-region optimizer inside the activated env:
-
-```bash
-python -m pip install --no-build-isolation git+https://github.com/vchoutas/torch-trust-ncg.git
-```
-
-5. Install the PSBody mesh package required by `smplx/transfer_model`:
-
-```bash
-sudo apt-get install -y libboost-dev
-git clone https://github.com/MPI-IS/mesh.git "$HOME/mesh"
-cd "$HOME/mesh"
-make all
-```
-
-6. Clone AddBiomechanics:
-
-```bash
+# AddBiomechanics engine (scaling and inverse kinematics)
 git clone https://github.com/keenon/AddBiomechanics.git "$HOME/AddBiomechanics"
 ```
 
-## macOS Setup (Apple Silicon + Intel)
+Download the SMPL-X model from the [SMPL-X website](https://smpl-x.is.tue.mpg.de/)
+(registration required) and place `SMPLX_NEUTRAL.npz` (and the gendered
+models, if needed) in `model/smpl/`. The BSM model and its geometry are
+included in `model/bsm/`.
 
-1. Install Conda (Miniconda or Miniforge).
-2. Create and activate the environment:
+Optional dependencies for the dataset converters (NTU RGB+D, HumanML3D,
+CARE-PD) are listed in [`docs/usage_reference.md`](docs/usage_reference.md).
 
-```bash
-conda env create -f environment.yml
-conda activate opensim-torque
-```
+## Quick start
 
-3. Install the SMPL-X trust-region optimizer inside the activated env:
-
-```bash
-python -m pip install --no-build-isolation git+https://github.com/vchoutas/torch-trust-ncg.git
-```
-
-4. Install the PSBody mesh package required by `smplx/transfer_model`:
-
-```bash
-sudo apt-get install -y libboost-dev
-git clone https://github.com/MPI-IS/mesh.git "$HOME/mesh"
-cd "$HOME/mesh"
-make all
-```
-
-5. Clone AddBiomechanics:
-
-```bash
-git clone https://github.com/keenon/AddBiomechanics.git "$HOME/AddBiomechanics"
-```
-
-Notes for macOS:
-
-- The pipeline script sets `KMP_DUPLICATE_LIB_OK=TRUE` automatically to avoid OpenMP runtime conflicts.
-- If `python` is not available in your shell, use `python3` (inside the activated conda env, `python` is usually available).
-
-## One Command End-to-End
-
-Run the full pipeline with one Python command:
+Annotate one AMASS sequence:
 
 ```bash
 python scripts/run_amass_to_bsm_csv.py \
   --input data/A3-_Swing_arms_stageii.npz \
-  --trial A3_swing_full \
+  --trial A3_swing \
   --output-dir outputs/bsm \
   --smplx-model-dir model/smpl \
   --bsm-model model/bsm/bsm.osim \
@@ -179,400 +131,172 @@ python scripts/run_amass_to_bsm_csv.py \
   --cleanup-intermediate
 ```
 
-If your shell does not resolve `python`, run the same command with `python3`.
+The result is `outputs/bsm/A3_swing.csv`, plus a `.quality.json` sidecar.
+Use `--trial all` to export one CSV per trial from a multi-trial `.npz`.
+With `--cleanup-intermediate`, only the final CSV is kept.
 
-To export one CSV per trial from a multi-trial `.npz`, use:
+Main options:
 
-```bash
-python scripts/run_amass_to_bsm_csv.py \
-  --input data/your_multitrial_file.npz \
-  --trial all \
-  --output-dir outputs/bsm \
-  --smplx-model-dir model/smpl \
-  --bsm-model model/bsm/bsm.osim \
-  --addbio-root "$HOME/AddBiomechanics" \
-  --id-grf-mode estimated \
-  --cleanup-intermediate
-```
+| Option | Default | Description |
+|---|---|---|
+| `--id-grf-mode {estimated,none}` | `estimated` | Estimate GRF from motion, or run inverse dynamics without external loads. |
+| `--id-filter-mode {auto,walking,dynamic,none}` | `auto` | Low-pass preset: 12 Hz (`walking`), 30 Hz (`dynamic`), or chosen from the trial name (`auto`). |
+| `--id-cutoff-hz HZ` | – | Explicit cutoff; overrides `--id-filter-mode`. |
+| `--id-contact-height-threshold-m` | `0.04` | Contact height threshold above the support plane. |
+| `--id-contact-speed-threshold-mps` | `0.5` | Contact speed threshold. |
+| `--id-forces-to-exclude {Actuators,Muscles}` | – | Exclude a force set of the model from the reported joint torques, e.g. passive muscle forces. |
+| `--id-horizontal-split-model PATH` | – | Calibrated horizontal force sharing ([Calibrated variant](#calibrated-variant)). |
+| `--id-cop-progress-model PATH` | – | Calibrated center of pressure ([Calibrated variant](#calibrated-variant)). |
 
-Final output:
+## Annotating AMASS
 
-- `outputs/bsm/A3_swing_full.csv`
-
-With `--cleanup-intermediate`, all temporary files under `outputs/bsm/<trial>/` are removed after a successful run, leaving only the final CSV.
-
-## NTU `.skeleton` to SMPL-X `.npz`
-
-NTU RGB+D 60/120 skeleton files can be converted to AMASS-like SMPL-X `.npz` files, then passed to `run_amass_to_bsm_csv.py`.
-
-Single-file conversion:
-
-```bash
-python scripts/convert_ntu_skeleton_to_smplx_npz.py \
-  --input-file data/ntu/S001C001P001R001A001.skeleton \
-  --output-dir data/ntu_smplx_npz \
-  --smplx-model-dir model/smpl \
-  --target-frame z-up
-```
-
-Folder conversion:
-
-```bash
-python scripts/convert_ntu_skeleton_to_smplx_npz.py \
-  --input-dir data/ntu \
-  --output-dir data/ntu_smplx_npz \
-  --smplx-model-dir model/smpl \
-  --recursive \
-  --target-frame z-up
-```
-
-Output example:
-
-- `data/ntu_smplx_npz/S001C001P001R001A001.npz`
-- `data/ntu_smplx_npz/conversion_summary.json`
-- `data/ntu_smplx_npz/_shape_cache/P001.npy`
-
-Important options:
-
-- `--target-frame z-up` is the default and should be used before BSM/OpenSim dynamics.
-- `--target-frame y-up` preserves raw NTU vertical and is mainly for debugging.
-- `--actor-mode primary` keeps the main tracked body per file.
-- `--actor-mode all` exports additional tracked bodies as `_bodyXX`.
-- `--performer P001` filters conversion to one NTU performer.
-- `--swap-left-right` is disabled by default. Use it only when visual inspection shows left/right are reversed for a specific source.
-- The NTU fitter is conservative by default: `--input-smooth-passes 1`, `--center-horizontal`, `--root-yaw-degrees 180`, `--root-up-prior-weight 50`, `--torso-frame-prior-weight 3`, `--spine-upright-prior-weight 8`, `--foot-flat-prior-weight 25`, `--temporal-joint-smooth-weight 350`, and `--temporal-joint-jerk-weight 35`. These defaults center Kinect camera-depth coordinates around the actor, align SMPL-X anatomical front with NTU camera-front, keep the torso upright while preserving shoulder/hip yaw, suppress short-frame flicker, and keep SMPL-X heel/toe joints flat during contact.
-- `--fit-shapes-only` fits/writes performer beta cache, then stops before pose fitting.
-- `--force` recomputes existing outputs and shape cache entries.
-
-The generated `.npz` can be fed directly into the existing BSM pipeline:
-
-```bash
-python scripts/run_amass_to_bsm_csv.py \
-  --input data/ntu_smplx_npz/S001C001P001R001A001.npz \
-  --trial S001C001P001R001A001 \
-  --output-dir outputs/ntu_bsm \
-  --smplx-model-dir model/smpl \
-  --bsm-model model/bsm/bsm.osim \
-  --addbio-root "$HOME/AddBiomechanics" \
-  --id-grf-mode estimated \
-  --cleanup-intermediate
-```
-
-## NTU SLURM Batch Runner
-
-Preferred HPC mode is one SLURM array task per NTU performer:
-
-```bash
-python scripts/run_ntu_skeleton_batch_slurm.py submit-subjects \
-  --input-root data/ntu \
-  --output-dir data/ntu_smplx_npz \
-  --smplx-model-dir model/smpl \
-  --python-exe python \
-  --slurm-setup-cmd 'source "$HOME/miniconda3/etc/profile.d/conda.sh"' \
-  --slurm-setup-cmd 'conda activate opensim-torque' \
-  --slurm-array-parallelism 32 \
-  --submit
-```
-
-What `submit-subjects` does:
-
-- groups input files by NTU performer key (`P001`, `P002`, ...)
-- launches one SLURM array task per performer
-- inside each task, fits one common SMPL-X shape/beta vector for that performer
-- converts all that performer's `.skeleton` files to `.npz`
-- writes logs under `data/ntu_smplx_npz/logs/`
-- writes SLURM manifests and result JSON files under `data/ntu_smplx_npz/slurm/`
-
-This is usually cleaner than one job per file because each performer gets a shared shape estimate before pose fitting.
-
-Dry run:
-
-```bash
-python scripts/run_ntu_skeleton_batch_slurm.py submit-subjects \
-  --input-root data/ntu \
-  --output-dir data/ntu_smplx_npz \
-  --smplx-model-dir model/smpl \
-  --limit 1 \
-  --dry-run
-```
-
-Constrain the job to a specific node:
-
-```bash
-python scripts/run_ntu_skeleton_batch_slurm.py submit-subjects \
-  --input-root data/ntu \
-  --output-dir data/ntu_smplx_npz \
-  --smplx-model-dir model/smpl \
-  --slurm-node node001 \
-  --slurm-array-parallelism 32 \
-  --slurm-setup-cmd 'source "$HOME/miniconda3/etc/profile.d/conda.sh"' \
-  --slurm-setup-cmd 'conda activate opensim-torque' \
-  --submit
-```
-
-`--slurm-node node001` is an alias for `--slurm-nodelist node001` and writes `#SBATCH -w node001`.
-
-Alternative two-step mode:
-
-```bash
-python scripts/run_ntu_skeleton_batch_slurm.py prefit-shapes \
-  --input-root data/ntu \
-  --output-dir data/ntu_smplx_npz \
-  --smplx-model-dir model/smpl \
-  --python-exe python
-
-python scripts/run_ntu_skeleton_batch_slurm.py submit \
-  --input-root data/ntu \
-  --output-dir data/ntu_smplx_npz \
-  --smplx-model-dir model/smpl \
-  --python-exe python \
-  --slurm-setup-cmd 'source "$HOME/miniconda3/etc/profile.d/conda.sh"' \
-  --slurm-setup-cmd 'conda activate opensim-torque' \
-  --slurm-array-parallelism 32 \
-  --submit
-```
-
-Use this only if you explicitly want global prefit first and then one array task per file.
-
-## HumanML3D 52-Joint to SMPL-X `.npz`
-
-For HumanML3D, use the `joints/` folder, not `new_joint_vecs/`. The `joints/*.npy` files have shape `(T, 52, 3)` and provide the richest direct joint target.
-
-```bash
-python scripts/convert_humanml3d_joints_to_smplx_npz.py \
-  --input data/HumanML3D/joints/000000.npy \
-  --output-dir data/humanml3d_smplx_npz \
-  --smplx-model-dir model/smpl \
-  --target-frame z-up
-```
-
-Output example:
-
-- `data/humanml3d_smplx_npz/000000.npz`
-
-On HPC/SLURM, submit the full `joints/` folder with:
-
-```bash
-python scripts/run_humanml3d_joints_batch_slurm.py submit \
-  --input-root data/HumanML3D \
-  --output-dir data/humanml3d_smplx_npz \
-  --smplx-model-dir model/smpl \
-  --python-exe python \
-  --slurm-nodelist 'node[001-002],blade[010-012]' \
-  --slurm-setup-cmd 'source "$HOME/miniconda3/etc/profile.d/conda.sh"' \
-  --slurm-setup-cmd 'conda activate opensim-torque' \
-  --slurm-max-array-size 1000 \
-  --slurm-array-parallelism 32 \
-  --submit
-```
-
-The script automatically uses `--input-root/joints` when that folder exists. For large datasets, for example 17k HumanML3D files, it follows the same scheduling pattern as `run_amass_batch_slurm.py`: it splits the task list into multiple SLURM array chunks with `--slurm-max-array-size` (default `1000`) and submits them one at a time with retry/backoff. Use `--slurm-nodelist` or the alias `--slurm-node` to constrain execution to a node or node range.
-
-HumanML3D fitting defaults are conservative for visual stability: `--input-smooth-passes 1`, `--pose-iters 2600`, `--no-fit-hands`, `--root-up-prior-weight 10`, `--torso-frame-prior-weight 2`, `--pose-prior-weight 0.05`, `--temporal-smooth-weight 0.03`, `--temporal-joint-smooth-weight 500`, `--temporal-joint-jerk-weight 50`, and `--foot-flat-prior-weight 25`. The hand fit is disabled by default because the HumanML3D 52-joint hands come from SMPL/SMPL-H-style joints and can create unnatural SMPL-X finger/body twists. The torso-frame prior matches hip, spine, collar, and shoulder directions from the source joints, the joint smooth/jerk priors suppress short flicker bursts, and the foot-flat prior keeps SMPL-X ankle, heel, and toe joints coplanar during detected contact frames.
-
-It writes:
-
-- `data/humanml3d_smplx_npz/slurm/manifest.jsonl`
-- `data/humanml3d_smplx_npz/slurm/run_humanml3d_joints_to_npz.sbatch`
-- additional chunk scripts such as `run_humanml3d_joints_to_npz_0001.sbatch` when needed
-- `data/humanml3d_smplx_npz/slurm/results/task_*.json`
-- per-file logs under `data/humanml3d_smplx_npz/logs/`
-
-The generated `.npz` contains `trans`, `root_orient`, `pose_body`, `pose_hand`, `pose_jaw`, `pose_eye`, `betas`, `gender`, and `mocap_frame_rate`, so it can be passed to `run_amass_to_bsm_csv.py`:
-
-```bash
-python scripts/run_amass_to_bsm_csv.py \
-  --input data/humanml3d_smplx_npz/000000.npz \
-  --trial humanml3d_000000 \
-  --output-dir outputs/humanml3d_bsm \
-  --smplx-model-dir model/smpl \
-  --bsm-model model/bsm/bsm.osim \
-  --addbio-root "$HOME/AddBiomechanics" \
-  --id-grf-mode estimated \
-  --cleanup-intermediate
-```
-
-## Batch Parallel Runner
-
-To process an entire AMASS folder in parallel, use:
+Download AMASS (SMPL-X G) from the [AMASS website](https://amass.is.tue.mpg.de/).
+To process a whole folder on one machine:
 
 ```bash
 python scripts/run_amass_batch_parallel.py \
   --input-root /path/to/AMASS \
-  --output-dir outputs/bsm_batch \
+  --output-dir outputs/amass_bsm \
   --workers 8 \
   --smplx-model-dir model/smpl \
   --bsm-model model/bsm/bsm.osim \
   --addbio-root "$HOME/AddBiomechanics" \
   --id-grf-mode estimated \
+  --id-cutoff-hz 12 \
+  --id-forces-to-exclude Actuators \
   --cleanup-intermediate
 ```
 
-What it does:
+The output tree mirrors the input tree, with one CSV per sequence, per-file
+logs and a `batch_summary.json`. Existing outputs that passed the quality
+gate with the current pipeline version are skipped, so an interrupted run can
+be resumed with the same command.
 
-- recursively scans `--input-root` for `.npz` files
-- runs the full pipeline in parallel (`--workers N`)
-- writes one final CSV per input `.npz` (preserving folder structure in `--output-dir`)
-- writes per-file logs under `outputs/bsm_batch/logs/`
-- writes a global summary JSON at `outputs/bsm_batch/batch_summary.json`
+On a SLURM cluster, `scripts/run_amass_batch_slurm.py submit` writes a task
+manifest and submits array jobs with the same pipeline options; for very
+large runs, `scripts/submit_amass_arrays_with_capacity.py` keeps the queue
+within the cluster's job limit, and `scripts/watch_amass_oom_retries.py`
+resubmits tasks that ran out of memory. See
+[`docs/usage_reference.md`](docs/usage_reference.md) for all options.
 
-Useful options:
+## Calibrated variant
 
-- `--dry-run` to preview discovered files and planned outputs
-- `--limit N` to run only the first `N` discovered files
-- `--skip-existing-csv` (default) skips files when the destination CSV already exists and is non-empty
-- `--no-skip-existing-csv` to force re-run even when output CSV already exists
-- `--no-cleanup-intermediate` to keep intermediate artifacts
-- `--engine-work-root PATH` controls the local scratch directory used by
-  AddBiomechanics/OpenSim (default `/tmp/groundlink-engine-work`). This keeps
-  expensive engine I/O off CIFS/NAS; retained artifacts are copied to the
-  output tree after a successful trial.
-- `--engine-timeout-s SECONDS` limits one AddBiomechanics run (default `7200`; use
-  `0` to disable the timeout).
+The motion determines the total force, but not how its horizontal part is
+shared between the feet or where each foot force is applied. The calibrated
+variant learns these two rules from force-plate data with linear models;
+vertical forces and contact states are unchanged.
 
-Note on SMB paths:
+- **Horizontal force sharing.** For each foot, a linear model predicts the
+  horizontal force from stance progress, contact activation, the estimated
+  vertical force, the foot position and velocity relative to the center of
+  mass (normalized by center-of-mass height) and the total horizontal force.
+  Both feet share the coefficients, with the mediolateral axis mirrored for
+  the right foot. In double support, the two predictions are corrected
+  equally so that they sum to the required horizontal force; in single
+  support, the loaded foot receives the full horizontal force.
+- **Center of pressure.** Each foot force is applied at
+  $\mathbf h + s(\mathbf t-\mathbf h)$, where $\mathbf h$ and $\mathbf t$ are
+  the heel and toe body positions and $s\in[0,1]$ is a clipped linear
+  function of foot pitch, stance progress and contact activation.
 
-- If your dataset path is like `smb://parconas.di.univr.it/MAEVE/dataset/AMASS`, mount it first (for example to `/Volumes/AMASS`) and pass the mounted local path to `--input-root`.
-
-## SLURM Parallel Runner
-
-For HPC clusters, use the SLURM helper script:
-
-```bash
-python scripts/run_amass_batch_slurm.py submit \
-  --smplx-model-dir model/smpl \
-  --bsm-model model/bsm/bsm.osim \
-  --addbio-root "$HOME/AddBiomechanics" \
-  --id-grf-mode estimated \
-  --cleanup-intermediate \
-  --slurm-job-name amass_bsm \
-  --slurm-partition cpu \
-  --slurm-time 08:00:00 \
-  --slurm-cpus-per-task 4 \
-  --slurm-mem 16G \
-  --slurm-array-parallelism 32 \
-  --slurm-setup-cmd 'source "$HOME/miniconda3/etc/profile.d/conda.sh"' \
-  --slurm-setup-cmd 'conda activate opensim-torque' \
-  --submit
-```
-
-On the UniVR HPC layout described in this project, the script now defaults to:
-
-- input root: `~/storage/emartini/AMASS/AMASS`
-- output root: `~/storage/emartini/AMASS_torque`
-
-Assuming `~/storage` is a symlink to `/storage-large/shared-folders/gr_bombieri/emartini`, the shortest working submit command is:
+The two models have 25 coefficients in total. The fitted coefficients, from
+least squares on all six GroundLink subjects, are in
+[`model/groundlink_calibrated/`](model/groundlink_calibrated/):
 
 ```bash
-python scripts/run_amass_batch_slurm.py submit \
-  --addbio-root "$HOME/AddBiomechanics" \
-  --slurm-job-name amass_bsm \
-  --slurm-nodelist 'node[001-002],blade[010-012]' \
-  --slurm-time 08:00:00 \
-  --slurm-cpus-per-task 4 \
-  --slurm-mem 16G \
-  --slurm-array-parallelism 32 \
-  --slurm-setup-cmd 'source "$HOME/miniconda3/etc/profile.d/conda.sh"' \
-  --slurm-setup-cmd 'conda activate opensim-torque' \
-  --submit
+python scripts/run_amass_to_bsm_csv.py \
+  ... \
+  --id-horizontal-split-model model/groundlink_calibrated/hsym_horizontal_model.json \
+  --id-cop-progress-model model/groundlink_calibrated/cop_progress_model.json
 ```
 
-If your cluster requires an explicit partition or account, add `--slurm-partition ...` and/or `--slurm-account ...`.
-If admins ask you to constrain jobs to a subset of hosts, add `--slurm-nodelist 'node[001-002],blade[010-012]'`.
-If the preferred queue is overloaded, consider switching some batches to `--slurm-partition low`.
+Without these two options, the pipeline is training-free and its output is
+unchanged. The calibrated variant is evaluated on GroundLink
+leave-one-subject-out; use the training-free pipeline when no force-plate data
+are available for calibration.
 
-What this script does:
+## Evaluation on GroundLink
 
-- discovers `.npz` files recursively
-- skips existing destination CSVs by default (`--skip-existing-csv`)
-- writes a task manifest at `outputs/bsm_batch/slurm/manifest.jsonl`
-- writes an SBATCH script at `outputs/bsm_batch/slurm/run_batch.sbatch`
-- launches a SLURM array job (if `--submit` is passed)
-- stores per-task worker status JSON files under `outputs/bsm_batch/slurm/results/`
+We evaluate the estimated forces and torques on GroundLink (Han et al., SIGGRAPH Asia 2023): 206 trials from six subjects
+(s001–s006), after excluding subject s007, motion classes with non-foot
+support, and trials with misaligned motion and centers of pressure.
+Reference torques come from OpenSim inverse dynamics with the measured
+forces and centers of pressure, using the same model and kinematics.
 
-Useful SLURM workflow:
+The main scripts are:
 
-- use `--dry-run` first to generate and inspect manifest + SBATCH script without submitting
-- omit `--submit` if you want to manually run the printed `sbatch ...` command
-- use `--no-skip-existing-csv` when you intentionally want to recompute all outputs
-- tune `--slurm-array-parallelism` to cap concurrent jobs (for example `%32`)
+| Step | Script |
+|---|---|
+| Audit force/motion pairs | [`scripts/validate_groundlink.py`](scripts/validate_groundlink.py) |
+| Run the pipeline on all subjects and the measured-force inverse dynamics | [`scripts/rerun_groundlink_all.sh`](scripts/rerun_groundlink_all.sh), [`scripts/run_groundlink_e4.py`](scripts/run_groundlink_e4.py) |
+| Extract reference and estimated torques | [`scripts/extract_groundlink_torque_targets.py`](scripts/extract_groundlink_torque_targets.py) |
+| Compute the force and torque metrics | [`scripts/evaluate_groundlink_table1.py`](scripts/evaluate_groundlink_table1.py) |
 
-## Output Format
-
-The unified CSV includes:
-
-- `frame`, `time`
-- Subject metadata: `subject_mass_kg`, `subject_height_m`
-- Body scaling metadata: `<body>_scale_x`, `<body>_scale_y`, `<body>_scale_z` (one triplet for each model body)
-- For each DOF: `<dof>`, `<dof>_vel`, `<dof>_acc`, `<dof>_tau`
-- GRF columns (for every detected contact body and total)
-- Contact code columns (for every detected contact body, for example `hand_l_contact`, `tibia_r_contact`, `calcn_l_contact`)
-
-GRF values are explicitly encoded with zeros when no contact is detected, so CSV schemas stay consistent across motions (including jumps/flight phases).
-
-## Pipeline Summary
-
-For native AMASS input:
-
-1. Load AMASS (`SMPL-X`) from `.npz`.
-2. Run SMPL-X forward pass.
-3. Extract BSM virtual markers from SMPL-X vertices.
-4. Export `markers.trc`.
-5. Run AddBiomechanics scaling + kinematic fit.
-6. Export fitted `.osim` and `.mot`.
-7. Compute DOF kinematics (`q`, `qdot`, `qddot`).
-8. Estimate contact wrenches/GRF from motion.
-9. Run inverse dynamics in OpenSim.
-10. Merge kinematics + torques + GRF/contact into one final CSV.
-
-For NTU input, prepend:
-
-1. Read NTU RGB+D `.skeleton` 25-joint tracks.
-2. Convert raw NTU Y-up camera coordinates to Z-up world coordinates.
-3. Smooth the metric joint targets and fit SMPL-X `betas` from segment lengths.
-4. Fit SMPL-X root/body pose over time with torso-frame, foot-flat, and joint smoothness priors.
-5. Export AMASS-like `.npz`, then run the same AMASS/BSM pipeline above.
-
-For HumanML3D `joints/*.npy` input, prepend:
-
-1. Read HumanML3D 52-joint SMPL/SMPL-H-style positions.
-2. Convert HumanML3D Y-up coordinates to Z-up world coordinates.
-3. Fit SMPL-X `betas` from 52-joint segment lengths.
-4. Fit SMPL-X root and body pose over time, with hands neutral by default.
-5. Export AMASS-like `.npz`, then run the same AMASS/BSM pipeline above.
-
-## Key CLI Options
-
-- `--addbio-root /path/to/AddBiomechanics`
-- `--id-grf-mode {estimated,none}` (default: `estimated`)
-- `--id-contact-bodies all` (default; uses all model body nodes as contact candidates)
-- `--id-friction-coeff 0.8` (compatibility/diagnostic parameter; the OpenSim
-  net-force target is preserved rather than clipped)
-- `--id-filter-mode {auto,walking,dynamic,none}` (default: `auto`)
-- `--id-cutoff-hz <float>` (optional custom cutoff)
-- `--final-csv-path /custom/output.csv` (optional)
-- `--cleanup-intermediate` (keep only final CSV)
-
-## CSV Explorer (PDF Report)
-
-You can generate a full multi-page PDF report from any unified output CSV with:
+The metrics are computed with
 
 ```bash
-python scripts/csv_explorer.py \
-  --input-csv outputs/bsm/A3-_Swing_arms_stageii.csv \
-  --output-pdf outputs/bsm/A3-_Swing_arms_stageii_report.pdf
+python scripts/evaluate_groundlink_table1.py \
+  --torque-root /path/to/GroundLink_torque \
+  --force-root /path/to/GroundLink/force \
+  --output-dir outputs/groundlink_table1
 ```
 
-The report includes:
+Metrics are computed on valid frames during measured contact (vertical force
+above 0.05 BW), with measured forces filtered at 12 Hz, averaged per foot,
+trial and subject, and reported as the mean and 95% confidence interval over
+the six subjects. The leave-one-subject-out fitting and evaluation of the
+calibrated variant are in
+[`scripts/metrics_tau_claude/`](scripts/metrics_tau_claude/README.md).
 
-- global summary (frames, duration, sample rate, detected DOFs and GRFs)
-- motion overview statistics
-- one page per DOF with position/velocity/acceleration/(torque if present)
-- GRF pages for each contact body and total GRF
+## Output format
 
-## Legacy Scripts
+| Columns | Content |
+|---|---|
+| `frame`, `time` | Frame index and time (s) |
+| `subject_mass_kg`, `subject_height_m` | Estimated body mass and stature |
+| `<body>_scale_{x,y,z}` | Scale factors of each model body |
+| `<dof>`, `<dof>_vel`, `<dof>_acc` | Joint angle (rad) or translation (m), velocity, acceleration |
+| `<dof>_tau` | Estimated joint torque (N m) or pelvis residual force (N) |
+| GRF columns | Estimated force for each contact body and in total (N); zero without contact |
+| `<body>_contact` | Binary contact state for each contact body |
 
-The previous pipelines are still available:
+`knee_angle_{l,r}_beta` are always undefined and are removed, so the CSV has
+49 DOFs. The column schema is the same for every sequence, including flight
+phases.
 
-- [run_amass_to_opensim.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/run_amass_to_opensim.py)
-- [run_amass_to_opencap_legacy.py](/Users/enricomartini/Desktop/opensim-batch-dynamics/scripts/run_amass_to_opencap_legacy.py)
+## Repository structure
+
+```
+scripts/run_amass_to_bsm_csv.py     single-sequence entry point
+scripts/run_amass_batch_*.py        batch runners (local pool, SLURM)
+scripts/*groundlink*                GroundLink validation and torque targets
+scripts/metrics_tau_claude/         GroundLink evaluator and LOSO calibration study
+src/opensim_batch_dynamics/         library code (loading, markers, IK, GRF, ID, export)
+model/bsm/                          BSM OpenSim model and geometry
+model/groundlink_calibrated/        coefficients of the calibrated variant
+assets/smpl2ab/                     SMPL-X → BSM virtual-marker map
+docs/                               detailed usage and dataset notes
+tests/                              unit tests
+```
+
+Converters from NTU RGB+D, HumanML3D and CARE-PD to AMASS-like SMPL-X files,
+a PDF report generator for the output CSVs, and a real-time prototype (`RT/`)
+are also included. See
+[`docs/usage_reference.md`](docs/usage_reference.md).
+
+Run the tests with
+
+```bash
+PYTHONPATH=src python -m unittest discover -s tests -p 'test_*.py'
+```
+
+## License and acknowledgements
+
+The code is released under the [MIT License](LICENSE). SMPL-X, AMASS, SKEL
+and GroundLink are distributed under their own licenses and must be obtained
+from their authors. The pipeline builds on
+[SMPL-X](https://smpl-x.is.tue.mpg.de/),
+[AddBiomechanics](https://github.com/keenon/AddBiomechanics),
+[SKEL](https://skel.is.tue.mpg.de/),
+[OpenSim](https://opensim.stanford.edu/) and
+[Nimble Physics](https://nimblephysics.org/).
