@@ -26,16 +26,16 @@ except ImportError as e:
 def get_com_trajectory(model_path, ik_mot_path):
     model = opensim.Model(str(model_path))
     state = model.initSystem()
-    
+
     # Parse mot file
     lines = Path(ik_mot_path).read_text().splitlines()
     endheader_idx = lines.index("endheader")
     labels = lines[endheader_idx + 1].split()
     data = np.loadtxt(lines[endheader_idx + 2:])
-    
+
     times = data[:, 0]
     coords_data = data[:, 1:]
-    
+
     # Map labels to coordinates
     coord_set = model.getCoordinateSet()
     active_coords = []
@@ -45,7 +45,7 @@ def get_com_trajectory(model_path, ik_mot_path):
             active_coords.append((c, label))
         except Exception:
             continue
-            
+
     com_traj = []
     for frame_idx in range(len(times)):
         for c, label in active_coords:
@@ -55,11 +55,11 @@ def get_com_trajectory(model_path, ik_mot_path):
             if c.getMotionType() == opensim.Coordinate.Rotational:
                 val = np.deg2rad(val)
             c.setValue(state, val, False)
-        
+
         model.realizePosition(state)
         com = model.calcMassCenterPosition(state)
         com_traj.append([com.get(0), com.get(1), com.get(2)])
-        
+
     return times, np.array(com_traj)
 
 def lowpass_filter(data, fs, cutoff=6.0, order=4):
@@ -71,7 +71,7 @@ def main():
     parser.add_argument("--trials", nargs="+", required=True)
     parser.add_argument("--output", default="outputs/exo_improve/sync.md")
     args = parser.parse_args()
-    
+
     model_path = Path("~/nas/MAEVE/EXO_RECORD/s5/s5_opensim/calibration/model_opensim.osim").expanduser()
     output_md_path = Path(args.output)
     output_md_path.parent.mkdir(parents=True, exist_ok=True)
@@ -79,12 +79,12 @@ def main():
     # Model mass
     model = opensim.Model(str(model_path))
     total_mass = sum(body.getMass() for body in model.getBodySet())
-    
+
     results = []
-    
+
     for trial in args.trials:
         print(f"Processing {trial}...")
-        
+
         # Determine IK path
         if trial in ["static_0", "static_1", "posterior_reaching_end", "posterior_reaching_1"]: # Correction based on objective
             # Note: Objective says posterior_reaching_1
@@ -105,34 +105,34 @@ def main():
         # COM and Required Force
         times, com_pos = get_com_trajectory(model_path, ik_path)
         fs = 1.0 / np.median(np.diff(times))
-        
+
         com_filt = lowpass_filter(com_pos, fs)
         # Acceleration: v = grad(p)*fs, a = grad(v)*fs
         vel = np.gradient(com_filt, axis=0) * fs
         acc = np.gradient(vel, axis=0) * fs
-        
+
         # F_req = m * (a_com + [0, 9.81, 0])
         f_req = total_mass * (acc + np.array([0, 9.81, 0]))
-        
+
         # Plate data
         plate_csv = Path(f"~/nas/MAEVE/EXO_RECORD/s5/aligned/forceplate/{trial}.csv").expanduser()
         marker_csv = Path(f"~/nas/MAEVE/EXO_RECORD/s5/aligned/marker/{trial}.csv").expanduser()
-        
-        # To avoid reading plate_wrench 101 times, we can simulate it by reading once 
+
+        # To avoid reading plate_wrench 101 times, we can simulate it by reading once
         # and interpolating. But users said calling it 101 times is acceptable.
         # However, let's optimize slightly if possible.
-        
+
         lags = np.arange(-0.100, 0.101, 0.002)
         rms_total = []
         rms_axes = [[], [], []] # X, Y, Z
-        
+
         best_lag = 0
         min_rms = float('inf')
-        
+
         # For plot
         plot_lags = []
         plot_rms = []
-        
+
         # We'll do a loop over lags
         for lag in lags:
             shifted_times = times + lag
@@ -140,35 +140,35 @@ def main():
             # force is reaction ON THE SUBJECT in LAB frame (Z up)
             f_plate_lab, _, _ = plate_wrench(plate_csv, shifted_times, cutoff_hz=6.0)
             f_plate_osim = lab_to_osim(f_plate_lab)
-            
+
             # RMS error per axis
             errs = f_plate_osim - f_req
             rms_x = np.sqrt(np.mean(errs[:, 0]**2))
             rms_y = np.sqrt(np.mean(errs[:, 1]**2))
             rms_z = np.sqrt(np.mean(errs[:, 2]**2))
             rms_tot = np.sqrt(np.mean(errs**2))
-            
+
             rms_axes[0].append(rms_x)
             rms_axes[1].append(rms_y)
             rms_axes[2].append(rms_z)
             rms_total.append(rms_tot)
-            
+
             if rms_tot < min_rms:
                 min_rms = rms_tot
                 best_lag = lag
-            
+
             plot_lags.append(lag)
             plot_rms.append(rms_tot)
 
         # Metrics at lag 0
         lag_0_idx = np.argmin(np.abs(lags))
         rms_0 = rms_total[lag_0_idx]
-        
+
         # Best lag per axis
         best_lag_x = lags[np.argmin(rms_axes[0])]
         best_lag_y = lags[np.argmin(rms_axes[1])]
         best_lag_z = lags[np.argmin(rms_axes[2])]
-        
+
         # Mean vertical force / weight
         # Use best lag for this or lag 0? Usually best lag.
         best_lag_idx = np.argmin(rms_total)
@@ -178,7 +178,7 @@ def main():
         mean_f_y = np.mean(f_plate_best_osim[:, 1])
         weight = total_mass * 9.81
         ratio_weight = mean_f_y / weight
-        
+
         results.append({
             "trial": trial,
             "best_lag": best_lag,
@@ -190,7 +190,7 @@ def main():
             "ratio_weight": ratio_weight,
             "plot_data": (plot_lags, plot_rms)
         })
-        
+
         if trial == "axial_twist_0":
             plt.figure(figsize=(8, 5))
             plt.plot(plot_lags, plot_rms)
@@ -215,7 +215,7 @@ def main():
             f.write(f"| Best Lag Y | {res['best_lag_y']:.4f} s |\n")
             f.write(f"| Best Lag Z | {res['best_lag_z']:.4f} s |\n")
             f.write(f"| Mean F_y / Weight | {res['ratio_weight']:.4f} |\n\n")
-            
+
             # Comments
             if "static" in res['trial']:
                 f.write("Comment: Static trial. Signal is very low, best lag is not meaningful.\n\n")
