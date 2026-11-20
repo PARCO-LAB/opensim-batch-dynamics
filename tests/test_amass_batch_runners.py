@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -72,6 +73,34 @@ class AmassBatchRunnerCliTest(unittest.TestCase):
         self.assertIn(f"Plan summary: {expected_plan}", result.stdout)
         self.assertIn(f"[DRY 1] sample.npz -> {expected_csv}", result.stdout)
         self.assertIn("trial=sample_8151325d", result.stdout)
+
+    def test_slurm_dry_run_forwards_force_exclusion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "sample.npz").touch()
+            output_dir = (root / "out").resolve()
+
+            _run_script(
+                "scripts/run_amass_batch_slurm.py",
+                "submit",
+                "--input-root",
+                str(root),
+                "--output-dir",
+                str(output_dir),
+                "--id-forces-to-exclude",
+                "Actuators",
+                "--dry-run",
+                "--limit",
+                "1",
+            )
+
+            manifest = json.loads(
+                (output_dir / "slurm" / "manifest.jsonl").read_text(encoding="utf-8").splitlines()[0]
+            )
+
+        command = manifest["command"]
+        self.assertIn("--id-forces-to-exclude", command)
+        self.assertEqual(command[command.index("--id-forces-to-exclude") + 1], "Actuators")
 
     def test_ntu_dry_run_reports_manifest_and_output_path(self) -> None:
         with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmpdir:

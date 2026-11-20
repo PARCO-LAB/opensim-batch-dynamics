@@ -182,6 +182,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--id-cutoff-hz", type=float, default=None)
     parser.add_argument(
+        "--id-forces-to-exclude",
+        choices=["Actuators", "Muscles"],
+        default=None,
+        help="Pass an OpenSim force-exclusion group to the final ID setup.",
+    )
+    parser.add_argument(
         "--id-grf-mode",
         default="estimated",
         choices=["estimated", "none"],
@@ -295,6 +301,9 @@ def _build_single_run_cmd(
         cmd.extend(["--subject-height-m", str(args.subject_height_m)])
     if args.id_cutoff_hz is not None:
         cmd.extend(["--id-cutoff-hz", str(args.id_cutoff_hz)])
+    id_forces_to_exclude = getattr(args, "id_forces_to_exclude", None)
+    if id_forces_to_exclude is not None:
+        cmd.extend(["--id-forces-to-exclude", id_forces_to_exclude])
     if args.skip_inverse_dynamics:
         cmd.append("--skip-inverse-dynamics")
     if args.cleanup_intermediate:
