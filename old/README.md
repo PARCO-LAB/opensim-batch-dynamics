@@ -1,7 +1,7 @@
 # Old workflows
 
-Everything here is unmaintained, preserved for reference, and excluded from the
-root tests suite.
+Everything here is unmaintained, preserved for reference, and excluded from
+repository test discovery.
 
 - `legacy/`: OpenCap/LaiUhlrich pipeline, Nimble runner, model, and assets.
 - `rt/`: causal real-time prototype and comparison driver.
