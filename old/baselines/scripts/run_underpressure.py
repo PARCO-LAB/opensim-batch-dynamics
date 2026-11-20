@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from opensim_batch_dynamics.amass_loader import load_amass_npz
 from opensim_batch_dynamics.smplx_forward import run_smplx_forward
 

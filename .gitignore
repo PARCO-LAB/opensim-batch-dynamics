@@ -3,10 +3,10 @@ smplx/
 model/smpl
 miniconda.sh
 .DS_Store
-RT/tmp_*
-RT/*.pdf
-RT/*.json
-RT/*.ipynb
+old/rt/RT/tmp_*
+old/rt/RT/*.pdf
+old/rt/RT/*.json
+old/rt/RT/*.ipynb
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

@@ -26,8 +26,9 @@ from typing import Iterable
 import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
+REPO_ROOT = SCRIPT_DIR.parents[2]
 sys.path.insert(0, str(SCRIPT_DIR))
+sys.path.insert(0, str(SCRIPT_DIR.parents[1] / "exo" / "scripts"))
 from run_exo_record_dynamics import split_feet  # noqa: E402
 
 DEFAULT_DATASET = Path("~/nas/MAEVE/GroundLink_torque/torque_targets_12hz_nomuscles").expanduser()

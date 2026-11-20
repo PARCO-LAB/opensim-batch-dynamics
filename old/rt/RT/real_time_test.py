@@ -10,7 +10,7 @@ import nimblephysics as nimble
 import numpy as np
 import pandas as pd
 
-SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
+SRC_ROOT = Path(__file__).resolve().parents[3] / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
@@ -67,7 +67,7 @@ def _set_control_forces_safely(skeleton, forces: np.ndarray) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[3]
     parser = argparse.ArgumentParser(description="Run real-time 2-stage inverse dynamics against offline CSV.")
     parser.add_argument("--csv", type=Path, default=repo_root / "data" / "AMASS" / "BMLhandball" / "Trial_upper_left_012_poses.csv")
     parser.add_argument("--model", type=Path, default=repo_root / "model" / "bsm" / "bsm.osim")

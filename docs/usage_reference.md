@@ -574,9 +574,8 @@ The report includes:
 - one page per DOF with position/velocity/acceleration/(torque if present)
 - GRF pages for each contact body and total GRF
 
-## Legacy Scripts
+## Older workflows
 
-The previous pipelines are still available:
-
-- [run_amass_to_opensim.py](../scripts/run_amass_to_opensim.py)
-- [run_amass_to_opencap_legacy.py](../scripts/run_amass_to_opencap_legacy.py)
+Unmaintained prototypes and one-off utilities are preserved under `../old/`
+and excluded from the test suite. The legacy OpenCap scripts are at
+[`old/legacy/scripts/`](../old/legacy/scripts/).

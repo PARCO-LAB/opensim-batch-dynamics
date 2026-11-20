@@ -557,7 +557,7 @@ def main() -> int:
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--dataset-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--smplx-model-dir", type=Path, default=Path(__file__).resolve().parents[1] / "model" / "smpl")
+    parser.add_argument("--smplx-model-dir", type=Path, default=Path(__file__).resolve().parents[3] / "model" / "smpl")
     parser.add_argument("--subject", choices=SUBJECTS)
     parser.add_argument("--merge", action="store_true")
     args = parser.parse_args()

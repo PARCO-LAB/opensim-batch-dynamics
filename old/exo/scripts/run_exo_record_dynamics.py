@@ -29,7 +29,7 @@ import numpy as np
 from scipy.signal import butter, sosfiltfilt
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 # Plate is 900 x 900 mm with its corner at the lab origin; moments are reported
 # about its centre on the top surface (checked in DATASET-BSM conversion_audit.json).

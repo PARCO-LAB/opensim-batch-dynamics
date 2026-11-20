@@ -276,13 +276,13 @@ model/bsm/                          BSM OpenSim model and geometry
 model/groundlink_calibrated/        coefficients of the calibrated variant
 assets/smpl2ab/                     SMPL-X → BSM virtual-marker map
 docs/                               detailed usage and dataset notes
-tests/                              unit tests
+tests/                              core unit tests
+old/                                unmaintained workflows, excluded from tests
 ```
 
-Converters from NTU RGB+D, HumanML3D and CARE-PD to AMASS-like SMPL-X files,
-a PDF report generator for the output CSVs, and a real-time prototype (`RT/`)
-are also included. See
-[`docs/usage_reference.md`](docs/usage_reference.md).
+Dataset converters and PDF report tools are also included. Older prototypes
+and one-off utilities live under `old/` and are excluded from the test suite.
+See [`docs/usage_reference.md`](docs/usage_reference.md).
 
 Run the tests with
 
