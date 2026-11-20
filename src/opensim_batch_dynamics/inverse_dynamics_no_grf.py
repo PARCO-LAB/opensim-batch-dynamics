@@ -9,6 +9,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 import numpy as np
 
@@ -42,6 +43,7 @@ class InverseDynamicsNoGrfSummary:
     grf_mot_path: Path | None = None
     external_loads_xml_path: Path | None = None
     contact_wrench_csv_path: Path | None = None
+    forces_to_exclude: str | None = None
 
 
 def _canonical_label(label: str) -> str:
@@ -82,11 +84,23 @@ def _find_opensim_cmd() -> str | None:
     return None
 
 
-def _run_opensim_tool(setup_xml: Path) -> None:
+def _run_opensim_tool(
+    setup_xml: Path,
+    *,
+    working_directory: Path | None = None,
+) -> None:
+    setup_xml = Path(setup_xml).resolve()
+    if working_directory is not None:
+        working_directory = Path(working_directory).resolve()
     opensim_cmd = _find_opensim_cmd()
     if opensim_cmd:
         command = [opensim_cmd, "-o", "error", "run-tool", str(setup_xml)]
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            cwd=working_directory,
+        )
         if result.returncode != 0:
             raise RuntimeError(
                 "OpenSim inverse dynamics failed.\n"
@@ -104,18 +118,43 @@ def _run_opensim_tool(setup_xml: Path) -> None:
             "opensim Python package is unavailable."
         ) from exc
 
-    tool = opensim.InverseDynamicsTool(str(setup_xml))
-    success = tool.run()
+    previous_cwd = Path.cwd()
+    if working_directory is not None:
+        os.chdir(working_directory)
+    try:
+        tool = opensim.InverseDynamicsTool(str(setup_xml))
+        success = tool.run()
+    finally:
+        if working_directory is not None:
+            os.chdir(previous_cwd)
     if success is False:
         raise RuntimeError(
             "OpenSim inverse dynamics failed while running through the Python API."
         )
 
 
+def _set_forces_to_exclude(setup_xml: Path, forces_to_exclude: str | None) -> None:
+    """Set the ID tool's force-exclusion field without changing other settings."""
+    if not forces_to_exclude:
+        return
+    tree = ET.parse(setup_xml)
+    tool = tree.getroot().find("InverseDynamicsTool")
+    if tool is None:
+        raise ValueError(f"No InverseDynamicsTool in {setup_xml}")
+    excluded = tool.find("forces_to_exclude")
+    if excluded is None:
+        excluded = ET.SubElement(tool, "forces_to_exclude")
+    excluded.text = forces_to_exclude
+    temporary = setup_xml.with_suffix(setup_xml.suffix + ".partial")
+    tree.write(temporary, encoding="utf-8", xml_declaration=True)
+    temporary.replace(setup_xml)
+
+
 def _prepare_model_for_inverse_dynamics(
     model_path: Path,
     output_dir: Path,
     trial_name: str,
+    z_up_gravity: bool = True,
 ) -> Path:
     """
     Create a marker-free model copy for inverse dynamics.
@@ -139,7 +178,7 @@ def _prepare_model_for_inverse_dynamics(
         + float(gravity.get(1)) ** 2
         + float(gravity.get(2)) ** 2
     )
-    if gravity_norm > 1e-8:
+    if z_up_gravity and gravity_norm > 1e-8:
         model.setGravity(opensim.Vec3(0.0, 0.0, -gravity_norm))
     marker_set = model.updMarkerSet()
     if marker_set.getSize() > 0:
@@ -930,8 +969,11 @@ def run_inverse_dynamics_with_measured_grf(
     cop_m: np.ndarray,
     contact_body_names: tuple[str, str] = ("calcn_l", "calcn_r"),
     cutoff_hz: float = 12.0,
+    free_moment_nm: np.ndarray | None = None,
+    z_up_gravity: bool = True,
+    forces_to_exclude: str | None = None,
 ) -> tuple[Path, Path, Path, Path, Path]:
-    """Run ID with measured GroundLink GRF/CoP and zero free moment."""
+    """Run ID with measured GRF/CoP; free moment defaults to zero."""
     try:
         import nimblephysics as nimble
         import opensim
@@ -943,6 +985,9 @@ def run_inverse_dynamics_with_measured_grf(
     cop_m = np.asarray(cop_m, dtype=float)
     if grf_n.shape != cop_m.shape or grf_n.shape != (timestamps.size, 2, 3):
         raise ValueError("Measured GRF/CoP must have shape (T, 2, 3), matching timestamps.")
+    moment_nm = np.zeros_like(grf_n) if free_moment_nm is None else np.asarray(free_moment_nm, dtype=float)
+    if moment_nm.shape != grf_n.shape:
+        raise ValueError("Measured free moment must have shape (T, 2, 3), matching GRF.")
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     grf_mot = output_dir / f"{trial_name}_grf_measured.mot"
@@ -964,7 +1009,7 @@ def run_inverse_dynamics_with_measured_grf(
             for foot in range(2):
                 row.extend(grf_n[i, foot].tolist())
                 row.extend(cop_m[i, foot].tolist())
-                row.extend((0.0, 0.0, 0.0))
+                row.extend(moment_nm[i, foot].tolist())
             handle.write(" ".join(f"{value:.10g}" for value in row) + "\n")
     with wrench_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -979,7 +1024,7 @@ def run_inverse_dynamics_with_measured_grf(
             for foot in range(2):
                 row.extend(cop_m[i, foot].tolist())
                 row.extend(grf_n[i, foot].tolist())
-                row.extend((0.0, 0.0, 0.0))
+                row.extend(moment_nm[i, foot].tolist())
             writer.writerow(row)
     osim_model = nimble.biomechanics.OpenSimParser.parseOsim(str(model_path), "", True)
     contact_nodes = []
@@ -991,7 +1036,9 @@ def run_inverse_dynamics_with_measured_grf(
     nimble.biomechanics.OpenSimParser.saveOsimInverseDynamicsProcessedForcesXMLFile(
         trial_name, contact_nodes, grf_mot.name, str(external_xml)
     )
-    id_model = _prepare_model_for_inverse_dynamics(Path(model_path).resolve(), output_dir, trial_name)
+    id_model = _prepare_model_for_inverse_dynamics(
+        Path(model_path).resolve(), output_dir, trial_name, z_up_gravity=z_up_gravity
+    )
     setup = output_dir / f"Setup_ID_measuredGRF_{trial_name}.xml"
     sto = output_dir / f"{trial_name}_id_measuredGRF.sto"
     opensim.Logger.setLevelString("error")
@@ -1006,6 +1053,7 @@ def run_inverse_dynamics_with_measured_grf(
     tool.setResultsDir(str(output_dir))
     tool.setOutputGenForceFileName(sto.name)
     tool.printToXML(str(setup))
+    _set_forces_to_exclude(setup, forces_to_exclude)
     _run_opensim_tool(setup)
     if not sto.exists():
         raise FileNotFoundError(f"Measured-GRF ID output not found: {sto}")
@@ -1076,6 +1124,7 @@ def run_inverse_dynamics_no_grf(
     trial_name: str,
     filter_mode: str = "auto",
     cutoff_hz: float | None = None,
+    forces_to_exclude: str | None = None,
 ) -> tuple[Path, Path, float | None]:
     """
     Run OpenSim inverse dynamics without explicit external loads.
@@ -1122,6 +1171,7 @@ def run_inverse_dynamics_no_grf(
     id_tool.setResultsDir(str(output_dir))
     id_tool.setOutputGenForceFileName(id_sto_path.name)
     id_tool.printToXML(str(id_setup_path))
+    _set_forces_to_exclude(id_setup_path, forces_to_exclude)
 
     _run_opensim_tool(id_setup_path)
 
@@ -1144,6 +1194,7 @@ def run_inverse_dynamics_with_estimated_grf(
     contact_speed_threshold_mps: float = 0.5,
     horizontal_split_model_path: str | Path | None = None,
     cop_progress_model_path: str | Path | None = None,
+    forces_to_exclude: str | None = None,
 ) -> tuple[Path, Path, float | None, Path, Path, Path]:
     """
     Run OpenSim ID using GRF/contact wrench estimated from kinematics.
@@ -1218,6 +1269,9 @@ def run_inverse_dynamics_with_estimated_grf(
     id_tool.setResultsDir(str(output_dir))
     id_tool.setOutputGenForceFileName(id_sto_path.name)
     id_tool.printToXML(str(id_setup_path))
+    # Keep the no-GRF force-target pass above unchanged: it defines the
+    # estimated external loads. Exclusion applies to the final reported ID.
+    _set_forces_to_exclude(id_setup_path, forces_to_exclude)
 
     _run_opensim_tool(id_setup_path)
     if not id_sto_path.exists():
@@ -1309,6 +1363,7 @@ def run_inverse_dynamics_and_export_torque_csv(
     contact_speed_threshold_mps: float = 0.5,
     horizontal_split_model_path: str | Path | None = None,
     cop_progress_model_path: str | Path | None = None,
+    forces_to_exclude: str | None = None,
 ) -> InverseDynamicsNoGrfSummary:
     """High-level helper: run ID (no GRF) and export DOF torque CSV."""
     model_path = Path(model_path).resolve()
@@ -1338,6 +1393,7 @@ def run_inverse_dynamics_and_export_torque_csv(
                     contact_speed_threshold_mps=contact_speed_threshold_mps,
                     horizontal_split_model_path=horizontal_split_model_path,
                     cop_progress_model_path=cop_progress_model_path,
+                    forces_to_exclude=forces_to_exclude,
                 )
             )
 
@@ -1399,6 +1455,7 @@ def run_inverse_dynamics_and_export_torque_csv(
             grf_mot_path=grf_mot_path,
             external_loads_xml_path=external_loads_xml_path,
             contact_wrench_csv_path=contact_wrench_csv_path,
+            forces_to_exclude=forces_to_exclude,
         )
 
     ik_labels, ik_rows = parse_mot(ik_mot_path)
@@ -1430,6 +1487,7 @@ def run_inverse_dynamics_and_export_torque_csv(
             contact_speed_threshold_mps=contact_speed_threshold_mps,
             horizontal_split_model_path=horizontal_split_model_path,
             cop_progress_model_path=cop_progress_model_path,
+            forces_to_exclude=forces_to_exclude,
         )
     elif grf_mode_normalized in ("none", "no_grf"):
         id_setup_path, id_sto_path, effective_cutoff = run_inverse_dynamics_no_grf(
@@ -1439,6 +1497,7 @@ def run_inverse_dynamics_and_export_torque_csv(
             trial_name=trial_name,
             filter_mode=filter_mode,
             cutoff_hz=cutoff_hz,
+            forces_to_exclude=forces_to_exclude,
         )
         grf_mot_path = None
         external_loads_xml_path = None
@@ -1466,4 +1525,5 @@ def run_inverse_dynamics_and_export_torque_csv(
         grf_mot_path=grf_mot_path,
         external_loads_xml_path=external_loads_xml_path,
         contact_wrench_csv_path=contact_wrench_csv_path,
+        forces_to_exclude=forces_to_exclude,
     )

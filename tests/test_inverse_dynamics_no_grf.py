@@ -16,9 +16,31 @@ from opensim_batch_dynamics.inverse_dynamics_no_grf import (
     _prepare_model_for_inverse_dynamics,
     _project_force_to_friction_cone,
     _root_force_target_from_id_sto,
+    _set_forces_to_exclude,
     run_inverse_dynamics_with_estimated_grf,
 )
 import numpy as np
+
+
+class InverseDynamicsForceExclusionSetupTest(unittest.TestCase):
+    def test_force_exclusion_changes_only_the_id_exclusion_field(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            setup = Path(tmpdir) / "Setup_ID.xml"
+            setup.write_text(
+                "<OpenSimDocument><InverseDynamicsTool>"
+                "<lowpass_cutoff_frequency_for_coordinates>12</lowpass_cutoff_frequency_for_coordinates>"
+                "<results_directory>.</results_directory>"
+                "</InverseDynamicsTool></OpenSimDocument>",
+                encoding="utf-8",
+            )
+
+            _set_forces_to_exclude(setup, "Actuators")
+
+            tool = ET.parse(setup).getroot().find("InverseDynamicsTool")
+            self.assertIsNotNone(tool)
+            self.assertEqual(tool.findtext("forces_to_exclude"), "Actuators")
+            self.assertEqual(tool.findtext("lowpass_cutoff_frequency_for_coordinates"), "12")
+            self.assertEqual(tool.findtext("results_directory"), ".")
 
 
 @unittest.skipUnless(opensim is not None, "opensim is not installed")

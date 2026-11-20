@@ -101,6 +101,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional explicit low-pass cutoff (Hz) for inverse dynamics coordinates",
     )
     parser.add_argument(
+        "--id-forces-to-exclude",
+        choices=["Actuators", "Muscles"],
+        default=None,
+        help="Optional OpenSim ID force group to exclude from reported generalized forces.",
+    )
+    parser.add_argument(
         "--id-grf-mode",
         default="estimated",
         choices=["estimated", "none"],
@@ -380,6 +386,7 @@ def _run_single_trial_pipeline(
             contact_speed_threshold_mps=args.id_contact_speed_threshold_mps,
             horizontal_split_model_path=args.id_horizontal_split_model,
             cop_progress_model_path=args.id_cop_progress_model,
+            forces_to_exclude=args.id_forces_to_exclude,
         )
         partial_csv_path = resolved_final_csv_path.with_suffix(resolved_final_csv_path.suffix + ".partial")
         final_csv_summary = export_final_csv(
@@ -393,6 +400,7 @@ def _run_single_trial_pipeline(
             fallback_contact_bodies=fallback_contact_bodies,
         )
         quality = assess_csv(partial_csv_path, mass_kg=final_csv_summary.mass_kg)
+        quality["id_forces_to_exclude"] = args.id_forces_to_exclude
         if set(quality.get("reasons", ())) == {"pelvis_rotation_speed_gt_20rad_s"}:
             trim = leading_pelvis_transient_frames(partial_csv_path)
             if trim:
@@ -404,6 +412,7 @@ def _run_single_trial_pipeline(
                     csv.writer(f).writerows([rows[0], *rows[trim + 2 :]])
                 quality = assess_csv(partial_csv_path, mass_kg=final_csv_summary.mass_kg)
                 quality["trimmed_leading_frames"] = trim + 1
+                quality["id_forces_to_exclude"] = args.id_forces_to_exclude
         # This provenance marker makes --skip-existing/--resume invalidate
         # outputs made before the force target was derived by OpenSim itself.
         quality["dynamics_pipeline_version"] = DYNAMICS_PIPELINE_VERSION
@@ -457,6 +466,7 @@ def _run_single_trial_pipeline(
         "quality": summary_quality if final_csv_summary is not None else None,
     }
     if torque_summary is not None:
+        summary["id_forces_to_exclude"] = torque_summary.forces_to_exclude
         summary["torque_csv_path"] = str(_published_path(torque_summary.torque_csv_path))
         summary["id_sto_path"] = str(_published_path(torque_summary.id_sto_path))
         summary["id_setup_path"] = str(_published_path(torque_summary.id_setup_path))
