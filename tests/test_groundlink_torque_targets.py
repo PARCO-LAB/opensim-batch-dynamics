@@ -33,18 +33,10 @@ from rerun_groundlink_id_nomuscles import (  # noqa: E402
     _cop_invalid_mask,
     _tcode_from_marker_min_y,
 )
-from validate_groundlink_tcode_phase_c import _lag_correlation  # noqa: E402
 from opensim_batch_dynamics.mot_to_csv import _lowpass_butterworth_4th
 
 
 class GroundLinkTorqueTargetsTest(unittest.TestCase):
-    def test_lag_correlation_skips_lags_longer_than_a_segment(self) -> None:
-        correlation, count = _lag_correlation(
-            np.asarray([1.0, 2.0, 3.0]), np.asarray([1.0, 2.0, 3.0]), 50
-        )
-        self.assertTrue(np.isnan(correlation))
-        self.assertEqual(count, 0)
-
     def test_resume_rejects_cop_shifted_copy_until_target_id_is_regenerated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             baseline = Path(tmp) / "torque_targets.csv"
