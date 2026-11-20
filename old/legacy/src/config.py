@@ -36,7 +36,7 @@ class AssetPaths:
 def _resolve_repo_root(repo_root: Path | None = None) -> Path:
     if repo_root is not None:
         return repo_root.resolve()
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[3]
 
 
 def default_asset_paths(repo_root: Path | None = None) -> AssetPaths:

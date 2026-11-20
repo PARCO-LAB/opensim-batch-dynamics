@@ -167,7 +167,7 @@ def _resolve_geometry_dir(osim_path: Path, explicit_geometry_dir: str | None) ->
     if explicit_geometry_dir:
         candidates.append(Path(explicit_geometry_dir).resolve())
     candidates.append((osim_path.parent / "Geometry").resolve())
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[3]
     candidates.append((repo_root / "model" / "Geometry").resolve())
 
     seen: set[str] = set()

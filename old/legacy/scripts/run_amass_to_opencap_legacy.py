@@ -9,7 +9,7 @@ from pathlib import Path
 
 def _add_src_to_path() -> None:
     # Keep the script runnable without package installation.
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[3]
     src = repo_root / "src"
     if str(src) not in sys.path:
         sys.path.insert(0, str(src))
@@ -156,7 +156,7 @@ def main() -> int:
     args = parser.parse_args()
     from opensim_batch_dynamics.opensim_pipeline import run_amass_to_opensim
 
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[3]
     defaults = default_asset_paths(repo_root=repo_root)
     assets_dir = Path(args.assets_dir).resolve()
     assets = AssetPaths(
